@@ -141,9 +141,18 @@ class Ui_MainWindow(object):
 
         with open('data/addresslist.txt', 'r') as f:
             addresses=f.readlines()
+
+        try:
+            if addresses[0]=='\n':
+                self.ga()
+        except:
+            if addresses==[]:
+                self.ga()
+
         for l in addresses:
-            appendi=l[:16]
-            self.comboBox.addItem(appendi)
+            if l!='\n':
+                appendi=l[:16]
+                self.comboBox.addItem(appendi)
         
         #print(self.comboBox.currentText())
 
