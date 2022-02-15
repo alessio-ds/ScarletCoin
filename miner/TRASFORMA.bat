@@ -1,0 +1,1 @@
+pyuic5 -x miner.ui -o miner.py

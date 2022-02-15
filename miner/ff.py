@@ -1,0 +1,11 @@
+import random,hashlib
+ok='0000000000000000000000000000000000000000000000000000000000000000'
+hexg='9999999999999999999999999999999999999999999999999999999999999999'
+
+while True: # replace 'hexg[0:8]!=ok[0:8]' with True to keep without an end
+    while hexg[0:4]!=ok[0:4]:
+        hexok=hex(random.randint(0,1000000)).encode()
+        hexg=(hashlib.sha256(hexok)).hexdigest()
+
+    print(hexok)
+    hexg='9999999999999999999999999999999999999999999999999999999999999999'
