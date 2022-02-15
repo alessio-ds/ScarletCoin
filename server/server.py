@@ -1,16 +1,33 @@
-from flask import Flask,render_template,request
+
+from flask import Flask,render_template,request,redirect
 from random import randint, shuffle
 import addrgen
 import find_coins_amount
 import hashlib
+import datetime
 
 app = Flask(__name__)
 
 @app.route('/', methods = ['POST', 'GET'])
 def data():
     if request.method == 'GET':
-        return f"You can't access this URL directly"
+        return render_template('index.html')
     if request.method == 'POST':
+        try:
+            form_data = request.form
+            a=form_data
+            txid=a['Field1_name']
+            try:
+                with open('templates/txs/'+txid+'.html', 'r') as f:
+                    print(f'{txid} has been found') 
+                    with open('data/explorer','r') as f:
+                        explurl=f.read()
+                    return redirect(explurl+txid+'.html')
+            except:
+                return("Couldn't find any tx with that id.")
+
+        except:
+            pass #significa che la richiesta non è stata fatta al sito
         request_data = request.data
         request_data = request_data.decode('utf-8')
         print(request_data)
@@ -45,6 +62,7 @@ def data():
                     f.write(strhash+'\n')
             print('valid')
             addrminer=stringa[pos+1:]
+            addrminer=addrminer.strip('\n')
             #sender='0000000000000000:9444d1539ffadec30fc6b0f6386d87ff36d58f9a92884253bd9c0c7b4c20e80e'
             coins=find_coins_amount.find(addrminer)
             initialcoins=int(coins)
@@ -57,10 +75,8 @@ def data():
 
             return(str(initialcoins+1))
 
-
-
         if 'send' in request_data:
-            
+
             pos=request_data.find('#')
             amount=int(request_data[4:pos])
             request_data=request_data[pos+1:]
@@ -72,6 +88,8 @@ def data():
             senderhash=request_data[pos1+1:pos2]
             dest=request_data[pos2+1:]
 
+            if sender==dest:
+                return("You can't send money to yourself")
 
             scoins=int(find_coins_amount.find(sender))
             try:
@@ -108,12 +126,37 @@ def data():
             with open('data/addresses/'+dest, 'w') as f:
                 f.write(nuovotesto)
             
-            return('Sent')
+            ##### generazione pagina web
 
+            txid=addrgen.gentxid(sender,dest,amount)
+            with open('templates/txs/'+txid+'.html', encoding='utf-8', mode='w') as f:
+                with open('templates/txbase1.html', encoding='utf-8', mode='r') as a:
+                    primaparte=a.read()
+                with open('templates/txbase2.html', encoding='utf-8', mode='r') as a:
+                    secondaparte=a.read()
+
+                now = datetime.datetime.now()
+                date=now.strftime('%Y-%m-%d %H:%M:%S')
+                fstr=f'{primaparte}TXID  {txid}」<br><br>「{sender} sent {amount} ScarletCoins to {dest}」<br>「Date of tx: {date}{secondaparte}'
+                f.write(fstr)
+            
+
+            return(f'Sent. \nTxid = {txid}')
+
+        if 'request_txs' in request_data:
+            addr_to_check=request_data[11:] #11 è la lenght di 'request_txs'
+            data_to_send=''
+            with open('data/txs', 'r') as f:
+                txs=f.readlines()
+            for e in txs:
+                if addr_to_check in e:
+                    data_to_send+=e+'#'
+            print(data_to_send)
+            return(data_to_send)
+
+            
         return('error')
 
 
-
 if __name__ == "__main__":
- #app.run(host='0.0.0.0',debug=True)
- app.run(host='0.0.0.0',debug=True)
+    app.run(host='0.0.0.0',debug=True)

@@ -56,7 +56,7 @@ class Ui_MainWindow(object):
         self.label_2.setText(_translate("MainWindow", "Your Address"))
         self.pushButton_4.setText(_translate("MainWindow", "Start"))
         self.label_6.setText(_translate("MainWindow", "H/s: 0"))
-        self.lineEdit.setText(_translate("MainWindow", "abcdef123"))
+        self.lineEdit.setText(_translate("MainWindow", "12345"))
 
         self.pushButton_4.clicked.connect(self.start)
 
@@ -76,7 +76,6 @@ class Ui_MainWindow(object):
             data='mined'+hexok+'#'+address
             requests.post(url, data)
             hexg='9999999999999999999999999999999999999999999999999999999999999999'
-            exit
             
 if __name__ == "__main__":
     import sys

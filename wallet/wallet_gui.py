@@ -10,11 +10,12 @@
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import getaddr, refresh, mandatx
-import subprocess
+import subprocess, webbrowser
+import txlist
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
-        MainWindow.setObjectName("MainWindow")
+        MainWindow.setObjectName("ScarletCoin Wallet")
         MainWindow.resize(520, 320)
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.centralwidget.setObjectName("centralwidget")
@@ -79,22 +80,38 @@ class Ui_MainWindow(object):
         MainWindow.setStatusBar(self.statusbar)
 
         self.label_ok = QtWidgets.QLabel(self.centralwidget)
-        self.label_ok.setGeometry(QtCore.QRect(30, 230, 471, 16))
+        self.label_ok.setGeometry(QtCore.QRect(30, 230, 471, 41))
         font = QtGui.QFont()
         font.setPointSize(10)
         self.label_ok.setFont(font)
         self.label_ok.setObjectName("label_ok")
+
+        self.pushButton_5 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_5.setGeometry(QtCore.QRect(330, 220, 75, 23))
+        self.pushButton_5.setObjectName("pushButton_5")
+
+        self.pushButton_6 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_6.setGeometry(QtCore.QRect(330, 250, 111, 23))
+        self.pushButton_6.setObjectName("pushButton_6")
+
+        self.pushButton_7 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_7.setGeometry(QtCore.QRect(330, 120, 121, 21))
+        self.pushButton_7.setObjectName("pushButton_7")
+
+
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
 
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_translate("MainWindow", "MainWindow"))
+        MainWindow.setWindowTitle(_translate("ScarletCoin Wallet", "ScarletCoin Wallet"))
 
         #pushButton = get new address
         #pushButton2 = refresh
         #pushButton3= copia
         #pushButton4= send
+        #5 = copy txid
+        #6 = lookup on explorer
         self.pushButton.setText(_translate("MainWindow", "Get new address"))
         self.pushButton_2.setText(_translate("MainWindow", "Refresh"))
         self.label.setText(_translate("MainWindow", "Your address(es):"))
@@ -109,10 +126,18 @@ class Ui_MainWindow(object):
 
         self.label_ok.setText(_translate("MainWindow", ""))
 
+        self.pushButton_5.setText(_translate("MainWindow", "Copy txid"))
+        self.pushButton_6.setText(_translate("MainWindow", "Lookup on explorer"))
+        self.pushButton_7.setText(_translate("MainWindow", "Open transactions list"))
+
         self.pushButton.clicked.connect(self.ga)
         self.pushButton_2.clicked.connect(self.ref)
-        self.pushButton_4.clicked.connect(self.send)
         self.pushButton_3.clicked.connect(self.copia)
+        self.pushButton_4.clicked.connect(self.send)
+        self.pushButton_5.clicked.connect(self.copiatxid)
+        self.pushButton_6.clicked.connect(self.apriweb)
+        self.pushButton_7.clicked.connect(self.apritxlist)
+
 
         with open('data/addresslist.txt', 'r') as f:
             addresses=f.readlines()
@@ -126,6 +151,12 @@ class Ui_MainWindow(object):
         actualcoins=refresh.ref(actualaddress)
         self.label_3.setText(str(actualcoins))
 
+        self.comboBox.currentTextChanged.connect(self.on_combobox_changed)
+
+    def on_combobox_changed(self):
+        actualaddress=self.comboBox.currentText()
+        actualcoins=refresh.ref(actualaddress)
+        self.label_3.setText(str(actualcoins))
     def copia(self):
         actualaddress=self.comboBox.currentText()
         cmd='echo '+actualaddress+'|clip'
@@ -133,7 +164,10 @@ class Ui_MainWindow(object):
 
     def ga(self):
         address=getaddr.askaddr()
-        self.comboBox.addItem(address)
+        if len(address)==16:
+            self.comboBox.addItem(address)
+        else:
+            self.label_ok.setText('Generic error. Try again')
     
     def ref(self):
         actualaddress=self.comboBox.currentText()
@@ -142,8 +176,8 @@ class Ui_MainWindow(object):
 
     def send(self):
 
-        amount=self.lineEdit.text()
-        dest=self.lineEdit_2.text()
+        amount=self.lineEdit.text().strip()
+        dest=self.lineEdit_2.text().strip()
 
         with open('data/addresslist.txt','r') as f:
             addresses=f.read()
@@ -156,10 +190,32 @@ class Ui_MainWindow(object):
         ris=mandatx.manda(amount,completeaddress,dest)
         self.label_ok.setText(ris)
 
+        #txid + explorer
+        if len(ris)==46: #14 lettere + 32 di txid
+            global txid 
+            global webtx
+            txid=ris[14:]
+            with open('data/explorer.txt','r') as f:
+                explorer=f.read()
+            webtx=explorer+txid+'.html'
+
         actualaddress=self.comboBox.currentText()
         actualcoins=refresh.ref(actualaddress)
         self.label_3.setText(str(actualcoins))
         
+    def copiatxid(self):
+        cmd='echo '+txid+'|clip'
+        return subprocess.check_call(cmd, shell=True)
+    def apriweb(self):
+        webbrowser.open(webtx)
+
+    def apritxlist(self):
+        print('ok')
+        actualaddress=self.comboBox.currentText()
+        self.window = QtWidgets.QMainWindow()
+        self.ui = txlist.Ui_txlist()
+        self.ui.setupUi(self.window,actualaddress)
+        self.window.show()
 
 if __name__ == "__main__":
     import sys

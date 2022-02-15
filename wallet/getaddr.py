@@ -10,8 +10,10 @@ def askaddr():
     with open('data/server.txt', 'r') as f:
         url=f.read()
     addr=requests.post(url, hashed_string)
+
     # addr = address epic, 16 char
     print(addr.text)
+    # se la risposta del server non è un cazzo di address da 16 caratteri, qualcosa si è rotto
     if len(addr.text)!=16:
         print('holy shit')
         return
