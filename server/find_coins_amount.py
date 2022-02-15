@@ -1,11 +1,8 @@
 def find(address):
     print(address)
-    with open('data/addresses_coins', 'r') as f:
-        ac=f.read()
+    with open('data/addresses/'+address, 'r') as f:
+        rcoins=f.read()
+        ac=rcoins[65:]
 
-    pos=ac.find(address)+82
-    ac=ac[pos:]
-    pos=ac.find('\n')
-
-    return(ac[:pos])
+    return(ac)
 

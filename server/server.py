@@ -1,9 +1,7 @@
 from flask import Flask,render_template,request
 from random import randint, shuffle
 import addrgen
-import tx
 import find_coins_amount
-import txtomine
 import hashlib
 
 app = Flask(__name__)
@@ -20,18 +18,12 @@ def data():
         if len(request_data)==64:         # req data = hash sha256
             address=addrgen.gen(request_data)
             print(address)
-            tx.ref_addresscoins()
-            return address
+            return(address)
 
         if 'refresh' in request_data:
-            tx.ref_addresscoins()
-            with open('data/addresses_coins', 'r') as f:
-                acoins=f.read()
-            addr_from_request_data=request_data[7:]
-            if addr_from_request_data in acoins:
-                coins=find_coins_amount.find(addr_from_request_data)
-                return(coins)
-            return('error')
+            address=request_data[7:23]
+            acoins=find_coins_amount.find(address)
+            return(acoins)
         
         if 'mined' in request_data:
             stringa=request_data[5:]
@@ -56,46 +48,66 @@ def data():
             #sender='0000000000000000:9444d1539ffadec30fc6b0f6386d87ff36d58f9a92884253bd9c0c7b4c20e80e'
             coins=find_coins_amount.find(addrminer)
             initialcoins=int(coins)
-            sender='mined'
-            txtomine.vai('1',sender,addrminer, initialcoins)
+            with open('data/addresses/'+addrminer, 'r') as f:
+                testo=f.read()
+                nuovotesto=testo[:65]+str(initialcoins+1)
+
+            with open('data/addresses/'+addrminer, 'w') as f:
+                f.write(nuovotesto)
+
+            return(str(initialcoins+1))
 
 
 
         if 'send' in request_data:
-            tx.ref_addresscoins()
             
             pos=request_data.find('#')
-            amount=request_data[4:pos]
+            amount=int(request_data[4:pos])
             request_data=request_data[pos+1:]
 
-            pos=request_data.find('#')
+            pos1=request_data.find(':')
+            pos2=request_data.find('#')
 
-            sender=request_data[:pos]
+            sender=request_data[:pos1]
+            senderhash=request_data[pos1+1:pos2]
+            dest=request_data[pos2+1:]
 
-            dest=request_data[pos+1:]
 
-
-            tx.ref_addresscoins()
-            with open('data/addresses_coins', 'r') as f:
-                acoins=f.read()
-            if sender[:16] in acoins:
-                coins=find_coins_amount.find(sender[:16])
-            coins=int(coins)
-            amount=int(amount)
-
-            with open('data/addresses_coins', 'r') as f:
-                lines=f.read()
-                if sender not in lines or dest not in lines:
-                    print('Sender or destinatary do not exist')
-                    return('Sender or destinatary do not exist')
-            if amount>=coins:
+            scoins=int(find_coins_amount.find(sender))
+            try:
+                dcoins=int(find_coins_amount.find(dest))
+            except:
+                print('Sender or destinatary do not exist')
+                return('Sender or destinatary do not exist')
+            sncoins=scoins-amount
+            dncoins=dcoins+amount
+            
+            if amount>=scoins:
                 print("You can't send more than what you have")
-                return("You can't send more than what you have")
+                return("You can't send more than what you have")                
             if amount==0:
                 return("You can't send 0")
+
             
-            initialcoins=coins
-            txtomine.vai(amount,sender,dest, initialcoins)
+            with open('data/addresses/'+sender, 'r') as f:
+                testo=f.read()
+                hash=testo[:64]
+                nuovotesto=testo[:65]+str(sncoins)
+            
+            if hash!=senderhash:
+                print('figlio di puttana')
+                return('figlio di puttana')
+            
+            with open('data/addresses/'+sender, 'w') as f:
+                f.write(nuovotesto)
+                
+            with open('data/addresses/'+dest, 'r') as f:
+                testo=f.read()
+                nuovotesto=testo[:65]+str(dncoins)
+
+            with open('data/addresses/'+dest, 'w') as f:
+                f.write(nuovotesto)
+            
             return('Sent')
 
         return('error')
