@@ -11,12 +11,12 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
 import getaddr, refresh, mandatx
 import subprocess, webbrowser
-import txlist
+import txlist, import_pk, export
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
-        MainWindow.setObjectName("ScarletCoin Wallet")
-        MainWindow.resize(520, 320)
+        MainWindow.setObjectName("MainWindow")
+        MainWindow.resize(483, 373)
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.centralwidget.setObjectName("centralwidget")
         self.pushButton = QtWidgets.QPushButton(self.centralwidget)
@@ -50,54 +50,56 @@ class Ui_MainWindow(object):
         self.label_3.setFont(font)
         self.label_3.setObjectName("label_3")
         self.label_4 = QtWidgets.QLabel(self.centralwidget)
-        self.label_4.setGeometry(QtCore.QRect(30, 160, 47, 21))
+        self.label_4.setGeometry(QtCore.QRect(30, 220, 47, 21))
         font = QtGui.QFont()
         font.setPointSize(10)
         self.label_4.setFont(font)
         self.label_4.setObjectName("label_4")
         self.lineEdit = QtWidgets.QLineEdit(self.centralwidget)
-        self.lineEdit.setGeometry(QtCore.QRect(30, 190, 113, 20))
+        self.lineEdit.setGeometry(QtCore.QRect(30, 250, 113, 20))
         self.lineEdit.setObjectName("lineEdit")
         self.label_5 = QtWidgets.QLabel(self.centralwidget)
-        self.label_5.setGeometry(QtCore.QRect(170, 160, 16, 21))
+        self.label_5.setGeometry(QtCore.QRect(170, 220, 16, 21))
         font = QtGui.QFont()
         font.setPointSize(10)
         self.label_5.setFont(font)
         self.label_5.setObjectName("label_5")
         self.lineEdit_2 = QtWidgets.QLineEdit(self.centralwidget)
-        self.lineEdit_2.setGeometry(QtCore.QRect(170, 190, 113, 20))
+        self.lineEdit_2.setGeometry(QtCore.QRect(170, 250, 113, 20))
         self.lineEdit_2.setObjectName("lineEdit_2")
         self.pushButton_4 = QtWidgets.QPushButton(self.centralwidget)
-        self.pushButton_4.setGeometry(QtCore.QRect(330, 190, 75, 23))
+        self.pushButton_4.setGeometry(QtCore.QRect(330, 250, 75, 23))
         self.pushButton_4.setObjectName("pushButton_4")
+        self.pushButton_5 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_5.setGeometry(QtCore.QRect(330, 280, 75, 23))
+        self.pushButton_5.setObjectName("pushButton_5")
+        self.pushButton_6 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_6.setGeometry(QtCore.QRect(330, 310, 111, 23))
+        self.pushButton_6.setObjectName("pushButton_6")
+        self.label_ok = QtWidgets.QLabel(self.centralwidget)
+        self.label_ok.setGeometry(QtCore.QRect(30, 290, 471, 41))
+        font = QtGui.QFont()
+        font.setPointSize(10)
+        self.label_ok.setFont(font)
+        self.label_ok.setText("")
+        self.label_ok.setObjectName("label_ok")
+        self.pushButton_7 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_7.setGeometry(QtCore.QRect(330, 120, 121, 21))
+        self.pushButton_7.setObjectName("pushButton_7")
+        self.pushButton_8 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_8.setGeometry(QtCore.QRect(150, 180, 75, 23))
+        self.pushButton_8.setObjectName("pushButton_8")
+        self.pushButton_9 = QtWidgets.QPushButton(self.centralwidget)
+        self.pushButton_9.setGeometry(QtCore.QRect(260, 180, 75, 23))
+        self.pushButton_9.setObjectName("pushButton_9")
         MainWindow.setCentralWidget(self.centralwidget)
         self.menubar = QtWidgets.QMenuBar(MainWindow)
-        self.menubar.setGeometry(QtCore.QRect(0, 0, 520, 21))
+        self.menubar.setGeometry(QtCore.QRect(0, 0, 483, 21))
         self.menubar.setObjectName("menubar")
         MainWindow.setMenuBar(self.menubar)
         self.statusbar = QtWidgets.QStatusBar(MainWindow)
         self.statusbar.setObjectName("statusbar")
         MainWindow.setStatusBar(self.statusbar)
-
-        self.label_ok = QtWidgets.QLabel(self.centralwidget)
-        self.label_ok.setGeometry(QtCore.QRect(30, 230, 471, 41))
-        font = QtGui.QFont()
-        font.setPointSize(10)
-        self.label_ok.setFont(font)
-        self.label_ok.setObjectName("label_ok")
-
-        self.pushButton_5 = QtWidgets.QPushButton(self.centralwidget)
-        self.pushButton_5.setGeometry(QtCore.QRect(330, 220, 75, 23))
-        self.pushButton_5.setObjectName("pushButton_5")
-
-        self.pushButton_6 = QtWidgets.QPushButton(self.centralwidget)
-        self.pushButton_6.setGeometry(QtCore.QRect(330, 250, 111, 23))
-        self.pushButton_6.setObjectName("pushButton_6")
-
-        self.pushButton_7 = QtWidgets.QPushButton(self.centralwidget)
-        self.pushButton_7.setGeometry(QtCore.QRect(330, 120, 121, 21))
-        self.pushButton_7.setObjectName("pushButton_7")
-
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -123,13 +125,12 @@ class Ui_MainWindow(object):
         self.label_5.setText(_translate("MainWindow", "to"))
         self.lineEdit_2.setText(_translate("MainWindow", "abcdef123"))
         self.pushButton_4.setText(_translate("MainWindow", "Send"))
-
         self.label_ok.setText(_translate("MainWindow", ""))
-
         self.pushButton_5.setText(_translate("MainWindow", "Copy txid"))
         self.pushButton_6.setText(_translate("MainWindow", "Lookup on explorer"))
         self.pushButton_7.setText(_translate("MainWindow", "Open transactions list"))
-
+        self.pushButton_8.setText(_translate("MainWindow", "Import"))
+        self.pushButton_9.setText(_translate("MainWindow", "Export"))
         self.pushButton.clicked.connect(self.ga)
         self.pushButton_2.clicked.connect(self.ref)
         self.pushButton_3.clicked.connect(self.copia)
@@ -137,6 +138,8 @@ class Ui_MainWindow(object):
         self.pushButton_5.clicked.connect(self.copiatxid)
         self.pushButton_6.clicked.connect(self.apriweb)
         self.pushButton_7.clicked.connect(self.apritxlist)
+        self.pushButton_8.clicked.connect(self.importprivatekey)
+        self.pushButton_9.clicked.connect(self.exportprivatekey)
 
 
         with open('data/addresslist.txt', 'r') as f:
@@ -159,8 +162,8 @@ class Ui_MainWindow(object):
         actualaddress=self.comboBox.currentText()
         actualcoins=refresh.ref(actualaddress)
         self.label_3.setText(str(actualcoins))
-
         self.comboBox.currentTextChanged.connect(self.on_combobox_changed)
+
 
     def on_combobox_changed(self):
         actualaddress=self.comboBox.currentText()
@@ -219,10 +222,22 @@ class Ui_MainWindow(object):
         webbrowser.open(webtx)
 
     def apritxlist(self):
-        print('ok')
         actualaddress=self.comboBox.currentText()
         self.window = QtWidgets.QMainWindow()
         self.ui = txlist.Ui_txlist()
+        self.ui.setupUi(self.window,actualaddress)
+        self.window.show()
+
+    def importprivatekey(self):
+        self.window = QtWidgets.QMainWindow()
+        self.ui = import_pk.Ui_MainWindow()
+        self.ui.setupUi(self.window)
+        self.window.show()
+
+    def exportprivatekey(self):
+        actualaddress=self.comboBox.currentText()
+        self.window = QtWidgets.QMainWindow()
+        self.ui = export.Ui_MainWindow()
         self.ui.setupUi(self.window,actualaddress)
         self.window.show()
 

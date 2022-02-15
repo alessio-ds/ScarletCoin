@@ -13,7 +13,6 @@ import requests, subprocess, webbrowser
 
 class Ui_txlist(object):
     def setupUi(self, MainWindow,addr):
-        print(addr)
         
         MainWindow.setObjectName("ScarletCoin Wallet - Transactions list")
 
