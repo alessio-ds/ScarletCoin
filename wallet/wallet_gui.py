@@ -12,6 +12,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import getaddr, refresh, mandatx
 import subprocess, webbrowser
 import txlist, import_pk, export
+import requests
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
@@ -242,6 +243,25 @@ class Ui_MainWindow(object):
         self.ui = import_pk.Ui_MainWindow()
         self.ui.setupUi(self.window)
         self.window.show()
+
+        self.ui.pushButton.clicked.connect(self.updateWindow)
+
+    def updateWindow(self):
+        with open('data/server.txt', 'r') as f:
+            url=f.read()
+        hash=self.ui.lineEdit.text()
+        hash=hash.strip()
+        request='import'+hash
+        response=requests.post(url, request)
+        response=response.text
+        if response=='non existant':
+            self.ui.label_2.setText("Wrong private key. Try again")
+        else:
+            self.ui.label_2.setText("Imported successfully")
+            print('yea!!!!')
+            with open('data/addresslist.txt', 'a') as f:
+                f.write(response+'\n')
+        self.comboBox.addItem(response[:16])
 
     def exportprivatekey(self):
         actualaddress=self.comboBox.currentText()

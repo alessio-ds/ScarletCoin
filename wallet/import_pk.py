@@ -34,6 +34,7 @@ class Ui_MainWindow(object):
         self.label_2 = QtWidgets.QLabel(self.centralwidget)
         self.label_2.setGeometry(QtCore.QRect(170, 100, 141, 16))
         self.label_2.setObjectName("label_2")
+        self.label_2.setAlignment(QtCore.Qt.AlignCenter)
         MainWindow.setCentralWidget(self.centralwidget)
         self.menubar = QtWidgets.QMenuBar(MainWindow)
         self.menubar.setGeometry(QtCore.QRect(0, 0, 332, 21))
@@ -52,21 +53,7 @@ class Ui_MainWindow(object):
         self.label.setText(_translate("MainWindow", "Enter your private key"))
         self.pushButton.setText(_translate("MainWindow", "Import"))
         self.label_2.setText(_translate("MainWindow", ""))
-        self.pushButton.clicked.connect(self.richiesta)
-
-    def richiesta(self):
-        with open('data/server.txt', 'r') as f:
-            url=f.read()
-        hash=self.lineEdit.text()
-        request='import'+hash
-        response=requests.post(url, request)
-        response=response.text
-        if response=='non existant':
-            self.label_2.setText("Wrong private key. Try again")
-        else:
-            self.label_2.setText("Imported successfully")
-            with open('data/addresslist.txt', 'a') as f:
-                f.write(response+'\n')
+        
 
 
 if __name__ == "__main__":
