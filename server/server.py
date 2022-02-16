@@ -45,6 +45,13 @@ def data():
             stringa=request_data[5:]
             pos=stringa.find('#')
             strhash=stringa[:pos]
+            addrminer=stringa[pos+1:]
+            addrminer=addrminer.strip('\n')
+            #sender='0000000000000000:9444d1539ffadec30fc6b0f6386d87ff36d58f9a92884253bd9c0c7b4c20e80e'
+            coins=find_coins_amount.find(addrminer)
+            if coins=='Address does not exist':
+                print('address doesnt exist')
+                return(coins)
             print(strhash)
             strhashok=(hashlib.sha256(strhash.encode())).hexdigest()
             if strhashok[0:4]!='0000':
@@ -60,10 +67,7 @@ def data():
                 with open('data/mined','a') as f:
                     f.write(strhash+'\n')
             print('valid')
-            addrminer=stringa[pos+1:]
-            addrminer=addrminer.strip('\n')
-            #sender='0000000000000000:9444d1539ffadec30fc6b0f6386d87ff36d58f9a92884253bd9c0c7b4c20e80e'
-            coins=find_coins_amount.find(addrminer)
+
             initialcoins=int(coins)
             with open('data/addresses/'+addrminer, 'r') as f:
                 testo=f.read()
