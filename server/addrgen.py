@@ -14,7 +14,7 @@ def gen(request_data):
                 f.write(request_data+':0')
                 c+=1
             with open('data/address', 'a') as f:
-                f.write(request_data)
+                f.write(output_string+':'+request_data)
             return(output_string)
 
 def gentxid(sender,dest,amount):
