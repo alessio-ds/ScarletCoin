@@ -40,15 +40,24 @@ class Ui_MainWindow(object):
         self.statusbar.setObjectName("statusbar")
         MainWindow.setStatusBar(self.statusbar)
 
-        self.retranslateUi(MainWindow)
+        self.retranslateUi(MainWindow, addr)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
 
-    def retranslateUi(self, MainWindow):
+    def retranslateUi(self, MainWindow, addr):
         _translate = QtCore.QCoreApplication.translate
         MainWindow.setWindowTitle(_translate("MainWindow", "MainWindow"))
         self.label.setText(_translate("MainWindow", "Your private key"))
-        self.lineEdit.setText(_translate("MainWindow", "22ed42b2570a4ed938ef589c8f4b7774ea7c5e53a1018e005f528fbc30124351"))
+        self.lineEdit.setText(_translate("MainWindow", "i just shit at my ass"))
         self.pushButton_2.setText(_translate("MainWindow", "Copy"))
+        self.lineEdit.setText(self.findhash(addr))
+
+    def findhash(self, addr):
+        with open('data/addresslist.txt', 'r') as f:
+            lines=f.readlines()
+        for l in lines:
+            if l[:16]==addr:
+                hash=l[17:]
+        return(hash)
 
 
 if __name__ == "__main__":
