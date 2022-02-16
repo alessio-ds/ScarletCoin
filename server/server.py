@@ -159,11 +159,11 @@ def data():
 
             
         if 'import' in request_data:
-            hash=request_data[5:]
+            hash=request_data[6:]
             with open('data/address', 'r') as f:
                 linee = f.readlines()
             for l in linee:
-                if l[17:]==hash:
+                if l[16:]==hash:
                     return(l)
             return('non existant')
             
