@@ -16,11 +16,13 @@ def data():
             form_data = request.form
             a=form_data
             txid=a['Field1_name']
+            txid=txid.strip()
             try:
                 with open('templates/txs/'+txid+'.html', 'r') as f:
                     print(f'{txid} has been found') 
                     with open('data/explorer','r') as f:
                         explurl=f.read()
+                        explurl=explurl.strip()
                     return redirect(explurl+txid+'.html')
             except:
                 return("Couldn't find any tx with that id.")
