@@ -168,7 +168,16 @@ class Ui_MainWindow(object):
     def on_combobox_changed(self):
         actualaddress=self.comboBox.currentText()
         actualcoins=refresh.ref(actualaddress)
-        self.label_3.setText(str(actualcoins))
+        if actualcoins=='Address does not exist':
+            font = QtGui.QFont()
+            font.setPointSize(8)
+            self.label_3.setFont(font)
+            self.label_3.setText(actualcoins)
+        else:
+            font = QtGui.QFont()
+            font.setPointSize(14)
+            self.label_3.setFont(font)
+            self.label_3.setText(str(actualcoins))
     def copia(self):
         actualaddress=self.comboBox.currentText()
         cmd='echo '+actualaddress+'|clip'
