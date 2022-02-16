@@ -9,6 +9,7 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+import requests
 
 
 class Ui_MainWindow(object):
@@ -50,7 +51,21 @@ class Ui_MainWindow(object):
         MainWindow.setWindowTitle(_translate("MainWindow", "MainWindow"))
         self.label.setText(_translate("MainWindow", "Enter your private key"))
         self.pushButton.setText(_translate("MainWindow", "Import"))
-        self.label_2.setText(_translate("MainWindow", "Wrong private key. Try again"))
+        self.label_2.setText(_translate("MainWindow", ""))
+        self.pushButton.clicked.connect(self.richiesta)
+
+    def richiesta(self):
+        with open('data/server.txt', 'r') as f:
+            url=f.read()
+        hash=self.lineEdit.text()
+        request='import'+hash
+        response=requests.post(url, request)
+        if response=='non existant':
+            self.label_2.setText("Wrong private key. Try again")
+        else:
+            self.label_2.setText("Imported successfully")
+            with open('data/addresslist.txt', 'a') as f:
+                f.write(response+'\n')
 
 
 if __name__ == "__main__":

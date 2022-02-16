@@ -158,8 +158,18 @@ def data():
             return(data_to_send)
 
             
+        if 'import' in request_data:
+            hash=request_data[5:]
+            with open('data/address', 'r') as f:
+                linee = f.readlines()
+            for l in linee:
+                if l[16:]==hash:
+                    return(l)
+            return('non existant')
+            
+       
         return('error')
-
+        
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0',debug=True)
