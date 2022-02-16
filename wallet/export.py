@@ -9,6 +9,7 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from subprocess import check_call as checkailcall
 
 
 class Ui_MainWindow(object):
@@ -50,14 +51,20 @@ class Ui_MainWindow(object):
         self.lineEdit.setText(_translate("MainWindow", "i just shit at my ass"))
         self.pushButton_2.setText(_translate("MainWindow", "Copy"))
         self.lineEdit.setText(self.findhash(addr))
+        self.pushButton_2.clicked.connect(self.copia)
 
     def findhash(self, addr):
         with open('data/addresslist.txt', 'r') as f:
             lines=f.readlines()
+        global hash
         for l in lines:
             if l[:16]==addr:
                 hash=l[17:]
         return(hash)
+
+    def copia(self):
+        cmd='echo '+hash+'| clip'
+        return checkailcall(cmd, shell=True)
 
 
 if __name__ == "__main__":
