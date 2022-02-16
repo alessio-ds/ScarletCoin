@@ -249,8 +249,16 @@ class Ui_MainWindow(object):
     def updateWindow(self):
         with open('data/server.txt', 'r') as f:
             url=f.read()
+        with open('data/addresslist.txt', 'r') as f:
+            addresses=f.readlines()
         hash=self.ui.lineEdit.text()
         hash=hash.strip()
+        for l in addresses:
+            l=l.strip()
+            if hash==l[17:]:
+                self.ui.label_2.setText("Address already exists")
+                return('address already exists')
+
         request='import'+hash
         response=requests.post(url, request)
         response=response.text
@@ -261,7 +269,7 @@ class Ui_MainWindow(object):
             print('yea!!!!')
             with open('data/addresslist.txt', 'a') as f:
                 f.write(response+'\n')
-        self.comboBox.addItem(response[:16])
+            self.comboBox.addItem(response[:16])
 
     def exportprivatekey(self):
         actualaddress=self.comboBox.currentText()
