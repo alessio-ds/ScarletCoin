@@ -50,7 +50,7 @@ class Ui_MainWindow(object):
         self.lineEdit.setText(_translate("MainWindow", "i just shit at my ass"))
         self.pushButton_2.setText(_translate("MainWindow", "Copy"))
         self.lineEdit.setText(self.findhash(addr))
-        self.pushButton_2.clicked.connect(self.copia)
+        self.pushButton_2.clicked.connect(self.copia(addr))
 
     def findhash(self, addr):
         with open('data/addresslist.txt', 'r') as f:
@@ -62,8 +62,8 @@ class Ui_MainWindow(object):
         hash=hash.strip('\n')
         return(hash)
 
-    def copia(self):
-        cmd='echo '+hash+' | clip'
+    def copia(self, addr):
+        cmd='echo '+addr+':'+hash+' | clip'
         print(hash)
         subprocess.check_call(cmd, shell=True)
 
