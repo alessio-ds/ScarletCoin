@@ -9,7 +9,7 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from subprocess import check_call as checkailcall
+from subprocess import check_call
 
 
 class Ui_MainWindow(object):
@@ -64,7 +64,7 @@ class Ui_MainWindow(object):
 
     def copia(self):
         cmd='echo '+hash+'| clip'
-        return checkailcall(cmd, shell=True)
+        return check_call(cmd, shell=True)
 
 
 if __name__ == "__main__":
