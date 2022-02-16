@@ -60,6 +60,7 @@ class Ui_MainWindow(object):
         hash=self.lineEdit.text()
         request='import'+hash
         response=requests.post(url, request)
+        response=response.text
         if response=='non existant':
             self.label_2.setText("Wrong private key. Try again")
         else:
