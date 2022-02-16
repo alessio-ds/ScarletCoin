@@ -163,6 +163,7 @@ def data():
             with open('data/address', 'r') as f:
                 linee = f.readlines()
             for l in linee:
+                l=l.strip()
                 if l[17:]==hash:
                     return(l)
             return('non existant')
