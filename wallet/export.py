@@ -9,8 +9,7 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from subprocess import check_call
-
+import subprocess
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow, addr):
@@ -60,11 +59,13 @@ class Ui_MainWindow(object):
         for l in lines:
             if l[:16]==addr:
                 hash=l[17:]
+        hash=hash.strip('\n')
         return(hash)
 
     def copia(self):
-        cmd='echo '+hash+'| clip'
-        return check_call(cmd, shell=True)
+        cmd='echo '+hash+' | clip'
+        print(hash)
+        subprocess.check_call(cmd, shell=True)
 
 
 if __name__ == "__main__":
