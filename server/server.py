@@ -3,6 +3,8 @@ import addrgen
 import find_coins_amount
 import hashlib
 import datetime
+from threading import Thread
+from time import sleep
 import supply
 
 app = Flask(__name__)
@@ -172,7 +174,25 @@ def data():
             
        
         return('error')
-        
+    
+
+def start():
+    t1=Thread(target=run)
+    t1.start()
+
+
+def run():
+    while True:
+        with open('templates/indexbase1.html','r', encoding='utf-8') as f:
+            i1=f.read()
+        with open('templates/indexbase2.html','r', encoding='utf-8') as f:
+            i2=f.read()
+        with open('templates/index.html','w', encoding='utf-8') as f:
+            stronzium=f'<h2><font font color="#c1b492">Total supply: {supply.findsupply()} </font> </h2>'
+            index=i1+stronzium+i2
+            f.write(index)
+        sleep(300)
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0',debug=True)
+    start()
+    app.run(host='0.0.0.0', debug=True)
