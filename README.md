@@ -1,7 +1,7 @@
 # ScarletCoin
 ScarletCoin main repo, containing server, wallet and miner.
 
-You can:
+## Features
 - Create new wallets
 - Import and export wallets
 - Send and receive ScarletCoins
@@ -13,6 +13,11 @@ Every address is linked to a unique **SHA256** hash, which would take **1.27e+88
 
 A server manages every request in **the most secure** way.
 
+## To do
+- Smart Contracts
+- NFTs
+- Automated halvings
+- Minor UI bugfixes
 ## How to use
 Please check the [releases](https://github.com/alessio-ds/ScarletCoin/releases/) page.
 
