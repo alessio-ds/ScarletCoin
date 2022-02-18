@@ -17,7 +17,7 @@ import requests
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(483, 373)
+        MainWindow.setFixedSize(483, 373)
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.centralwidget.setObjectName("centralwidget")
         self.pushButton = QtWidgets.QPushButton(self.centralwidget)
@@ -182,6 +182,7 @@ class Ui_MainWindow(object):
     def copia(self):
         actualaddress=self.comboBox.currentText()
         cmd='echo '+actualaddress+'|clip'
+        self.label_ok.setText('Address copied to clipboard')
         return subprocess.check_call(cmd, shell=True)
 
     def ga(self):
@@ -226,10 +227,17 @@ class Ui_MainWindow(object):
         self.label_3.setText(str(actualcoins))
         
     def copiatxid(self):
-        cmd='echo '+txid+'|clip'
-        return subprocess.check_call(cmd, shell=True)
+        try:
+            cmd='echo '+txid+'|clip'
+            self.label_ok.setText('TXID copied to clipboard')
+            return subprocess.check_call(cmd, shell=True)
+        except:
+            self.label_ok.setText('Make a transaction first')
     def apriweb(self):
-        webbrowser.open(webtx)
+        try:
+            webbrowser.open(webtx)
+        except:
+            self.label_ok.setText('Make a transaction first')
 
     def apritxlist(self):
         actualaddress=self.comboBox.currentText()
