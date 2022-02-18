@@ -1,25 +1,28 @@
 # ScarletCoin
-ScarletCoin main repo, containing server, wallet and miner.
+**ScarletCoin main repo, containing server, wallet and miner.**
+
+**Check the [ScarletCoin Wiki](https://github.com/alessio-ds/ScarletCoin/wiki/ScarletCoin-Wiki) if you're a developer!**
 
 ## Features
-- Create new wallets
-- Import and export wallets
-- Send and receive ScarletCoins
-- Mine ScarletCoins 
-- Check every transaction both on wallet and on website
-- Check the actual total supply on the website
+- **Create new wallets**
+- **Import and export wallets**
+- **Send and receive ScarletCoins**
+- **Mine ScarletCoins** 
+- **Check every transaction both on wallet and on website**
+- **Check the actual total supply on the website**
 
 Every address is linked to a unique **SHA256** hash, which would take **1.27e+88 years to crack**, using a IBM supercomputer.
 
 A server manages every request in **the most secure** way.
 
 ## To do
-- Smart Contracts
-- NFTs
-- Automated halvings
-- Minor UI bugfixes
+- **Smart Contracts**
+- **NFTs**
+- **Automated halvings**
+- **Minor UI bugfixes**
+
 ## How to use
-Please check the [releases](https://github.com/alessio-ds/ScarletCoin/releases/) page.
+**Please check the [releases](https://github.com/alessio-ds/ScarletCoin/releases/) page.**
 
 If you want to check any txid, follow [this link](http://alessiosca.ddns.net:20000).
 
