@@ -3,7 +3,8 @@
 
 **Check the [ScarletCoin Wiki](https://github.com/alessio-ds/ScarletCoin/wiki/ScarletCoin-Wiki) if you're a developer!**
 
-**[Server status](https://scarletcoin.betteruptime.com/)**
+<p align=center><a align="center" href='https://scarletcoin.betteruptime.com/'><b>Server Status</b></a>
+
 ## Features
 - **Create new wallets**
 - **Import and export wallets**
