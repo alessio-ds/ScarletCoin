@@ -144,7 +144,7 @@ def data():
 
                 now = datetime.datetime.now()
                 date=now.strftime('%Y-%m-%d %H:%M:%S')
-                fstr=f'{primaparte}TXID  {txid}」<br><br>「{sender} sent {amount} ScarletCoins to {dest}」<br>「Date of tx: {date}{secondaparte}'
+                fstr=f"{primaparte}TXID  {txid}」<br><br>「{sender} sent {amount} ScarletCoins to {dest}」<br>「Date of tx: {date}」<br><br>「<a href='http://alessiosca.ddns.net:20000'>Go Back</a>{secondaparte}"
                 f.write(fstr)
             
 
