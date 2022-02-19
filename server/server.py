@@ -183,14 +183,23 @@ def start():
 
 def run():
     while True:
+        diz_top=supply.findtop()
+        stringa_diztop=''
+        cont=0
+        for e in diz_top:
+            if cont<=10:
+                cont+=1
+                stringa_diztop+=f'{cont}. 「{e} — {diz_top[e]} ScarletCoins」<br>'
         with open('templates/indexbase1.html','r', encoding='utf-8') as f:
             i1=f.read()
         with open('templates/indexbase2.html','r', encoding='utf-8') as f:
             i2=f.read()
         with open('templates/index.html','w', encoding='utf-8') as f:
-            stronzium=f'<h2><font font color="#c1b492">Total supply: {supply.findsupply()} </font> </h2>'
+            stronzium=f'<h4><font font color="#c1b492">Top ten addresses:<br><br>{stringa_diztop}</font><h2><font font color="#c1b492"><br>Total supply: {supply.findsupply()} </font> </h2>'
             index=i1+stronzium+i2
             f.write(index)
+
+
         sleep(300)
 
 if __name__ == "__main__":
