@@ -53,11 +53,15 @@ class Ui_txlist(object):
         self.tableWidget.setRowCount(len(res))
         row=0
         for e in res:
-
             txid=e[:32]
             amount=e[e.rfind(':')+1:].strip()
             self.tableWidget.setItem(row, 0, QtWidgets.QTableWidgetItem(txid))
-            self.tableWidget.setItem(row, 1, QtWidgets.QTableWidgetItem(amount))
+            if e[33:49]==addr:
+                amount='- '+str(amount)
+                self.tableWidget.setItem(row, 1, QtWidgets.QTableWidgetItem(amount))
+            elif e[50:-3]==addr:
+                amount='+ '+str(amount)
+                self.tableWidget.setItem(row, 1, QtWidgets.QTableWidgetItem(amount))
             row+=1
 
         
