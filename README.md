@@ -3,6 +3,8 @@
 
 **Check the [ScarletCoin Wiki](https://github.com/alessio-ds/ScarletCoin/wiki/ScarletCoin-Wiki) if you're a developer!**
 
+**PLEASE EDIT THE "server.txt" FILE AND CHANGE THE SERVER TO "http://scarlet.iliadboxos.it:20000", AS THE OLD DOMAIN IS IN MAINTENANCE.**
+
 <p align=center><a align="center" href='https://scarletcoin.betteruptime.com/'><b>Server Status</b></a>
 
 ## Features
@@ -25,7 +27,7 @@ A server manages every request in **the most secure** way.
 
 ## How to use
 **Please check the [releases](https://github.com/alessio-ds/ScarletCoin/releases/) page.**
-
+  
 If you want to check any txid, follow [this link](http://alessiosca.ddns.net:20000).
 
 ### Wallet proof of work
