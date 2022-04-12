@@ -49,5 +49,7 @@ If you want to check any txid, follow [this link](http://alessiosca.ddns.net:200
 ### Open transactions list
 ![](https://i.imgur.com/yGWCvHk.png)
 
-### Check total supply on the main page of the website
-![](https://i.imgur.com/ph5GT5s.png)
+### Check total supply and top 10 addresses on the main page of the website
+![](https://i.imgur.com/aDjFhPe.png)
+
+  
