@@ -3,8 +3,6 @@
 
 **Check the [ScarletCoin Wiki](https://github.com/alessio-ds/ScarletCoin/wiki/ScarletCoin-Wiki) if you're a developer!**
 
-**PLEASE EDIT THE "server.txt" FILE AND CHANGE THE SERVER TO "http://scarlet.iliadboxos.it:20000", AS THE OLD DOMAIN IS IN MAINTENANCE.**
-
 <p align=center><a align="center" href='https://scarletcoin.betteruptime.com/'><b>Server Status</b></a>
 
 ## Features
