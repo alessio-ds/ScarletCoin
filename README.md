@@ -53,3 +53,11 @@ If you want to check any txid, follow [this link](http://alessiosca.ddns.net:200
 ![](https://i.imgur.com/aDjFhPe.png)
 
   
+### Staking
+Each wallet will be rewarded with amount_of_coins/365/288  ScarletCoins every 300 seconds (5 minutes).
+
+**The minimum amount to get automatic ScarletCoins is 105120.**
+
+**This is the earning table:**
+
+![](https://i.imgur.com/uhDUCkD.png)
