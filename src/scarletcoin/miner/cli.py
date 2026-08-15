@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=15.0,
         help="seconds between requests for fresh work (default: %(default)s)",
     )
+    parser.add_argument(
+        "--max-rate",
+        type=float,
+        metavar="HASHES_PER_SEC",
+        help="cap the hash rate so the machine is not saturated (e.g. 1000)",
+    )
     parser.add_argument("--blocks", type=int, help="stop after mining this many blocks")
     parser.add_argument("--quiet", action="store_true", help="only report mined blocks")
     add_network_arguments(parser)
@@ -110,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         args.address,
         workers=args.workers,
         refresh_seconds=args.refresh,
+        max_rate=args.max_rate,
         on_event=on_event,
     )
 

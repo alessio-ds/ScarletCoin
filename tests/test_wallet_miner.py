@@ -273,6 +273,42 @@ class TestMiner:
         assert stats.blocks_accepted == 1
         assert client.getblockcount() == 1
 
+    def test_a_zero_or_negative_rate_cap_is_ignored(self, rpc, key):
+        from scarletcoin.miner.miner import Miner
+
+        _, _, client = rpc
+        address = str(key.address(REGTEST.address_version))
+        assert Miner(client, address, workers=1, max_rate=0).max_rate is None
+        assert Miner(client, address, workers=1, max_rate=-5).max_rate is None
+        assert Miner(client, address, workers=1, max_rate=500).max_rate == 500
+        # and a capped miner still mines fine
+        stats = Miner(client, address, workers=1, max_rate=500).run(max_blocks=1)
+        assert stats.blocks_accepted == 1
+
+    def test_a_rate_cap_actually_slows_the_loop(self, rpc, key, monkeypatch):
+        import time
+
+        import scarletcoin.miner.miner as module
+        from scarletcoin.miner.solver import ScanResult
+
+        _, _, client = rpc
+        address = str(key.address(REGTEST.address_version))
+
+        def quick_scan(header, target, *, start=0, count=1 << 20):
+            if start >= 2 * 1 << 16:  # a solution on the third call
+                return ScanResult(start, count, 0.001)
+            return ScanResult(None, count, 0.001)
+
+        monkeypatch.setattr(module, "scan_nonces", quick_scan)
+        monkeypatch.setattr(module.Miner, "_tune_chunk", lambda self, seconds: None)
+        miner = module.Miner(client, address, workers=1, max_rate=500, refresh_seconds=60)
+        miner._chunk = 1 << 16
+        started = time.time()
+        miner.run(max_blocks=1)
+        elapsed = time.time() - started
+        # 3 x 65536 hashes at a 500 H/s cap means ~0.39 s of idle time.
+        assert elapsed >= 0.3
+
     def test_an_unreachable_node_is_reported(self, key):
         from scarletcoin.net.client import RpcClient
 

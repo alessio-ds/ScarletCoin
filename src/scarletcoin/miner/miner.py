@@ -99,6 +99,7 @@ class Miner:
         *,
         workers: int = 1,
         refresh_seconds: float = 15.0,
+        max_rate: float | None = None,
         tag: bytes = b"scarlet-miner",
         on_event: Callable[[str, dict], None] | None = None,
     ) -> None:
@@ -106,6 +107,7 @@ class Miner:
         self.address_text = address
         self.workers = max(1, int(workers))
         self.refresh_seconds = max(1.0, float(refresh_seconds))
+        self.max_rate = max_rate if max_rate is not None and max_rate > 0 else None
         self.tag = tag[:32]
         self.on_event = on_event
         self.stats = MinerStats()
@@ -247,6 +249,12 @@ class Miner:
             self.stats.last_rate = hashes / seconds if seconds > 0 else 0.0
             self._tune_chunk(seconds)
             self._emit("progress", hashes=hashes, rate=self.stats.last_rate)
+
+            if self.max_rate is not None and seconds > 0:
+                # Idle the workers until the average rate drops to the cap.
+                idle = hashes / self.max_rate - seconds
+                if idle > 0 and self._stop.wait(min(idle, 1.0)):
+                    break
 
             if found is not None:
                 solved = candidate.with_header(candidate.header.with_nonce(found))
