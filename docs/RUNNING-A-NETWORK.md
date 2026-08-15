@@ -364,10 +364,11 @@ description="ScarletCoin miner"
 
 : ${address:=S_your_address_here}
 : ${workers:=1}
+: ${max_rate:=}
 
 command="/opt/scarletcoin/.venv/bin/scarlet-miner"
 command_args="${address} --network mainnet --datadir /var/lib/scarletcoin
-    --workers ${workers} --quiet"
+    --workers ${workers} --quiet ${max_rate:+--max-rate ${max_rate}}"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
@@ -388,7 +389,11 @@ rc-service scarlet-miner start
 The miner reads the node's token from `/var/lib/scarletcoin/mainnet/rpc.token`,
 which is why it runs as the same user. Keep `workers` to one or two on a small
 VPS — the point is to keep the chain moving, and difficulty adapts to whatever
-hash rate shows up.
+hash rate shows up. Even one worker burns a full core; to leave the machine
+responsive, cap the rate with `max_rate`, for example `max_rate=500` keeps the
+miner under half a per cent of a core. The node also uses a core; on a VPS with
+two vCPUs that is the whole machine, so do not mine and expect to run anything
+else there.
 
 ### 7. Check it from outside
 
