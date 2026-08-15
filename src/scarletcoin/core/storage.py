@@ -317,6 +317,14 @@ class Storage:
         )
         return [self._entry(row) for row in rows]
 
+    def count_blocks_since(self, timestamp: int) -> int:
+        """Number of active-chain blocks with a timestamp at or after ``timestamp``."""
+        row = self._one(
+            "SELECT COUNT(*) AS n FROM blocks WHERE in_chain = 1 AND timestamp >= ?",
+            (timestamp,),
+        )
+        return 0 if row is None else int(row["n"])
+
     def block_count(self) -> int:
         """Total number of stored blocks, including side branches."""
         row = self._one("SELECT COUNT(*) AS n FROM blocks")

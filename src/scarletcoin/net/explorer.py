@@ -59,6 +59,7 @@ button {
 .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase;
                letter-spacing: 0.1em; }
 .card .value { font-size: 19px; margin-top: 6px; word-break: break-all; }
+.card .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
 table { width: 100%; border-collapse: collapse; background: var(--panel);
         border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line);
@@ -200,6 +201,33 @@ def _when(timestamp: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamp)) + " UTC"
 
 
+def _hash_rate(rate: float | None) -> str:
+    """Render a hash rate with a sensible unit."""
+    if rate is None:
+        return "&mdash;"
+    for unit in ("H/s", "kH/s", "MH/s", "GH/s", "TH/s"):
+        if rate < 1000:
+            return f"{rate:.2f} {unit}"
+        rate /= 1000
+    return f"{rate:.2f} PH/s"  # pragma: no cover - optimistic
+
+
+def _duration(seconds: float | None) -> str:
+    """Render a number of seconds the way a person reads it."""
+    if seconds is None:
+        return "&mdash;"
+    if seconds < 10:
+        return f"{seconds:.1f} s"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60} s"
+    if seconds < 86400:
+        return f"{seconds // 3600} h {seconds % 3600 // 60} min"
+    return f"{seconds // 86400} d {seconds % 86400 // 3600} h"
+
+
 def _amount(scar: int) -> str:
     """An amount in SCT, coloured."""
     return f'<span class="amount">{escape(format_amount(scar))}</span>'
@@ -243,17 +271,46 @@ def _overview(server: RpcServer) -> str:
                 _html(_address_link(miner, short=True)),
             ]
         )
+    stats = chain.network_stats()
+    pace = "&mdash;"
+    if stats["average_spacing"]:
+        pace = (
+            f"{_duration(stats['average_spacing'])} / block"
+            f'<div class="sub">target {_duration(stats["target_spacing"])}</div>'
+        )
+    change = stats["estimated_difficulty_change"]
+    retarget = (
+        f"in {stats['blocks_until_retarget']} blocks"
+        f'<div class="sub">height {stats["next_retarget_height"]}'
+        + ("" if change is None else f", estimated {'+' if change >= 0 else ''}{change:.1f}%")
+        + "</div>"
+    )
+
     body = _cards(
         [
             ("Network", escape(info["network"])),
             ("Height", str(info["height"])),
-            ("Difficulty", f"{info['difficulty']:.6g}"),
             ("Circulating supply", _amount(info["supply"])),
-            ("Unspent outputs", str(info["utxo_count"])),
             ("Mempool", f"{info['mempool_size']} tx"),
+        ]
+    )
+    body += "<h2>Network</h2>" + _cards(
+        [
+            ("Block rate", pace),
+            ("Hash rate", _hash_rate(stats["hash_rate"])),
+            ("Difficulty", f"{stats['difficulty']:.6g}"),
+            ("Next retarget", retarget),
+            ("Last block", f"{_duration(stats['seconds_since_last_block'])} ago"),
+            ("Blocks last hour", str(stats["blocks_last_hour"])),
+            ("Blocks last 24 h", str(stats["blocks_last_day"])),
+            ("Unspent outputs", str(info["utxo_count"])),
             ("Peers", str(info["peers"])),
             ("Node version", escape(info["version"])),
         ]
+    )
+    body += (
+        f'<p class="empty">Measured over the last {stats["window"]} blocks'
+        f" ({_duration(stats['window_seconds'])}).</p>"
     )
     body += "<h2>Latest blocks</h2>" + _rows(
         ["#Height", "Hash", "Time", "#Txs", "#Reward", "Miner"], blocks

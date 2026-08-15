@@ -574,6 +574,76 @@ class Blockchain:
         """Total value of all unspent outputs, in scar."""
         return self.storage.utxo_stats()[1]
 
+    def network_stats(self, window: int | None = None) -> dict:
+        """Measure how fast the chain is actually moving.
+
+        Everything here is observed, not claimed: the pace comes from the
+        timestamps of the last ``window`` blocks, and the hash rate from the work
+        those blocks added divided by the time they took.
+
+        Args:
+            window: How many recent blocks to average over. Defaults to one
+                retargeting period.
+
+        Returns:
+            A JSON-friendly dictionary. Fields that cannot be measured yet (an
+            empty or one-block chain) are ``None``.
+        """
+        params = self.params
+        window = max(1, window or params.retarget_interval)
+        tip = self._tip
+        now = int(time.time())
+
+        first_height = max(0, tip.height - window)
+        first = self.storage.get_chain_entry(first_height)
+        blocks = tip.height - first_height
+        seconds = (tip.timestamp - first.timestamp) if first is not None else 0
+
+        spacing: float | None = None
+        hash_rate: float | None = None
+        if first is not None and blocks > 0 and seconds > 0:
+            spacing = seconds / blocks
+            hash_rate = (tip.chainwork - first.chainwork) / seconds
+
+        interval = params.retarget_interval
+        next_retarget = (tip.height // interval + 1) * interval
+        estimated_bits = tip.bits
+        if spacing is not None:
+            # If the observed pace held for a whole period, this is where the
+            # target would land.
+            estimated_bits = next_bits(
+                tip.bits,
+                int(spacing * interval),
+                target_timespan=params.target_timespan,
+                pow_limit=params.pow_limit,
+                max_adjustment_factor=params.max_adjustment_factor,
+            )
+
+        current_difficulty = difficulty(tip.bits, pow_limit=params.pow_limit)
+        estimated_difficulty = difficulty(estimated_bits, pow_limit=params.pow_limit)
+        return {
+            "height": tip.height,
+            "window": blocks,
+            "window_seconds": seconds,
+            "target_spacing": params.target_spacing,
+            "average_spacing": None if spacing is None else round(spacing, 2),
+            "hash_rate": None if hash_rate is None else round(hash_rate, 2),
+            "difficulty": current_difficulty,
+            "blocks_last_hour": self.storage.count_blocks_since(now - 3600),
+            "blocks_last_day": self.storage.count_blocks_since(now - 86400),
+            "seconds_since_last_block": max(0, now - tip.timestamp),
+            "median_time": self.median_time_past(tip),
+            "next_retarget_height": next_retarget,
+            "blocks_until_retarget": next_retarget - tip.height,
+            "estimated_next_bits": f"{estimated_bits:#010x}",
+            "estimated_next_difficulty": estimated_difficulty,
+            "estimated_difficulty_change": (
+                None
+                if not current_difficulty
+                else round((estimated_difficulty / current_difficulty - 1) * 100, 2)
+            ),
+        }
+
     def stats(self) -> dict:
         """Return a summary of the chain, for RPC and the explorer."""
         utxo_count, supply = self.storage.utxo_stats()

@@ -5,14 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from scarletcoin.cli_common import DEFAULT_DATADIR, read_rpc_token
 from scarletcoin.core.params import get_params, network_names
 from scarletcoin.net.client import RpcClient, RpcClientError
+from scarletcoin.net.launcher import LocalNode, LocalNodeError
 
 __all__ = [
     "STYLESHEET",
@@ -23,9 +26,11 @@ __all__ = [
     "apply_theme",
     "ask_for_node",
     "client_from_args",
+    "is_loopback",
     "monospace",
     "settings_from_args",
     "show_error",
+    "start_node_with_progress",
 ]
 
 logger = logging.getLogger(__name__)
@@ -99,6 +104,11 @@ def add_common_gui_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--datadir", type=Path, default=DEFAULT_DATADIR)
     parser.add_argument("--rpc-url", help="node RPC URL")
     parser.add_argument("--rpc-token", help="node RPC token")
+    parser.add_argument(
+        "--no-start-node",
+        action="store_true",
+        help="do not start a node automatically when none is running locally",
+    )
 
 
 def default_url(network: str) -> str:
@@ -364,3 +374,56 @@ def ask_for_node(
         return None
     dialog.settings.save(datadir, network)
     return dialog.settings
+
+
+def is_loopback(url: str) -> bool:
+    """Whether ``url`` points at this machine, and so at a node we may start."""
+    host = urlparse(url).hostname or ""
+    return host in ("127.0.0.1", "::1", "localhost", "0.0.0.0")
+
+
+def start_node_with_progress(
+    parent: QtWidgets.QWidget | None,
+    *,
+    network: str,
+    datadir: Path,
+    rpc_port: int | None = None,
+) -> LocalNode | None:
+    """Start a node, showing progress and keeping the interface responsive.
+
+    Returns:
+        The running node, or ``None`` if the user cancelled or it failed (in
+        which case the failure has already been reported).
+    """
+    dialog = QtWidgets.QProgressDialog(f"Starting a {network} node...", "Cancel", 0, 0, parent)
+    dialog.setWindowTitle("ScarletCoin")
+    dialog.setWindowModality(QtCore.Qt.WindowModal)
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setValue(0)
+    dialog.show()
+    QtWidgets.QApplication.processEvents()
+
+    node: LocalNode | None = None
+    try:
+        node = LocalNode.launch(network=network, datadir=datadir, rpc_port=rpc_port)
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            QtWidgets.QApplication.processEvents()
+            if dialog.wasCanceled():
+                node.stop()
+                return None
+            if not node.running:
+                raise LocalNodeError("the node stopped while starting up:\n\n" + node.tail_log())
+            if node.is_ready():
+                dialog.setLabelText("Node ready.")
+                return node
+            time.sleep(0.2)
+        raise LocalNodeError(f"the node did not answer in time:\n\n{node.tail_log()}")
+    except LocalNodeError as exc:
+        if node is not None:
+            node.stop()
+        show_error(parent, "Could not start a node", str(exc))
+        return None
+    finally:
+        dialog.close()

@@ -56,6 +56,7 @@ PUBLIC_METHODS = frozenset(
         "getbestblockhash",
         "getdifficulty",
         "getsupply",
+        "getnetworkstats",
         "getblockhash",
         "getblock",
         "getblockheader",
@@ -142,6 +143,9 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     def getsupply() -> dict:
         count, total = node.storage.utxo_stats()
         return {"supply": total, "utxo_count": count, "height": chain.height}
+
+    def getnetworkstats(window: int | None = None) -> dict:
+        return chain.network_stats(None if window is None else int(window))
 
     def getblockhash(height: int) -> str:
         entry = chain.get_entry_by_height(int(height))
@@ -367,6 +371,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getbestblockhash": getbestblockhash,
         "getdifficulty": getdifficulty,
         "getsupply": getsupply,
+        "getnetworkstats": getnetworkstats,
         "getblockhash": getblockhash,
         "getblock": getblock,
         "getblockheader": getblockheader,

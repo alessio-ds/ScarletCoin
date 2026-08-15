@@ -44,6 +44,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["error::DeprecationWarning"]
+markers = ["slow: takes a while because it spawns real processes"]
 
 [tool.ruff]
 line-length = 100

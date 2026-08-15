@@ -339,6 +339,10 @@ class TestPublicRpc:
             anonymous = RpcClient(server.url, timeout=10)
             assert anonymous.getblockcount() == 3
             assert anonymous.getinfo()["network"] == "regtest"
+            stats = anonymous.call("getnetworkstats")
+            assert stats["height"] == 3
+            assert stats["difficulty"] > 0
+            assert stats["blocks_last_day"] >= 3
             assert anonymous.getbalance(str(key.address(REGTEST.address_version)))["balance"] > 0
             assert anonymous.call("getblock", 1)["height"] == 1
             assert anonymous.call("getmempool")["count"] == 0
@@ -423,6 +427,7 @@ class TestPublicRpc:
         needed = {
             "getinfo",
             "getblockcount",
+            "getnetworkstats",
             "getbalance",
             "getutxos",
             "getaddresshistory",
@@ -466,6 +471,16 @@ class TestExplorer:
             status, body = self._get(server.url + path)
             assert status == 200, path
             assert "ScarletCoin" in body, path
+
+    def test_overview_shows_network_statistics(self, rpc):
+        _, server, client = rpc
+        client.call("generate", 5)
+        status, body = self._get(server.url + "/")
+        assert status == 200
+        for marker in ("Block rate", "Hash rate", "Next retarget", "Blocks last hour"):
+            assert marker in body
+        assert "H/s" in body
+        assert "Measured over the last" in body
 
     def test_missing_pages_answer_404(self, rpc):
         _, server, _ = rpc

@@ -166,6 +166,13 @@ uv run scarlet-wallet-gui --network regtest
 uv run scarlet-miner-gui  --network regtest
 ```
 
+If no node is already running on this machine, the wallet and the miner start a
+local node themselves (same network and datadir), wait for it to come up, and
+stop it again when the window closes. Disable that with `--no-start-node`; to
+start a node by hand from inside the window use *Node > Start a local node*.
+The miner needs a node it owns for its mining token, so a public node will not
+do.
+
 ## The three programs
 
 ### `scarlet-node`

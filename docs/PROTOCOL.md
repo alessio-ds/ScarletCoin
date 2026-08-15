@@ -297,6 +297,7 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `getbestblockhash` | — | tip hash |
 | `getdifficulty` | — | current difficulty |
 | `getsupply` | — | circulating supply and UTXO count |
+| `getnetworkstats` | `window` | block rate, hash rate, difficulty, retarget estimate |
 | `getblockhash` | `height` | block hash |
 | `getblock` | `hash_or_height`, `verbose=true` | block with transactions |
 | `getblockheader` | `hash_or_height` | header fields |
