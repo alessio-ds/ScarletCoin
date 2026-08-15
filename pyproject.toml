@@ -1,0 +1,55 @@
+[project]
+name = "scarletcoin"
+version = "2.0.0"
+description = "ScarletCoin: a small but complete proof-of-work cryptocurrency with a real blockchain, peer-to-peer nodes, wallet and miner."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Alessio Della Santa" }]
+keywords = ["blockchain", "cryptocurrency", "proof-of-work", "utxo", "p2p"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = ["cryptography>=41.0"]
+
+[project.optional-dependencies]
+gui = ["PyQt5>=5.15"]
+
+[project.scripts]
+scarlet-node = "scarletcoin.net.cli:main"
+scarlet-wallet = "scarletcoin.wallet.cli:main"
+scarlet-miner = "scarletcoin.miner.cli:main"
+scarlet-wallet-gui = "scarletcoin.gui.wallet_app:main"
+scarlet-miner-gui = "scarletcoin.gui.miner_app:main"
+
+[project.urls]
+Homepage = "https://github.com/alessio-ds/ScarletCoin"
+Repository = "https://github.com/alessio-ds/ScarletCoin"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scarletcoin"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["B008"]

@@ -1,3 +1,18 @@
-designs/
-*.pyc
-miner/miner copy.py
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local node / wallet state
+*.sqlite3
+*.sqlite3-journal
+data/
+datadir/
+peers.json
+*.wallet.json

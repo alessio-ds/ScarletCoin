@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --extra gui --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: |
+          uv run ruff check src tests tools
+          uv run ruff format --check src tests tools
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run pytest -q
+
+      - name: Check the genesis blocks still match the parameters
+        run: uv run python tools/mine_genesis.py

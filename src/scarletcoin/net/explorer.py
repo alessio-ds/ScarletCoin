@@ -1,0 +1,640 @@
+"""The built-in block explorer.
+
+Server-side rendered HTML with no external assets, so a node is browsable with
+nothing but a browser pointed at its RPC port.  Every value that comes from the
+chain is HTML-escaped: block and transaction data is attacker-controlled.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from html import escape
+from typing import TYPE_CHECKING
+
+from scarletcoin.core.transaction import Transaction
+from scarletcoin.crypto.keys import Address, InvalidKeyError
+from scarletcoin.units import format_amount
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type checking
+    from scarletcoin.net.rpc import RpcServer
+
+__all__ = ["NotFound", "render", "render_error"]
+
+_STYLE = """
+:root {
+  --bg: #12100f; --panel: #1b1817; --line: #2e2825; --text: #e8e2df;
+  --muted: #97877f; --accent: #e33a4e; --accent-soft: #f0a0a8; --good: #6fc98b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.55 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+a { color: var(--accent-soft); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  border-bottom: 1px solid var(--line); padding: 18px 24px; display: flex;
+  gap: 24px; align-items: center; flex-wrap: wrap;
+}
+header h1 { font-size: 20px; margin: 0; letter-spacing: 0.08em; }
+header h1 a { color: var(--accent); }
+header nav { display: flex; gap: 16px; font-size: 14px; }
+main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+h2 { font-size: 16px; text-transform: uppercase; letter-spacing: 0.12em;
+     color: var(--muted); margin: 32px 0 12px; }
+h2:first-child { margin-top: 0; }
+form { display: flex; gap: 8px; margin-left: auto; }
+input[type=text] {
+  background: var(--panel); border: 1px solid var(--line); color: var(--text);
+  padding: 7px 10px; border-radius: 6px; min-width: 320px; font: inherit;
+}
+button {
+  background: var(--accent); border: 0; color: #fff; padding: 7px 14px;
+  border-radius: 6px; cursor: pointer; font: inherit;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 14px; }
+.card .label { color: var(--muted); font-size: 12px; text-transform: uppercase;
+               letter-spacing: 0.1em; }
+.card .value { font-size: 19px; margin-top: 6px; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+        border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line);
+         font-size: 14px; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 12px;
+     letter-spacing: 0.08em; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.hash { word-break: break-all; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px;
+       border: 1px solid var(--line); color: var(--muted); }
+.tag.ok { color: var(--good); border-color: var(--good); }
+.tag.warn { color: var(--accent); border-color: var(--accent); }
+.amount { color: var(--good); }
+footer { color: var(--muted); font-size: 12px; padding: 24px; text-align: center; }
+.empty { color: var(--muted); padding: 12px 0; }
+"""
+
+
+class NotFound(Exception):
+    """Raised when a page or object does not exist."""
+
+
+def _page(server: RpcServer, title: str, body: str) -> str:
+    node = server.node
+    network = escape(node.params.name)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)} - ScarletCoin explorer</title>
+<style>{_STYLE}</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">ScarletCoin</a></h1>
+  <nav>
+    <a href="/">Overview</a>
+    <a href="/blocks">Blocks</a>
+    <a href="/mempool">Mempool</a>
+    <a href="/peers">Peers</a>
+    <a href="/rich">Rich list</a>
+  </nav>
+  <form action="/search" method="get">
+    <input type="text" name="q" placeholder="block height, hash, txid or address" required>
+    <button type="submit">Search</button>
+  </form>
+</header>
+<main>{body}</main>
+<footer>
+  ScarletCoin node on the {network} network &mdash; block explorer served by the node itself
+</footer>
+</body>
+</html>
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class Cell:
+    """One table cell: markup that is ready to render, plus its alignment.
+
+    Cells are built with :func:`_text` (which escapes) or :func:`_html` (which
+    does not), so whether a value has been escaped is decided once, where the
+    value is known, and never guessed by the renderer.
+    """
+
+    html: str
+    numeric: bool = False
+
+
+def _text(value: object, *, numeric: bool = False) -> Cell:
+    """A cell holding plain text, HTML-escaped."""
+    return Cell(escape(str(value)), numeric)
+
+
+def _html(markup: str, *, numeric: bool = False) -> Cell:
+    """A cell holding markup built by this module (a link, an amount, a tag)."""
+    return Cell(markup, numeric)
+
+
+def _cards(items: list[tuple[str, str]]) -> str:
+    """Render a row of summary cards.  Labels are escaped, values are markup."""
+    cards = "".join(
+        f'<div class="card"><div class="label">{escape(label)}</div>'
+        f'<div class="value">{value}</div></div>'
+        for label, value in items
+    )
+    return f'<div class="cards">{cards}</div>'
+
+
+def _rows(header: list[str], rows: list[list[Cell]], *, empty: str = "Nothing here yet.") -> str:
+    """Render a table.  A column name starting with ``#`` is right-aligned."""
+    if not rows:
+        return f'<p class="empty">{escape(empty)}</p>'
+    head = "".join(
+        f'<th class="num">{escape(name[1:])}</th>'
+        if name.startswith("#")
+        else f"<th>{escape(name)}</th>"
+        for name in header
+    )
+    body = "".join(
+        "<tr>"
+        + "".join(
+            f'<td class="num">{cell.html}</td>' if cell.numeric else f"<td>{cell.html}</td>"
+            for cell in row
+        )
+        + "</tr>"
+        for row in rows
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _height_link(height: int) -> str:
+    """A link to a block by height."""
+    return f'<a href="/block/{height:d}">{height:d}</a>'
+
+
+def _short(text: str, keep: int = 16) -> str:
+    return text if len(text) <= keep * 2 else f"{text[:keep]}…{text[-keep:]}"
+
+
+def _block_link(block_hash: str, *, short: bool = True) -> str:
+    label = _short(block_hash) if short else block_hash
+    return f'<a class="hash" href="/block/{escape(block_hash)}">{escape(label)}</a>'
+
+
+def _tx_link(txid: str, *, short: bool = True) -> str:
+    label = _short(txid) if short else txid
+    return f'<a class="hash" href="/tx/{escape(txid)}">{escape(label)}</a>'
+
+
+def _address_link(address: str, *, short: bool = False) -> str:
+    label = _short(address, 12) if short else address
+    return f'<a class="hash" href="/address/{escape(address)}">{escape(label)}</a>'
+
+
+def _when(timestamp: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamp)) + " UTC"
+
+
+def _amount(scar: int) -> str:
+    """An amount in SCT, coloured."""
+    return f'<span class="amount">{escape(format_amount(scar))}</span>'
+
+
+def _tag(label: str, kind: str = "") -> str:
+    """A small pill-shaped label, such as "coinbase" or "active chain"."""
+    classes = f"tag {kind}".strip()
+    return f'<span class="{escape(classes)}">{escape(label)}</span>'
+
+
+def _hash_span(value: str) -> str:
+    """A hash or address rendered so it wraps instead of overflowing."""
+    return f'<span class="hash">{escape(value)}</span>'
+
+
+# --------------------------------------------------------------------------- pages
+
+
+def _overview(server: RpcServer) -> str:
+    node = server.node
+    chain = node.chain
+    info = node.info()
+    blocks = []
+    for height in range(chain.height, max(-1, chain.height - 10), -1):
+        entry = chain.get_entry_by_height(height)
+        if entry is None:  # pragma: no cover
+            continue
+        block = chain.get_block(entry.hash)
+        if block is None:  # pragma: no cover
+            continue
+        reward = block.coinbase.total_output()
+        miner = str(block.coinbase.outputs[0].address(node.params.address_version))
+        blocks.append(
+            [
+                _html(_height_link(height), numeric=True),
+                _html(_block_link(entry.hash[::-1].hex())),
+                _text(_when(entry.timestamp)),
+                _text(len(block.transactions), numeric=True),
+                _html(_amount(reward), numeric=True),
+                _html(_address_link(miner, short=True)),
+            ]
+        )
+    body = _cards(
+        [
+            ("Network", escape(info["network"])),
+            ("Height", str(info["height"])),
+            ("Difficulty", f"{info['difficulty']:.6g}"),
+            ("Circulating supply", _amount(info["supply"])),
+            ("Unspent outputs", str(info["utxo_count"])),
+            ("Mempool", f"{info['mempool_size']} tx"),
+            ("Peers", str(info["peers"])),
+            ("Node version", escape(info["version"])),
+        ]
+    )
+    body += "<h2>Latest blocks</h2>" + _rows(
+        ["#Height", "Hash", "Time", "#Txs", "#Reward", "Miner"], blocks
+    )
+    return _page(server, "Overview", body)
+
+
+def _blocks_page(server: RpcServer, query: dict[str, list[str]]) -> str:
+    chain = server.node.chain
+    per_page = 50
+    try:
+        end = int(query.get("from", [chain.height])[0])
+    except ValueError:
+        raise NotFound("that is not a block height") from None
+    end = max(0, min(end, chain.height))
+    start = max(0, end - per_page + 1)
+    rows = []
+    for height in range(end, start - 1, -1):
+        entry = chain.get_entry_by_height(height)
+        block = None if entry is None else chain.get_block(entry.hash)
+        if entry is None or block is None:  # pragma: no cover
+            continue
+        rows.append(
+            [
+                _html(_height_link(height), numeric=True),
+                _html(_block_link(entry.hash[::-1].hex())),
+                _text(_when(entry.timestamp)),
+                _text(len(block.transactions), numeric=True),
+                _text(block.size(), numeric=True),
+                _html(_amount(block.coinbase.total_output()), numeric=True),
+            ]
+        )
+    body = "<h2>Blocks</h2>" + _rows(["#Height", "Hash", "Time", "#Txs", "#Bytes", "#Reward"], rows)
+    links = []
+    if end < chain.height:
+        links.append(f'<a href="/blocks?from={min(chain.height, end + per_page)}">Newer</a>')
+    if start > 0:
+        links.append(f'<a href="/blocks?from={start - 1}">Older</a>')
+    if links:
+        body += "<p>" + " &middot; ".join(links) + "</p>"
+    return _page(server, "Blocks", body)
+
+
+def _transaction_rows(server: RpcServer, transaction: Transaction) -> str:
+    node = server.node
+    version = node.params.address_version
+    inputs: list[list[Cell]] = []
+    for txin in transaction.inputs:
+        if txin.prevout.is_null:
+            inputs.append([_html(_tag("coinbase", "warn")), _text(""), _text("")])
+            continue
+        parent = node.chain.get_transaction(txin.prevout.txid)
+        if parent is None:
+            inputs.append(
+                [
+                    _html(_tx_link(txin.prevout.txid[::-1].hex())),
+                    _text(txin.prevout.index, numeric=True),
+                    _text("unknown"),
+                ]
+            )
+            continue
+        output = parent[0].outputs[txin.prevout.index]
+        source = _address_link(str(output.address(version))) + " &nbsp; " + _amount(output.value)
+        inputs.append(
+            [
+                _html(_tx_link(txin.prevout.txid[::-1].hex())),
+                _text(txin.prevout.index, numeric=True),
+                _html(source),
+            ]
+        )
+    outputs = [
+        [
+            _text(index, numeric=True),
+            _html(_address_link(str(output.address(version)))),
+            _html(_amount(output.value), numeric=True),
+        ]
+        for index, output in enumerate(transaction.outputs)
+    ]
+    return (
+        "<h2>Inputs</h2>"
+        + _rows(["Previous transaction", "#Index", "Source"], inputs)
+        + "<h2>Outputs</h2>"
+        + _rows(["#Index", "Address", "#Amount"], outputs)
+    )
+
+
+def _block_page(server: RpcServer, identifier: str) -> str:
+    chain = server.node.chain
+    entry = None
+    if identifier.isdigit():
+        entry = chain.get_entry_by_height(int(identifier))
+    else:
+        try:
+            entry = chain.get_entry(bytes.fromhex(identifier)[::-1])
+        except ValueError:
+            entry = None
+    if entry is None:
+        raise NotFound("no block with that height or hash")
+    block = chain.get_block(entry.hash)
+    if block is None:  # pragma: no cover
+        raise NotFound("block data is missing")
+
+    total_out = sum(tx.total_output() for tx in block.transactions)
+    body = _cards(
+        [
+            ("Height", str(entry.height)),
+            ("Confirmations", str(chain.confirmations(entry.height) if entry.in_chain else 0)),
+            ("Time", escape(_when(entry.timestamp))),
+            ("Transactions", str(len(block.transactions))),
+            ("Size", f"{block.size()} bytes"),
+            ("Difficulty target", escape(f"{entry.bits:#010x}")),
+            ("Nonce", str(block.header.nonce)),
+            ("Value moved", _amount(total_out)),
+        ]
+    )
+    status = _tag("active chain", "ok") if entry.in_chain else _tag("side branch", "warn")
+    previous = (
+        _block_link(entry.prev_hash[::-1].hex(), short=False) if entry.height else "<em>none</em>"
+    )
+    children = chain.storage.children_of(entry.hash)
+    body += "<h2>Header</h2>" + _rows(
+        ["Field", "Value"],
+        [
+            [_text("Hash"), _html(f"{_hash_span(entry.hash[::-1].hex())} {status}")],
+            [_text("Previous block"), _html(previous)],
+            [_text("Merkle root"), _html(_hash_span(block.header.merkle_root[::-1].hex()))],
+            [
+                _text("Next block"),
+                _html(
+                    ", ".join(_block_link(child.hash[::-1].hex()) for child in children)
+                    or "<em>none</em>"
+                ),
+            ],
+            [_text("Cumulative work"), _text(entry.chainwork)],
+        ],
+    )
+    rows = [
+        [
+            _html(_tx_link(tx.txid_hex())),
+            _html(_tag("coinbase", "warn") if tx.is_coinbase else ""),
+            _text(len(tx.inputs), numeric=True),
+            _text(len(tx.outputs), numeric=True),
+            _html(_amount(tx.total_output()), numeric=True),
+        ]
+        for tx in block.transactions
+    ]
+    body += "<h2>Transactions</h2>" + _rows(
+        ["Transaction id", "Type", "#Inputs", "#Outputs", "#Value"], rows
+    )
+    return _page(server, f"Block {entry.height}", body)
+
+
+def _tx_page(server: RpcServer, txid_hex: str) -> str:
+    node = server.node
+    try:
+        txid = bytes.fromhex(txid_hex)[::-1]
+    except ValueError:
+        raise NotFound("that is not a transaction id") from None
+    if len(txid) != 32:
+        raise NotFound("a transaction id is 32 bytes long")
+
+    found = node.chain.get_transaction(txid)
+    if found is not None:
+        transaction, location = found
+        entry = node.chain.get_entry(location.block_hash)
+        confirmations = node.chain.confirmations(location.height)
+        status = (
+            _tag(f"{confirmations} confirmations", "ok")
+            if entry is not None and entry.in_chain
+            else _tag("not on the active chain", "warn")
+        )
+        block_cell = _block_link(location.block_hash[::-1].hex())
+        height = str(location.height)
+    else:
+        transaction = node.mempool.get(txid)
+        if transaction is None:
+            raise NotFound("no transaction with that id")
+        status = _tag("unconfirmed", "warn")
+        block_cell = "<em>in the mempool</em>"
+        height = "&mdash;"
+
+    body = _cards(
+        [
+            ("Transaction id", _hash_span(transaction.txid_hex())),
+            ("Status", status),
+            ("Block", block_cell),
+            ("Height", height),
+            ("Size", f"{transaction.size()} bytes"),
+            ("Output total", _amount(transaction.total_output())),
+        ]
+    )
+    body += _transaction_rows(server, transaction)
+    return _page(server, "Transaction", body)
+
+
+def _address_page(server: RpcServer, text: str) -> str:
+    node = server.node
+    try:
+        address = Address.decode(text, expected_version=node.params.address_version)
+    except InvalidKeyError as exc:
+        raise NotFound(str(exc)) from exc
+
+    coins = node.storage.coins_of(address.hash)
+    balance = sum(coin.value for _, coin in coins)
+    history = node.storage.address_history(address.hash, 100)
+    body = _cards(
+        [
+            ("Address", _hash_span(str(address))),
+            ("Balance", _amount(balance)),
+            ("Unspent outputs", str(len(coins))),
+            ("Transactions", str(len(history))),
+        ]
+    )
+    rows = []
+    for txid, height in history:
+        found = node.chain.get_transaction(txid)
+        if found is None:  # pragma: no cover
+            continue
+        transaction, _ = found
+        received = sum(o.value for o in transaction.outputs if o.pubkey_hash == address.hash)
+        sent = 0
+        for txin in transaction.inputs:
+            if txin.prevout.is_null:
+                continue
+            parent = node.chain.get_transaction(txin.prevout.txid)
+            if parent is None:  # pragma: no cover
+                continue
+            output = parent[0].outputs[txin.prevout.index]
+            if output.pubkey_hash == address.hash:
+                sent += output.value
+        rows.append(
+            [
+                _html(_height_link(height), numeric=True),
+                _html(_tx_link(transaction.txid_hex())),
+                _html(_amount(received - sent), numeric=True),
+                _text(node.chain.confirmations(height), numeric=True),
+            ]
+        )
+    body += "<h2>History</h2>" + _rows(
+        ["#Height", "Transaction", "#Net amount", "#Confirmations"],
+        rows,
+        empty="This address has never been used.",
+    )
+    unspent = [
+        [
+            _html(_tx_link(outpoint.txid[::-1].hex())),
+            _text(outpoint.index, numeric=True),
+            _html(_amount(coin.value), numeric=True),
+            _html(_tag("coinbase", "warn") if coin.is_coinbase else ""),
+        ]
+        for outpoint, coin in coins
+    ]
+    body += "<h2>Unspent outputs</h2>" + _rows(
+        ["Transaction", "#Index", "#Amount", "Type"], unspent, empty="No unspent outputs."
+    )
+    return _page(server, "Address", body)
+
+
+def _mempool_page(server: RpcServer) -> str:
+    entries = server.node.mempool.entries()
+    rows = [
+        [
+            _html(_tx_link(entry.txid[::-1].hex())),
+            _text(entry.size, numeric=True),
+            _html(_amount(entry.fee), numeric=True),
+            _text(f"{entry.fee_rate:.0f}", numeric=True),
+            _text(_when(int(entry.received))),
+        ]
+        for entry in entries
+    ]
+    body = _cards(
+        [
+            ("Transactions", str(len(entries))),
+            ("Size", f"{server.node.mempool.total_bytes} bytes"),
+            ("Total fees", _amount(sum(entry.fee for entry in entries))),
+        ]
+    )
+    body += "<h2>Unconfirmed transactions</h2>" + _rows(
+        ["Transaction id", "#Bytes", "#Fee", "#Fee/kB", "Seen"],
+        rows,
+        empty="The mempool is empty.",
+    )
+    return _page(server, "Mempool", body)
+
+
+def _peers_page(server: RpcServer) -> str:
+    node = server.node
+    rows = [
+        [
+            _text(peer["address"]),
+            _text(peer["direction"]),
+            _text(peer["user_agent"] or "unknown"),
+            _text(peer["start_height"], numeric=True),
+            _text(peer["latency_ms"] if peer["latency_ms"] is not None else "-", numeric=True),
+            _text(int(peer["connected_for"]), numeric=True),
+        ]
+        for peer in (p.to_dict() for p in node.peers)
+    ]
+    body = _cards(
+        [
+            ("Connected peers", str(len(rows))),
+            ("Known addresses", str(len(node.addrbook))),
+            ("Listening port", str(node.p2p_port or "not listening")),
+        ]
+    )
+    body += "<h2>Peers</h2>" + _rows(
+        ["Address", "Direction", "User agent", "#Height", "#Latency (ms)", "#Uptime (s)"],
+        rows,
+        empty="No peers connected.",
+    )
+    return _page(server, "Peers", body)
+
+
+def _rich_page(server: RpcServer) -> str:
+    node = server.node
+    supply = max(1, node.chain.total_supply())
+    rows = [
+        [
+            _text(rank, numeric=True),
+            _html(_address_link(str(Address(node.params.address_version, pubkey_hash)))),
+            _html(_amount(total), numeric=True),
+            _text(f"{total * 100 / supply:.2f}%", numeric=True),
+        ]
+        for rank, (pubkey_hash, total) in enumerate(node.storage.richest_addresses(25), start=1)
+    ]
+    body = "<h2>Largest balances</h2>" + _rows(
+        ["#Rank", "Address", "#Balance", "#Share"], rows, empty="No coins have been mined yet."
+    )
+    return _page(server, "Rich list", body)
+
+
+def _search(server: RpcServer, query: dict[str, list[str]]) -> str:
+    term = (query.get("q") or [""])[0].strip()
+    if not term:
+        raise NotFound("nothing to search for")
+    node = server.node
+    if term.isdigit() and int(term) <= node.chain.height:
+        return _block_page(server, term)
+    if len(term) == 64:
+        try:
+            raw = bytes.fromhex(term)[::-1]
+        except ValueError:
+            raise NotFound(f"could not find anything matching {term!r}") from None
+        if node.chain.get_entry(raw) is not None:
+            return _block_page(server, term)
+        if node.chain.get_transaction(raw) is not None or node.mempool.get(raw) is not None:
+            return _tx_page(server, term)
+    if Address.is_valid(term, expected_version=node.params.address_version):
+        return _address_page(server, term)
+    raise NotFound(f"could not find anything matching {term!r}")
+
+
+def render(server: RpcServer, path: str, query: dict[str, list[str]]) -> str:
+    """Render the page for ``path``.
+
+    Raises:
+        NotFound: if the path or the object it refers to does not exist.
+    """
+    if path == "/":
+        return _overview(server)
+    if path == "/blocks":
+        return _blocks_page(server, query)
+    if path == "/mempool":
+        return _mempool_page(server)
+    if path == "/peers":
+        return _peers_page(server)
+    if path == "/rich":
+        return _rich_page(server)
+    if path == "/search":
+        return _search(server, query)
+    for prefix, handler in (
+        ("/block/", _block_page),
+        ("/tx/", _tx_page),
+        ("/address/", _address_page),
+    ):
+        if path.startswith(prefix):
+            return handler(server, path[len(prefix) :])
+    raise NotFound(f"no page at {path}")
+
+
+def render_error(server: RpcServer, message: str) -> str:
+    """Render a "not found" page."""
+    body = f'<h2>Not found</h2><p>{escape(message)}</p><p><a href="/">Back to the overview</a></p>'
+    return _page(server, "Not found", body)
