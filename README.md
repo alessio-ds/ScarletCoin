@@ -88,12 +88,36 @@ offers a shortcut that mines instantly:
 uv run scarlet-node rpc --network regtest generate 5
 ```
 
+### Joining or starting a public network
+
+`mainnet` and `testnet` ship with an empty seed list, because this is a hobby
+chain: there is no network to join until somebody starts one, and the addresses
+of its first public nodes are theirs, not mine.
+
+To **join** a network somebody runs, point your node at one of its published host
+names — everything after that is automatic (the seed's records are all tried, the
+node asks for more addresses, and the address book is saved for next time):
+
+```sh
+uv run scarlet-node --network mainnet --seed seed.example.org
+uv run scarlet-node --network mainnet --addnode 203.0.113.7:20333   # one specific peer
+```
+
+To **run** a network other people can join: open TCP 20333, publish a DNS name
+for your node, and add that name to `ChainParams.seeds` in
+`src/scarletcoin/core/params.py` so every install of that version connects with no
+configuration at all.
+
+[docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) covers the whole thing:
+systemd units, firewalls, seeds and gossip, clock requirements, publishing the
+explorer safely, and how to prove that a set of nodes really is on one chain.
+
 ### Two nodes talking to each other
 
 ```sh
 uv run scarlet-node --network regtest --datadir /tmp/a --p2p-port 41001 --rpc-port 41002
 uv run scarlet-node --network regtest --datadir /tmp/b --p2p-port 41003 --rpc-port 41004 \
-    --connect 127.0.0.1:41001
+    --addnode 127.0.0.1:41001
 ```
 
 Mine on one and watch the other follow:
@@ -119,7 +143,8 @@ explorer.
 
 ```sh
 scarlet-node [--network mainnet|testnet|regtest] [--datadir DIR]
-             [--p2p-port N] [--no-listen] [--connect HOST[:PORT]] [--no-seeds]
+             [--p2p-port N] [--no-listen]
+             [--seed HOST[:PORT]] [--addnode HOST[:PORT]] [--no-seeds]
              [--rpc-host ADDR] [--rpc-port N] [--rpc-token TOKEN] [--no-rpc]
 scarlet-node rpc  METHOD [PARAMS...]     # call a running node
 scarlet-node info                        # its status, in plain text
@@ -164,8 +189,10 @@ SHA-256 reaches roughly 1 MH/s per core — enough for `regtest` and `testnet`.
 | Coinbase maturity | 100 blocks | 20 blocks | 2 blocks |
 | Easiest target | `0x1e0fffff` | `0x1e0fffff` | `0x207fffff` |
 
-`mainnet` ships with no seed nodes: this is a hobby chain, so a network exists
-only if you start one. Use `--connect` to point nodes at each other.
+`mainnet` and `testnet` ship with no seed nodes: this is a hobby chain, so a
+network exists only if somebody starts one. Use `--seed` or `--addnode` to point
+nodes at each other, or bake your seeds into `ChainParams.seeds`. See
+[docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md).
 
 ## Layout
 
@@ -193,6 +220,9 @@ uv run python tools/mine_genesis.py   # only if the genesis definition changes
 
 ## Documentation
 
+* [docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) — how to run a public
+  node, let others connect to it automatically, and verify that everyone is on
+  the same chain.
 * [docs/PROTOCOL.md](docs/PROTOCOL.md) — consensus rules, serialisation formats,
   the peer-to-peer messages and the RPC methods.
 * [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the rewrite fixed, and why.

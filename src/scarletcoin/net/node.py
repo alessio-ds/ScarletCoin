@@ -57,6 +57,8 @@ PING_INTERVAL = 60.0
 _TICK = 0.25
 _CONNECT_INTERVAL = 1.0
 _MAINTENANCE_INTERVAL = 5.0
+#: Never re-ask every peer for blocks more often than this.
+_POLL_INTERVAL = 60.0
 
 
 @dataclass
@@ -76,6 +78,8 @@ class NodeConfig:
     max_inbound: int = 64
     connect: tuple[str, ...] = ()
     """Peers to connect to on start, in addition to the address book."""
+    seeds: tuple[str, ...] = ()
+    """Extra seed hosts, resolved through DNS, on top of the network's own."""
     use_seeds: bool = True
     user_agent: str = f"/scarletcoin:{__version__}/"
 
@@ -128,12 +132,18 @@ class Node:
         self._threads: list[threading.Thread] = []
         self._listen_socket: socket.socket | None = None
         self.started_at = time.time()
+        self._last_block_at = time.time()
+        self._last_poll_at = 0.0
 
-        if config.use_seeds:
-            for seed in self.params.seeds:
-                self._add_address(seed, source="seed")
         for peer_address in config.connect:
             self._add_address(peer_address, source="config")
+
+    @property
+    def seed_hosts(self) -> tuple[str, ...]:
+        """Every seed this node may bootstrap from."""
+        if not self.config.use_seeds:
+            return tuple(self.config.seeds)
+        return tuple(self.params.seeds) + tuple(self.config.seeds)
 
     def _add_address(self, text: str, *, source: str) -> None:
         try:
@@ -142,6 +152,30 @@ class Node:
             logger.warning("ignoring peer address %r: %s", text, exc)
             return
         self.addrbook.add(host, port, source=source)
+
+    def _bootstrap_seeds(self) -> None:
+        """Add the seed hosts and every address their names resolve to.
+
+        A seed is published as a host name, so one name can point at several
+        machines: each of its A and AAAA records becomes a candidate peer. The
+        name itself is kept too, which keeps working when the records change.
+        """
+        for seed in self.seed_hosts:
+            try:
+                host, port = parse_address(seed, self.params.default_p2p_port)
+            except ValueError as exc:
+                logger.warning("ignoring seed %r: %s", seed, exc)
+                continue
+            self.addrbook.add(host, port, source="seed")
+            try:
+                resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            except OSError as exc:
+                logger.warning("cannot resolve seed %s: %s", host, exc)
+                continue
+            addresses = {info[4][0] for info in resolved}
+            for address in addresses:
+                self.addrbook.add(address, port, source="dns")
+            logger.info("seed %s resolved to %d address(es)", host, len(addresses))
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -155,6 +189,9 @@ class Node:
         )
         if self.config.listen:
             self._start_listener()
+        if self.seed_hosts:
+            # DNS can be slow, so never block start-up on it.
+            self._spawn("seeds", self._bootstrap_seeds)
         self._spawn("connector", self._connect_loop)
         self._spawn("maintenance", self._maintenance_loop)
 
@@ -386,6 +423,16 @@ class Node:
             logger.debug("%s is ourselves, dropping", peer)
             peer.close()
             return
+        twin = next(
+            (other for other in self.peers if other is not peer and other.nonce == message.nonce),
+            None,
+        )
+        if twin is not None:
+            # The same node reachable under two names or addresses: one link is enough.
+            logger.debug("%s is already connected as %s, dropping", peer, twin)
+            peer.close()
+            return
+        peer.nonce = message.nonce
         peer.version = message.version
         peer.user_agent = message.user_agent
         peer.start_height = message.start_height
@@ -512,6 +559,23 @@ class Node:
         if txids:
             peer.send(protocol.Inv(tuple(InvItem(InvType.TX, txid) for txid in txids)))
 
+    @property
+    def stale_tip_seconds(self) -> float:
+        """How long a quiet tip is normal before we go looking for blocks."""
+        return max(300.0, 10.0 * self.params.target_spacing)
+
+    def _poll_for_blocks(self) -> None:
+        """Ask every peer what follows our tip.
+
+        Announcements can be missed — a peer may have been mid-handshake, or two
+        nodes may sit on equal-height branches, in which case neither considers
+        the other ahead. Re-asking on a slow timer makes the network converge
+        without anyone having to restart a node.
+        """
+        for peer in self.peers:
+            if peer.handshake_done.is_set():
+                self._maybe_sync(peer, force=True)
+
     def _maybe_sync(self, peer: Peer, *, force: bool = False) -> None:
         """Ask ``peer`` for the blocks we are missing, if it looks ahead of us."""
         if peer.closed:
@@ -534,6 +598,7 @@ class Node:
             logger.info("rejected block %s: %s", block.hash_hex(), result.reason)
             return result
         if result.status is BlockStatus.CONNECTED:
+            self._last_block_at = time.time()
             logger.info(
                 "block %s accepted at height %d%s",
                 block.hash_hex(),
@@ -621,6 +686,18 @@ class Node:
                         peer.send(protocol.Ping(peer.last_ping_nonce))
                     except PeerDisconnected:
                         continue
+            if (
+                self.peers
+                and now - self._last_block_at > self.stale_tip_seconds
+                and now - self._last_poll_at > _POLL_INTERVAL
+            ):
+                self._last_poll_at = now
+                logger.debug("tip has not moved recently, asking peers for blocks")
+                self._poll_for_blocks()
+
+            if not self.peers and not len(self.addrbook) and self.seed_hosts:
+                self._bootstrap_seeds()
+
             with self._lock:
                 for block_hash, (_, seen) in list(self._orphans.items()):
                     if now - seen > 600:
@@ -639,8 +716,12 @@ class Node:
         data.update(
             {
                 "version": __version__,
+                "protocol_version": protocol.PROTOCOL_VERSION,
                 "user_agent": self.config.user_agent,
                 "uptime": round(time.time() - self.started_at, 1),
+                "genesis": self.params.genesis_hash[::-1].hex(),
+                "magic": self.params.magic.decode("ascii", "replace"),
+                "listening": self.config.listen,
                 "p2p_port": self.p2p_port,
                 "peers": len(peers),
                 "inbound_peers": sum(1 for peer in peers if peer.inbound),

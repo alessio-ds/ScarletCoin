@@ -44,13 +44,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--no-listen", action="store_true", help="do not accept inbound peers")
     run.add_argument(
+        "--addnode",
         "--connect",
+        dest="connect",
         action="append",
         default=[],
         metavar="HOST[:PORT]",
-        help="connect to this peer (may be repeated)",
+        help="also try this peer, on top of the ones already known (may be repeated)",
     )
-    run.add_argument("--no-seeds", action="store_true", help="ignore the built-in seed peers")
+    run.add_argument(
+        "--seed",
+        dest="seeds",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]",
+        help="bootstrap from this seed host name, resolving all of its addresses",
+    )
+    run.add_argument(
+        "--no-seeds", action="store_true", help="ignore the seed peers built into this build"
+    )
     run.add_argument(
         "--max-outbound", type=int, default=8, help="outbound peer slots (default: %(default)s)"
     )
@@ -99,6 +111,7 @@ def _run(args: argparse.Namespace) -> int:
         max_outbound=args.max_outbound,
         max_inbound=args.max_inbound,
         connect=tuple(args.connect),
+        seeds=tuple(args.seeds),
         use_seeds=not args.no_seeds,
     )
 
@@ -133,8 +146,11 @@ def _run(args: argparse.Namespace) -> int:
         if rpc is not None:
             rpc.start()
             print(f"explorer: {rpc.url}")
-        for peer in config.connect:
-            logger.info("connecting to configured peer %s", peer)
+        if not node.seed_hosts and not config.connect:
+            logger.warning(
+                "no seeds and no --addnode peers: this node will stay alone unless"
+                " another node connects to it"
+            )
         node.wait()
     except RuntimeError as exc:
         die(str(exc))

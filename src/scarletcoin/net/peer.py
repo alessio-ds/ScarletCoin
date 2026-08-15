@@ -48,6 +48,8 @@ class Peer:
 
         # Handshake state, filled in from the peer's ``version`` message.
         self.version: int | None = None
+        self.nonce: int | None = None
+        """The random number the peer identifies itself with."""
         self.user_agent: str = ""
         self.start_height: int = 0
         self.listen_port: int | None = None

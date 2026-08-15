@@ -77,7 +77,13 @@ class ChainParams:
 
     # Bootstrap
     seeds: tuple[str, ...] = field(default_factory=tuple)
-    """``host:port`` peers contacted on first start."""
+    """Host names a fresh node bootstraps from.
+
+    Each name is resolved to every address it points at, so one entry can stand
+    for several machines. Whoever runs a network publishes one or two long-lived
+    names here; everything else is learned by gossip afterwards. Operators can
+    add more at run time with ``--seed``.
+    """
 
     # ------------------------------------------------------------------ derived
 
@@ -148,6 +154,8 @@ MAINNET = ChainParams(
     genesis_bits=0x1E0FFFFF,
     genesis_nonce=366_905,
     genesis_message=_GENESIS_MESSAGE,
+    # Add the long-lived host names of your network's public nodes here, e.g.
+    # seeds=("seed.example.org", "seed2.example.org:20333").
     seeds=(),
 )
 

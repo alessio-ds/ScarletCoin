@@ -8,6 +8,7 @@ import urllib.request
 
 import pytest
 
+from scarletcoin import __version__
 from scarletcoin.core.params import REGTEST
 from scarletcoin.net import protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
@@ -157,6 +158,15 @@ class TestRpc:
         header = client.call("getblockheader", 1)
         assert header["hash"] == hashes[0]
         assert bytes.fromhex(client.call("getrawblock", 1))
+
+    def test_getinfo_identifies_the_chain(self, rpc):
+        _, _, client = rpc
+        info = client.getinfo()
+        # These are what two operators compare to prove they run the same chain.
+        assert info["genesis"] == REGTEST.genesis_hash[::-1].hex()
+        assert info["magic"] == "SCRR"
+        assert info["protocol_version"] == 1
+        assert info["version"] == __version__
 
     def test_getinfo_and_supply(self, rpc):
         _, _, client = rpc
@@ -397,6 +407,69 @@ class TestExplorer:
         assert "&lt;script&gt;" in body
 
 
+class TestSeeds:
+    def _config(self, tmp_path, **overrides) -> NodeConfig:
+        return NodeConfig(
+            network="regtest",
+            datadir=tmp_path / "seeded",
+            listen=False,
+            rpc=False,
+            p2p_port=0,
+            **overrides,
+        )
+
+    def test_seed_hosts_combine_the_build_in_and_the_configured_ones(self, tmp_path):
+        node = Node(self._config(tmp_path, seeds=("example.org",)))
+        try:
+            assert node.seed_hosts == (*REGTEST.seeds, "example.org")
+        finally:
+            node.stop()
+
+    def test_no_seeds_ignores_the_ones_in_the_build(self, tmp_path):
+        node = Node(self._config(tmp_path, seeds=("example.org",), use_seeds=False))
+        try:
+            assert node.seed_hosts == ("example.org",)
+        finally:
+            node.stop()
+
+    def test_a_seed_name_is_resolved_to_its_addresses(self, tmp_path):
+        node = Node(self._config(tmp_path, seeds=("localhost:41999",)))
+        try:
+            node._bootstrap_seeds()
+            entries = {(entry.host, entry.port, entry.source) for entry in node.addrbook.all()}
+            assert ("localhost", 41999, "seed") in entries
+            resolved = {host for host, port, source in entries if source == "dns"}
+            assert resolved & {"127.0.0.1", "::1"}
+            assert all(port == 41999 for _, port, _ in entries)
+        finally:
+            node.stop()
+
+    def test_an_unresolvable_seed_is_only_a_warning(self, tmp_path):
+        node = Node(self._config(tmp_path, seeds=("no-such-host.invalid",)))
+        try:
+            node._bootstrap_seeds()  # must not raise
+            hosts = {entry.host for entry in node.addrbook.all()}
+            assert hosts == {"no-such-host.invalid"}
+        finally:
+            node.stop()
+
+    def test_a_malformed_seed_is_ignored(self, tmp_path):
+        node = Node(self._config(tmp_path, seeds=("host:not-a-port",)))
+        try:
+            node._bootstrap_seeds()
+            assert len(node.addrbook) == 0
+        finally:
+            node.stop()
+
+    def test_addnode_peers_are_remembered(self, tmp_path):
+        node = Node(self._config(tmp_path, connect=("example.org:1234",)))
+        try:
+            entries = {(entry.host, entry.port, entry.source) for entry in node.addrbook.all()}
+            assert ("example.org", 1234, "config") in entries
+        finally:
+            node.stop()
+
+
 class TestPeerToPeer:
     def _node(self, tmp_path, name: str, **overrides) -> Node:
         node = Node(
@@ -512,6 +585,48 @@ class TestPeerToPeer:
                 raw[40] ^= mask  # corrupt the Merkle root
                 peer.send(protocol.BlockMessage(Block.deserialize(bytes(raw))))
             assert wait_until(lambda: first.addrbook.is_banned("127.0.0.1"), timeout=20)
+        finally:
+            first.stop()
+            second.stop()
+
+    def test_a_node_recovers_a_missed_announcement(self, tmp_path, key):
+        """A node that never heard an `inv` still catches up on the slow poll."""
+        first = self._node(tmp_path, "a")
+        second = self._node(tmp_path, "b")
+        try:
+            second.connect_peer("127.0.0.1", first.p2p_port)
+            assert wait_until(
+                lambda: bool(second.peers) and second.peers[0].handshake_done.is_set()
+            )
+            # Add blocks straight to the chain, so nothing is relayed.
+            for _ in range(3):
+                first.chain.add_block(mine_block(first.chain, key))
+            assert first.chain.height == 3
+            assert second.chain.height == 0
+
+            second._poll_for_blocks()
+            assert wait_until(lambda: second.chain.height == 3, timeout=20)
+            assert second.chain.tip_hash == first.chain.tip_hash
+        finally:
+            first.stop()
+            second.stop()
+
+    def test_the_stale_tip_threshold_follows_the_block_spacing(self, node):
+        assert node.stale_tip_seconds >= 10 * REGTEST.target_spacing
+        assert node.stale_tip_seconds >= 300
+
+    def test_the_same_peer_is_not_connected_twice(self, tmp_path):
+        """A seed reachable as both a name and an address must not use two slots."""
+        first = self._node(tmp_path, "a")
+        second = self._node(tmp_path, "b")
+        try:
+            assert second.connect_peer("127.0.0.1", first.p2p_port)
+            assert wait_until(
+                lambda: bool(second.peers) and second.peers[0].handshake_done.is_set()
+            )
+            second.connect_peer("localhost", first.p2p_port)
+            assert wait_until(lambda: len(second.peers) == 1, timeout=15)
+            assert len(first.peers) == 1
         finally:
             first.stop()
             second.stop()
