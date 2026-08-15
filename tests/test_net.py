@@ -855,7 +855,7 @@ class TestPeerToPeer:
             assert wait_until(
                 lambda: bool(second.peers) and second.peers[0].handshake_done.is_set()
             )
-            second.connect_peer("localhost", first.p2p_port)
+            assert not second.connect_peer("localhost", first.p2p_port)
             assert wait_until(lambda: len(second.peers) == 1, timeout=15)
             assert len(first.peers) == 1
         finally:

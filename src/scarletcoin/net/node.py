@@ -334,6 +334,8 @@ class Node:
         """Open an outbound connection and start its reader thread."""
         if self.addrbook.is_banned(host):
             return False
+        if self._already_connected(host, port):
+            return False
         try:
             peer = connect_to(host, port, magic=self.params.magic)
         except PeerDisconnected as exc:
@@ -343,6 +345,29 @@ class Node:
         self.addrbook.mark_success(host, port)
         self._register(peer)
         return True
+
+    def _already_connected(self, host: str, port: int) -> bool:
+        """Whether a peer to ``host:port`` is already connected.
+
+        Host names are resolved so that ``localhost`` and ``127.0.0.1`` count as
+        the same address: a node reachable under two names must not take two
+        outbound slots.  The handshake also drops true duplicates by nonce, but
+        refusing the redundant dial here avoids racing a second connection that
+        a slow node might otherwise never get told to close.
+        """
+        return any(self._addresses_match(peer.host, peer.port, host, port) for peer in self.peers)
+
+    @staticmethod
+    def _addresses_match(a_host: str, a_port: int, b_host: str, b_port: int) -> bool:
+        """Whether two addresses name the same socket, resolving names when needed."""
+        if a_port != b_port:
+            return False
+        if a_host == b_host:
+            return True
+        try:
+            return socket.gethostbyname(a_host) == socket.gethostbyname(b_host)
+        except OSError:
+            return False
 
     def _register(self, peer: Peer) -> None:
         with self._lock:
