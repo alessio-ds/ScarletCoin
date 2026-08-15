@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import http.client
 import itertools
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -13,6 +15,29 @@ from scarletcoin.core.params import get_params
 __all__ = ["RpcClient", "RpcClientError", "default_url"]
 
 _ids = itertools.count(1)
+
+#: How many attempts for a request whose connection drops before answering.
+MAX_ATTEMPTS = 3
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Whether ``exc`` means the node dropped the connection instead of answering.
+
+    A freshly started or overloaded node sometimes tears the TCP connection down
+    mid-response, which Python 3.13 surfaces as an ``IncompleteRead``. Those are
+    worth retrying once or twice. Everything else — refused tokens, bad
+    requests, connection refusals, timeouts — is returned to the caller.
+    """
+    dropped = (
+        http.client.IncompleteRead,
+        http.client.RemoteDisconnected,
+        ConnectionResetError,
+        BrokenPipeError,
+        ConnectionAbortedError,
+    )
+    if isinstance(exc, dropped):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, dropped)
 
 
 class RpcClientError(Exception):
@@ -60,18 +85,29 @@ class RpcClient:
         )
         if self.token:
             request.add_header("Authorization", f"Bearer {self.token}")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:200]
-            raise RpcClientError(
-                f"node returned HTTP {exc.code} for {method}: {detail}", exc.code
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RpcClientError(f"cannot reach the node at {self.url}: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise RpcClientError(f"the node did not answer within {self.timeout}s") from exc
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body = response.read()
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                raise RpcClientError(
+                    f"node returned HTTP {exc.code} for {method}: {detail}", exc.code
+                ) from exc
+            except urllib.error.URLError as exc:
+                if not _is_transient(exc):
+                    raise RpcClientError(
+                        f"cannot reach the node at {self.url}: {exc.reason}"
+                    ) from exc
+            except TimeoutError as exc:
+                raise RpcClientError(f"the node did not answer within {self.timeout}s") from exc
+            except (http.client.IncompleteRead, http.client.RemoteDisconnected, OSError) as exc:
+                if not _is_transient(exc):
+                    raise RpcClientError(f"the node dropped the connection: {exc}") from exc
+            if attempt == MAX_ATTEMPTS - 1:
+                raise RpcClientError(f"the node closed the connection while answering {method}")
+            time.sleep(0.1 * (attempt + 1))
 
         try:
             message = json.loads(body.decode("utf-8"))

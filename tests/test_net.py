@@ -316,6 +316,91 @@ class TestRpc:
             node.stop()
 
 
+class TestRpcClientRetry:
+    """Transient connection drops are retried; real errors are not."""
+
+    def _stub(self, monkeypatch, responses):
+        """Replace urlopen with a callable returning or raising from a queue."""
+        import contextlib
+        from types import SimpleNamespace
+
+        calls = []
+
+        def fake_open(request, timeout=None):
+            calls.append(1)
+            outcome = responses.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            payload = json.dumps(outcome).encode("utf-8")
+            response = SimpleNamespace(read=lambda: payload)
+            return contextlib.nullcontext(response)
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_open)
+        return calls
+
+    def test_retries_a_truncated_response(self, monkeypatch):
+        import http.client
+
+        calls = self._stub(
+            monkeypatch,
+            [
+                http.client.IncompleteRead(b"", 55),
+                {"jsonrpc": "2.0", "id": 1, "result": {"network": "regtest"}},
+            ],
+        )
+        client = RpcClient("http://127.0.0.1:1")
+        assert client.getinfo()["network"] == "regtest"
+        assert calls == [1, 1]
+
+    def test_retries_a_reset_connection(self, monkeypatch):
+        import urllib.error
+
+        calls = self._stub(
+            monkeypatch,
+            [
+                urllib.error.URLError(ConnectionResetError(104, "connection reset")),
+                {"jsonrpc": "2.0", "id": 1, "result": "ok"},
+            ],
+        )
+        client = RpcClient("http://127.0.0.1:1")
+        assert client.call("ping") == "ok"
+        assert len(calls) == 2
+
+    def test_gives_up_after_the_last_attempt(self, monkeypatch):
+        import http.client
+
+        calls = self._stub(monkeypatch, [http.client.IncompleteRead(b"", 55)] * 3)
+        client = RpcClient("http://127.0.0.1:1")
+        with pytest.raises(RpcClientError, match="closed the connection"):
+            client.getinfo()
+        assert len(calls) == 3
+
+    def test_does_not_retry_a_refused_connection(self, monkeypatch):
+        import urllib.error
+
+        calls = self._stub(
+            monkeypatch, [urllib.error.URLError(ConnectionRefusedError(111, "refused"))]
+        )
+        client = RpcClient("http://127.0.0.1:1")
+        with pytest.raises(RpcClientError, match="cannot reach"):
+            client.getinfo()
+        assert len(calls) == 1
+
+    def test_does_not_retry_an_http_error(self, monkeypatch):
+        class FlakyHTTPError(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("http://127.0.0.1/rpc", 401, "unauthorised", None, None)
+
+            def read(self, *args):  # pragma: no cover - not reached
+                return b"{}"
+
+        calls = self._stub(monkeypatch, [FlakyHTTPError()])
+        client = RpcClient("http://127.0.0.1:1")
+        with pytest.raises(RpcClientError, match="401"):
+            client.getinfo()
+        assert len(calls) == 1
+
+
 class TestPublicRpc:
     """A node started with --rpc-public serves wallets without handing over control."""
 

@@ -571,7 +571,12 @@ class RpcServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 if self.command != "HEAD":
-                    self.wfile.write(body)
+                    try:
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                        # The client went away; nothing to do, and the handler
+                        # loop notices the closed socket and disconnects.
+                        self.close_connection = True
 
             def _json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
                 self._respond(
