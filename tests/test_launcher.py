@@ -84,6 +84,26 @@ class TestStartLocalNode:
         finally:
             node.stop()
 
+    def test_refuses_to_start_a_second_node_on_a_taken_port(self, tmp_path):
+        """A second node must fail cleanly instead of crashing on the port."""
+        from scarletcoin.net.launcher import LocalNode
+
+        port = free_port()
+        first = start_local_node(
+            network="regtest",
+            datadir=tmp_path / "a",
+            rpc_port=port,
+            p2p_port=0,
+            extra=("--no-seeds",),
+        )
+        try:
+            with pytest.raises(LocalNodeError, match="already in use"):
+                LocalNode.launch(
+                    network="regtest", datadir=tmp_path / "b", rpc_port=port, p2p_port=0
+                )
+        finally:
+            first.stop()
+
     def test_wait_until_ready_reports_a_dead_process(self, tmp_path):
         from scarletcoin.net.launcher import LocalNode
 

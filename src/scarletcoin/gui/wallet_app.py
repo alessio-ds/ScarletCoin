@@ -749,24 +749,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings.client(timeout=10.0).getinfo()
     except RpcClientError as exc:
-        if is_loopback(settings.url) and not args.no_start_node:
-            # Nothing is running here, so start a node instead of sending the
-            # user off to a terminal.
+        if exc.code is None and is_loopback(settings.url) and not args.no_start_node:
+            # Nothing answers on a local port, so start a node rather than send
+            # the user off to a terminal.
             local_node = start_node_with_progress(None, network=args.network, datadir=args.datadir)
             if local_node is not None:
                 settings = ConnectionSettings(local_node.url, local_node.token)
         if local_node is None:
+            if exc.code == 401:
+                reason = (
+                    f"A node is already running at {settings.url} but refused the "
+                    "RPC token, so it was probably started by another process. Stop "
+                    "that node first, or enter its token here."
+                )
+            else:
+                reason = (
+                    f"No {args.network} node answered at {settings.url}.\n\n"
+                    f"{exc}\n\n"
+                    "Start one here from Node > Start a local node, or enter the "
+                    "address of a node somebody else runs."
+                )
             chosen = ask_for_node(
                 None,
                 settings,
                 args.network,
                 args.datadir,
-                reason=(
-                    f"No {args.network} node answered at {settings.url}.\n\n"
-                    f"{exc}\n\n"
-                    "Start one here from Node > Start a local node, or enter the "
-                    "address of a node somebody else runs."
-                ),
+                reason=reason,
             )
             if chosen is not None:
                 settings = chosen

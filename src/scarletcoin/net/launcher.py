@@ -11,6 +11,7 @@ a test just as well.
 from __future__ import annotations
 
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -30,6 +31,17 @@ STARTUP_TIMEOUT = 60.0
 
 class LocalNodeError(RuntimeError):
     """Raised when a node could not be started."""
+
+
+def _port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    """Whether something already listens on ``host:port``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return True
+        return False
 
 
 def node_command(
@@ -106,6 +118,12 @@ class LocalNode:
         """
         params = get_params(network)
         port = rpc_port or params.default_rpc_port
+        if _port_busy(port):
+            raise LocalNodeError(
+                f"port {port} is already in use on this machine. A node is probably "
+                "already running here (your wallet may have started one). Stop that "
+                "node first, or connect to it instead of starting another."
+            )
         token = secrets.token_urlsafe(32)
         datadir = Path(datadir)
         log_path = datadir / network / "node.log"
