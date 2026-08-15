@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import signal
+import sys
 import time
 
 from scarletcoin import __version__
@@ -63,8 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``scarlet-miner``."""
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level)
-    # The command line reports mined blocks itself, so keep the library quiet.
-    if args.log_level == "info":
+    # The command line reports mined blocks itself, so keep the library quiet --
+    # but only when a person is watching. Under a service supervisor the log file
+    # is the only record, so leave the logger audible there.
+    if args.log_level == "info" and sys.stdout.isatty():
         logging.getLogger("scarletcoin.miner").setLevel(logging.WARNING)
     client = make_client(args)
 
@@ -74,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         die(str(exc))
     print(
         f"mining on {info['network']} at height {info['height']},"
-        f" difficulty {info['difficulty']:.6g}, paying {args.address}"
+        f" difficulty {info['difficulty']:.6g}, paying {args.address}",
+        flush=True,
     )
 
     last_report = 0.0
@@ -95,11 +99,11 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         elif kind == "accepted":
-            print(f"\rmined block {payload['hash']} at height {payload['height']}")
+            print(f"\rmined block {payload['hash']} at height {payload['height']}", flush=True)
         elif kind == "rejected":
-            print(f"\rblock {payload['hash']} was rejected: {payload['reason']}")
+            print(f"\rblock {payload['hash']} was rejected: {payload['reason']}", flush=True)
         elif kind == "error":
-            print(f"\r{payload['message']}")
+            print(f"\r{payload['message']}", flush=True)
 
     miner = Miner(
         client,
@@ -123,7 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"\nstopped after {stats.elapsed:.0f}s:"
         f" {stats.hashes} hashes, {stats.blocks_accepted} blocks accepted"
-        f", {stats.blocks_rejected} rejected"
+        f", {stats.blocks_rejected} rejected",
+        flush=True,
     )
     return 0
 
