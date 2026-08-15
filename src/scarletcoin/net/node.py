@@ -128,6 +128,7 @@ class Node:
         self._peers: dict[int, Peer] = {}
         self._orphans: OrderedDict[bytes, tuple[Block, float]] = OrderedDict()
         self._nonce = random.getrandbits(64)
+        self._local_addresses: set[tuple[str, int]] = set()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._listen_socket: socket.socket | None = None
@@ -151,7 +152,22 @@ class Node:
         except ValueError as exc:
             logger.warning("ignoring peer address %r: %s", text, exc)
             return
+        if (host, port) in self._local_addresses:
+            return
         self.addrbook.add(host, port, source=source)
+
+    def _note_local_address(self, host: str, port: int) -> None:
+        """Remember that an address is this very node, and stop dialling it.
+
+        Without this, the node that *is* the network's seed would dial its own
+        published name forever: the connection is accepted, recognised as itself
+        by the handshake nonce, dropped, and immediately retried.
+        """
+        if (host, port) in self._local_addresses:
+            return
+        self._local_addresses.add((host, port))
+        self.addrbook.forget(host, port)
+        logger.info("%s:%d is this node; it will not be dialled again", host, port)
 
     def _bootstrap_seeds(self) -> None:
         """Add the seed hosts and every address their names resolve to.
@@ -166,6 +182,8 @@ class Node:
             except ValueError as exc:
                 logger.warning("ignoring seed %r: %s", seed, exc)
                 continue
+            if (host, port) in self._local_addresses:
+                continue  # this node is that seed
             self.addrbook.add(host, port, source="seed")
             try:
                 resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -174,7 +192,8 @@ class Node:
                 continue
             addresses = {info[4][0] for info in resolved}
             for address in addresses:
-                self.addrbook.add(address, port, source="dns")
+                if (address, port) not in self._local_addresses:
+                    self.addrbook.add(address, port, source="dns")
             logger.info("seed %s resolved to %d address(es)", host, len(addresses))
 
     # ------------------------------------------------------------------ lifecycle
@@ -303,6 +322,7 @@ class Node:
                 continue
             busy = {(peer.host, peer.port) for peer in self.peers}
             busy.update(peer.advertised_address for peer in self.peers if peer.advertised_address)
+            busy.update(self._local_addresses)
             candidates = self.addrbook.candidates(busy)
             if candidates:
                 entry = candidates[0]
@@ -420,6 +440,12 @@ class Node:
         if peer.version is not None:
             raise ProtocolError("duplicate version message")
         if message.nonce == self._nonce:
+            # Both ends of a self-connection land here: remember the address so
+            # the connector never tries it again.
+            if not peer.inbound:
+                self._note_local_address(peer.host, peer.port)
+            if message.listen_port:
+                self._note_local_address(peer.host, message.listen_port)
             logger.debug("%s is ourselves, dropping", peer)
             peer.close()
             return
@@ -726,12 +752,18 @@ class Node:
                 "peers": len(peers),
                 "inbound_peers": sum(1 for peer in peers if peer.inbound),
                 "known_addresses": len(self.addrbook),
+                "own_addresses": sorted(f"{h}:{p}" for h, p in self._local_addresses),
                 "mempool_size": len(self.mempool),
                 "mempool_bytes": self.mempool.total_bytes,
                 "orphan_blocks": len(self._orphans),
             }
         )
         return data
+
+    @property
+    def local_addresses(self) -> set[tuple[str, int]]:
+        """Addresses discovered to be this node itself."""
+        return set(self._local_addresses)
 
     def orphan_hashes(self) -> Iterable[bytes]:
         """Hashes of the blocks currently waiting for a parent."""

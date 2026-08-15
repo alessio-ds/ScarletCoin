@@ -762,6 +762,39 @@ class TestPeerToPeer:
             first.stop()
             second.stop()
 
+    def test_a_seed_node_stops_dialling_itself(self, tmp_path):
+        """The node that *is* the seed must not dial its own name in a loop."""
+        node = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "seednode",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+            )
+        )
+        node.start()
+        try:
+            port = node.p2p_port
+            # Publish our own address, the way a seed operator's own node ends up
+            # with itself in its address book.
+            node.addrbook.add("127.0.0.1", port, source="seed")
+            node.connect_peer("127.0.0.1", port)
+            assert wait_until(lambda: ("127.0.0.1", port) in node.local_addresses, timeout=15)
+
+            # It is gone from the address book and never becomes a candidate again.
+            assert ("127.0.0.1", port) not in {e.key for e in node.addrbook.all()}
+            assert node.addrbook.candidates(node.local_addresses) == []
+            # Re-resolving the seeds must not put it back.
+            node._add_address(f"127.0.0.1:{port}", source="seed")
+            assert len(node.addrbook) == 0
+            assert f"127.0.0.1:{port}" in node.info()["own_addresses"]
+
+            # And no connection survives.
+            assert wait_until(lambda: len(node.peers) == 0, timeout=15)
+        finally:
+            node.stop()
+
     def test_a_node_refuses_to_connect_to_itself(self, tmp_path):
         node = self._node(tmp_path, "a")
         try:

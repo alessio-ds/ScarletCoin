@@ -229,8 +229,9 @@ description="ScarletCoin node"
 : ${datadir:=/var/lib/scarletcoin}
 
 command="/opt/scarletcoin/.venv/bin/scarlet-node"
+# --no-seeds: this node *is* the seed, so it has nothing to bootstrap from.
 command_args="--network ${network} --datadir ${datadir}
-    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332 --rpc-public"
+    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332 --rpc-public --no-seeds"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
@@ -325,10 +326,17 @@ the service and block the endpoint at the proxy instead:
 ```
 
 ```sh
+# Caddy usually runs as its own user, so the log directory has to exist and be
+# writable by it, or start-up fails with "permission denied".
+install -d -m 0755 /var/log/caddy
+chown -R caddy:caddy /var/log/caddy 2>/dev/null || true
+
 caddy validate --config /etc/caddy/Caddyfile
 rc-service caddy restart
 rc-update add caddy default
 ```
+
+Editing an existing `Caddyfile`? Back it up first — `cp -a /etc/caddy /etc/caddy.bak-$(date +%F-%H%M)` — and add the site as a new block rather than rewriting the file.
 
 Caddy gets a certificate automatically, which needs port 80 reachable and the DNS
 record already pointing at the server. Every explorer link is root-relative, so
@@ -828,6 +836,9 @@ What you are accepting by running this:
 | A remote wallet gets `-32001 … needs the node's RPC token` | The method is not in the public set on purpose (mining, peers, control). Use a local node for those |
 | A remote miner cannot get work | `getblocktemplate` is never public. Give the miner the token, or run it beside its own node |
 | Test nodes on your laptop keep joining the real network | Start them with `--no-seeds`, or they will find the seed and sync (and relay anything they mine) |
+| The seed node logs `connected` / `disconnected` once a second, peer numbers climbing | It is dialling its own published address. Fixed in the code (the address is remembered after the first attempt); also give the seed node `--no-seeds`, since it has nothing to bootstrap from. `getinfo.own_addresses` lists the addresses it knows are itself |
+| Caddy: `setting up custom log … permission denied` | `/var/log/caddy` is missing or not writable by Caddy's user: `install -d -m 0755 /var/log/caddy && chown -R caddy:caddy /var/log/caddy` |
+| `rc-service caddy restart` ends with `ERROR: caddy failed to stop` | The configuration check failed, so nothing was restarted. Fix the error it printed and try again; the old configuration is still what is running |
 | `supervise-daemon: failed to exec …/scarlet-node: Permission denied` | The service user cannot execute the launcher **or its interpreter**. Check `readlink -f .venv/bin/python3`: if it points inside `/root/.local/share/uv/`, uv used a Python only root can read — rebuild with `UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3`. Otherwise it is directory permissions: `chmod 755 /opt /opt/scarletcoin && chmod -R a+rX /opt/scarletcoin`. Confirm with `su -s /bin/sh scarlet -c '/opt/scarletcoin/.venv/bin/scarlet-node --version'` |
 | `rc-service scarlet-node start` says `[ ok ]` but nothing runs | OpenRC only reports that the supervisor started. The real error is in `/var/log/scarletcoin/node.log` |
 | `failed to exec` and `/opt` is a separate mount | Check `mount | grep /opt` for `noexec`; if so, install somewhere else |

@@ -139,6 +139,11 @@ class AddressBook:
             if entry.failures >= MAX_FAILURES:
                 self._entries.pop((host, port), None)
 
+    def forget(self, host: str, port: int) -> None:
+        """Drop one address, without banning the host."""
+        with self._lock:
+            self._entries.pop((host, port), None)
+
     def ban(self, host: str, seconds: float = 3600.0) -> None:
         """Refuse connections from ``host`` for a while."""
         with self._lock:
