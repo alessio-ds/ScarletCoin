@@ -119,14 +119,18 @@ def default_url(network: str) -> str:
 def settings_from_args(args: argparse.Namespace) -> ConnectionSettings:
     """Work out which node to use: command line first, then saved, then localhost.
 
-    Reading the local node's token file means a node running on this machine works
-    with no configuration at all.
+    The node running on this machine owns ``rpc.token``; a token saved by the
+    connection dialog may belong to an older node, so for the default localhost
+    URL the file on disk is the source of truth.
     """
     saved = ConnectionSettings.load(args.datadir, args.network)
     url = args.rpc_url or (saved.url if saved else default_url(args.network))
-    token = args.rpc_token or (saved.token if saved else "")
-    if not token and url == default_url(args.network):
-        token = read_rpc_token(args.datadir, args.network) or ""
+    if args.rpc_token:
+        token = args.rpc_token
+    elif url == default_url(args.network):
+        token = read_rpc_token(args.datadir, args.network) or (saved.token if saved else "")
+    else:
+        token = saved.token if saved else ""
     return ConnectionSettings(url, token)
 
 

@@ -137,6 +137,32 @@ class TestNodeConnection:
         assert settings.url == default_url("regtest")
         assert settings.token == "from-file"
 
+    def test_a_stale_saved_token_does_not_shadow_the_local_nodes(self, tmp_path):
+        """The connection dialog saves settings; an old saved token must not win
+        over the token of the node that is actually running here."""
+        import argparse
+
+        from scarletcoin.cli_common import write_rpc_token
+        from scarletcoin.gui.common import ConnectionSettings, default_url, settings_from_args
+
+        ConnectionSettings(default_url("regtest"), "stale-token").save(tmp_path, "regtest")
+        write_rpc_token(tmp_path, "regtest", "fresh-token")
+        args = argparse.Namespace(network="regtest", datadir=tmp_path, rpc_url=None, rpc_token=None)
+        settings = settings_from_args(args)
+        assert settings.url == default_url("regtest")
+        assert settings.token == "fresh-token"
+
+    def test_saved_settings_still_apply_to_remote_nodes(self, tmp_path):
+        import argparse
+
+        from scarletcoin.gui.common import ConnectionSettings, settings_from_args
+
+        ConnectionSettings("http://other:20332", "remote-token").save(tmp_path, "regtest")
+        args = argparse.Namespace(network="regtest", datadir=tmp_path, rpc_url=None, rpc_token=None)
+        settings = settings_from_args(args)
+        assert settings.url == "http://other:20332"
+        assert settings.token == "remote-token"
+
     def test_the_dialog_rejects_an_unreachable_node(self, qt_app, tmp_path):
         from scarletcoin.gui.common import ConnectionSettings, NodeDialog
 

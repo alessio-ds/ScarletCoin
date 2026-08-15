@@ -334,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             local_node = start_node_with_progress(None, network=args.network, datadir=args.datadir)
             if local_node is not None:
                 settings = ConnectionSettings(local_node.url, local_node.token)
+                settings.save(args.datadir, args.network)
         if local_node is None:
             if exc.code == 401:
                 reason = (
