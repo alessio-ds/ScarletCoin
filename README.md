@@ -88,29 +88,37 @@ offers a shortcut that mines instantly:
 uv run scarlet-node rpc --network regtest generate 5
 ```
 
-### Joining or starting a public network
+### Joining the network
 
-`mainnet` and `testnet` ship with an empty seed list, because this is a hobby
-chain: there is no network to join until somebody starts one, and the addresses
-of its first public nodes are theirs, not mine.
-
-To **join** a network somebody runs, point your node at one of its published host
-names — everything after that is automatic (the seed's records are all tried, the
-node asks for more addresses, and the address book is saved for next time):
+`mainnet` ships with a published seed, so joining takes no configuration at all:
 
 ```sh
-uv run scarlet-node --network mainnet --seed seed.example.org
+uv run scarlet-node --network mainnet
+```
+
+The node resolves `scarletcoin.remotewire.net`, connects, asks its peers for more
+addresses, downloads the chain, and saves what it learned to
+`<datadir>/mainnet/peers.json` — after the first start it no longer needs the seed.
+To add peers of your own:
+
+```sh
+uv run scarlet-node --network mainnet --seed seed.example.org       # a name, all its records
 uv run scarlet-node --network mainnet --addnode 203.0.113.7:20333   # one specific peer
 ```
 
-To **run** a network other people can join: open TCP 20333, publish a DNS name
-for your node, and add that name to `ChainParams.seeds` in
-`src/scarletcoin/core/params.py` so every install of that version connects with no
-configuration at all.
+### Running a public node
 
-[docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) covers the whole thing:
-systemd units, firewalls, seeds and gossip, clock requirements, publishing the
-explorer safely, and how to prove that a set of nodes really is on one chain.
+A node needs **two** ports, and they are not interchangeable:
+
+| Port | What | Who reaches it |
+|---|---|---|
+| 20333 | the peer-to-peer protocol, raw TCP | other nodes, directly — an HTTP proxy cannot carry it |
+| 20332 | JSON-RPC and the explorer, HTTP | localhost only; publish through a reverse proxy if you want |
+
+[docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) has the full guide,
+including a complete worked example for the reference node (Alpine Linux, OpenRC
+services, Caddy with automatic HTTPS in front of the explorer, firewall rules, and
+a DDNS name), plus how to prove that a set of nodes really is on one chain.
 
 ### Two nodes talking to each other
 
@@ -189,10 +197,10 @@ SHA-256 reaches roughly 1 MH/s per core — enough for `regtest` and `testnet`.
 | Coinbase maturity | 100 blocks | 20 blocks | 2 blocks |
 | Easiest target | `0x1e0fffff` | `0x1e0fffff` | `0x207fffff` |
 
-`mainnet` and `testnet` ship with no seed nodes: this is a hobby chain, so a
-network exists only if somebody starts one. Use `--seed` or `--addnode` to point
-nodes at each other, or bake your seeds into `ChainParams.seeds`. See
-[docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md).
+`mainnet` bootstraps from `scarletcoin.remotewire.net` (with the reference node's
+address as a fallback for when DNS is unavailable). `testnet` has no seeds: point
+nodes at each other with `--seed` or `--addnode`, or add your own to
+`ChainParams.seeds`. See [docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md).
 
 ## Layout
 

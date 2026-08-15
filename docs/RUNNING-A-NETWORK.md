@@ -5,7 +5,10 @@ their nodes find yours automatically, and how to prove that everybody is on the
 same chain.
 
 * [What "the same network" means](#what-the-same-network-means)
+* [Which ports do what](#which-ports-do-what)
 * [Are you launching a network or joining one?](#are-you-launching-a-network-or-joining-one)
+* [The ScarletCoin mainnet seed](#the-scarletcoin-mainnet-seed)
+* [Worked example: Alpine Linux, Caddy and a DDNS name](#worked-example-alpine-linux-caddy-and-a-ddns-name)
 * [Launching a network](#launching-a-network)
 * [Joining a network](#joining-a-network)
 * [How nodes find each other](#how-nodes-find-each-other)
@@ -32,6 +35,24 @@ So "keeping everyone in sync" is mostly a *distribution* problem: everyone runs
 the same released version, and then the consensus rules do the rest. The only
 thing an operator configures is **who to talk to**.
 
+## Which ports do what
+
+A public node listens on two ports that have nothing to do with each other, and
+mixing them up is the most common way to end up with a node nobody can reach.
+
+| Port | Protocol | Who connects | Exposure |
+|---|---|---|---|
+| 20333 (mainnet), 30333 (testnet) | **raw TCP**, the peer-to-peer protocol | other nodes | must be reachable from the internet, **directly** |
+| 20332 (mainnet), 30332 (testnet) | HTTP: JSON-RPC **and** the explorer | you, and explorer visitors | bind to localhost; publish only through a reverse proxy |
+
+The peer-to-peer port carries a binary framed protocol, not HTTP. An HTTP
+reverse proxy (Caddy, nginx, Cloudflare's orange cloud) **cannot** carry it. Peers
+open a plain TCP connection to port 20333 and speak `version`/`verack`; anything
+that terminates HTTP will simply close it.
+
+So: forward or open TCP 20333 at the firewall, and use your web server only for
+the explorer on 20332.
+
 ## Are you launching a network or joining one?
 
 `mainnet` and `testnet` ship with an **empty seed list**:
@@ -50,6 +71,332 @@ existing network to join, so the addresses of the first public nodes cannot be
 baked in by me — they are yours. Whoever launches the network publishes one or
 two host names, and from then on new nodes bootstrap from them automatically.
 
+## The ScarletCoin mainnet seed
+
+`mainnet` ships with one published seed:
+
+```python
+    seeds=("scarletcoin.remotewire.net", "45.126.126.139"),
+```
+
+The name is what makes the network movable — repoint the record and every node
+follows. The literal address next to it is a fallback for when DNS is broken,
+filtered on someone's network, or answered by a proxy that cannot carry the
+peer-to-peer protocol. Both are marked as seeds in the address book, which means
+they are never pruned, so a node can always find its way back after a long time
+offline.
+
+A node only needs a seed **once**. After the first successful start it has a
+gossiped address book in `<datadir>/<network>/peers.json` and no longer depends on
+the seed being up.
+
+## Worked example: Alpine Linux, Caddy and a DDNS name
+
+This is the exact recipe for the reference node: an Alpine server at
+`45.126.126.139`, reachable as `scarletcoin.remotewire.net`, with Caddy already
+installed and serving the explorer over HTTPS.
+
+The finished layout:
+
+```
+                        the internet
+                             │
+        ┌────────────────────┴─────────────────────┐
+        │ TCP 20333                     TCP 443/80 │
+        │ (raw peer-to-peer,            (HTTPS)    │
+        │  no proxy possible)                      │
+        ▼                                          ▼
+  ┌───────────────┐                          ┌───────────┐
+  │  scarlet-node │◄── 127.0.0.1:20332 ──────│   Caddy   │
+  │   (OpenRC)    │      HTTP, explorer      │  (OpenRC) │
+  └───────┬───────┘                          └───────────┘
+          │
+   /var/lib/scarletcoin/mainnet/{chain.sqlite3,peers.json,rpc.token}
+```
+
+### 1. Point the name at the server, with no proxy in between
+
+`scarletcoin.remotewire.net` must be a plain `A` record for `45.126.126.139`. If
+your DNS provider offers HTTP proxying (Cloudflare's orange cloud, for example),
+**turn it off** for this record: a proxy would break port 20333 and answer with
+its own address instead of yours.
+
+Check from somewhere that is not the server:
+
+```sh
+dig +short scarletcoin.remotewire.net      # must print 45.126.126.139
+```
+
+At the time of writing this name answered `138.199.60.12`, so the record still
+needs to be updated (or is going through a proxy). Until `dig` prints your
+address, seeding by name will not work — the literal address in `seeds` is what
+keeps the network reachable in the meantime.
+
+If the address is dynamic, add whatever update client your provider wants, on a
+timer:
+
+```sh
+apk add curl
+printf '*/5 * * * * curl -fsS "https://your-provider/update?host=scarletcoin&token=…" >/dev/null\n' \
+  >> /etc/crontabs/root
+rc-service crond restart
+```
+
+If you would rather keep `scarletcoin.remotewire.net` behind a proxy for the web
+side, publish a second, unproxied name for the peer-to-peer side (say
+`seed.remotewire.net`), and put *that* one in `ChainParams.seeds`.
+
+### 2. Install on Alpine
+
+Alpine uses musl, so wheels matter. `cryptography` publishes musl wheels for
+x86-64, which is all this project needs to compile nothing:
+
+```sh
+apk add --no-cache python3 git uv ca-certificates
+# no uv package on your Alpine release? then:
+#   apk add --no-cache python3 py3-pip git ca-certificates
+#   and replace the uv commands below with pip in a venv
+
+adduser -D -H -h /var/lib/scarletcoin -s /sbin/nologin scarlet
+install -d -o scarlet -g scarlet -m 0750 /var/lib/scarletcoin /var/log/scarletcoin
+
+git clone https://github.com/alessio-ds/ScarletCoin /opt/scarletcoin
+cd /opt/scarletcoin
+uv sync                      # creates /opt/scarletcoin/.venv
+.venv/bin/scarlet-node --version
+```
+
+If your architecture has no musl wheel for `cryptography`, use Alpine's own build
+instead of compiling Rust:
+
+```sh
+apk add --no-cache py3-cryptography
+python3 -m venv --system-site-packages /opt/scarletcoin/.venv
+/opt/scarletcoin/.venv/bin/pip install --no-deps -e /opt/scarletcoin
+python3 -c "import cryptography; print(cryptography.__version__)"   # want >= 41
+```
+
+Keep the clock right — a node rejects blocks more than two hours ahead of its own
+clock:
+
+```sh
+apk add --no-cache chrony
+rc-update add chronyd default && rc-service chronyd start
+```
+
+### 3. Open the peer-to-peer port
+
+```sh
+apk add --no-cache iptables ip6tables
+iptables -A INPUT -p tcp --dport 20333 -j ACCEPT   # peers
+iptables -A INPUT -p tcp --dport 80    -j ACCEPT   # Caddy: ACME challenge
+iptables -A INPUT -p tcp --dport 443   -j ACCEPT   # Caddy: explorer
+rc-service iptables save && rc-update add iptables default
+```
+
+Note what is *not* here: 20332 stays closed. If your provider has its own
+firewall or security group, open the same three ports there too.
+
+### 4. Run the node under OpenRC
+
+```sh
+cat > /etc/init.d/scarlet-node <<'EOF'
+#!/sbin/openrc-run
+
+name="scarlet-node"
+description="ScarletCoin node"
+
+: ${network:=mainnet}
+: ${datadir:=/var/lib/scarletcoin}
+
+command="/opt/scarletcoin/.venv/bin/scarlet-node"
+command_args="--network ${network} --datadir ${datadir}
+    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332"
+command_user="scarlet:scarlet"
+
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/scarletcoin/node.log"
+error_log="/var/log/scarletcoin/node.log"
+
+depend() {
+    need net
+    after firewall chronyd
+}
+
+start_pre() {
+    checkpath -d -o scarlet:scarlet -m 0750 "${datadir}" /var/log/scarletcoin
+}
+EOF
+chmod +x /etc/init.d/scarlet-node
+
+rc-update add scarlet-node default
+rc-service scarlet-node start
+tail -f /var/log/scarletcoin/node.log
+```
+
+You are looking for these three lines:
+
+```
+starting mainnet node at height 0 (/var/lib/scarletcoin/mainnet)
+listening for peers on 20333
+RPC and explorer listening on http://127.0.0.1:20332
+```
+
+`supervise-daemon` restarts the node if it ever dies, and `respawn_max=0` means it
+keeps trying forever. Rotate the log so it cannot fill the disk:
+
+```sh
+apk add --no-cache logrotate
+cat > /etc/logrotate.d/scarletcoin <<'EOF'
+/var/log/scarletcoin/*.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+```
+
+### 5. Put the explorer behind Caddy
+
+Caddy proxies **only** the HTTP port, and the control interface is blocked so no
+one can even try a token against it:
+
+```caddyfile
+# /etc/caddy/Caddyfile
+scarletcoin.remotewire.net {
+	encode zstd gzip
+
+	# The JSON-RPC control interface is never public.
+	@rpc path /rpc /rpc/*
+	handle @rpc {
+		respond "the RPC interface is not public" 404
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:20332
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/scarletcoin.log
+	}
+}
+```
+
+```sh
+caddy validate --config /etc/caddy/Caddyfile
+rc-service caddy restart
+rc-update add caddy default
+```
+
+Caddy gets a certificate automatically, which needs port 80 reachable and the DNS
+record already pointing at the server. Every explorer link is root-relative, so
+proxying at the root path needs no extra rewriting.
+
+### 6. Give the chain some blocks
+
+A fresh network is only its genesis block until somebody mines. Create the wallet
+**on your own machine**, never on the server, and give the server only the
+address:
+
+```sh
+# on your laptop
+uv run scarlet-wallet --network mainnet create
+uv run scarlet-wallet --network mainnet addresses
+```
+
+```sh
+# on the server, mining to that address; no keys involved
+cat > /etc/init.d/scarlet-miner <<'EOF'
+#!/sbin/openrc-run
+
+name="scarlet-miner"
+description="ScarletCoin miner"
+
+: ${address:=S_your_address_here}
+: ${workers:=1}
+
+command="/opt/scarletcoin/.venv/bin/scarlet-miner"
+command_args="${address} --network mainnet --datadir /var/lib/scarletcoin
+    --workers ${workers} --quiet"
+command_user="scarlet:scarlet"
+
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+output_log="/var/log/scarletcoin/miner.log"
+error_log="/var/log/scarletcoin/miner.log"
+
+depend() {
+    need net scarlet-node
+}
+EOF
+chmod +x /etc/init.d/scarlet-miner
+rc-update add scarlet-miner default
+rc-service scarlet-miner start
+```
+
+The miner reads the node's token from `/var/lib/scarletcoin/mainnet/rpc.token`,
+which is why it runs as the same user. Keep `workers` to one or two on a small
+VPS — the point is to keep the chain moving, and difficulty adapts to whatever
+hash rate shows up.
+
+### 7. Check it from outside
+
+Run all of these from a *different* machine:
+
+```sh
+dig +short scarletcoin.remotewire.net              # 45.126.126.139
+nc -vz scarletcoin.remotewire.net 20333            # open  (peers)
+nc -vz scarletcoin.remotewire.net 20332            # refused/filtered (correct!)
+curl -sI https://scarletcoin.remotewire.net | head -1
+curl -s  https://scarletcoin.remotewire.net/api/info
+
+# and the real test: a node somewhere else, with no configuration at all
+uv run scarlet-node --network mainnet --datadir /tmp/probe
+uv run scarlet-node info --network mainnet --datadir /tmp/probe
+```
+
+The probe should report `peers 1` or more and the same `genesis` as the server.
+That is the whole point: users install the release and run one command.
+
+### 8. Day-to-day operation
+
+```sh
+rc-service scarlet-node status
+tail -f /var/log/scarletcoin/node.log
+
+# the control interface, from the server itself
+cd /opt/scarletcoin
+.venv/bin/scarlet-node info --network mainnet --datadir /var/lib/scarletcoin
+.venv/bin/scarlet-node rpc  --network mainnet --datadir /var/lib/scarletcoin getpeers
+
+# or from your laptop, over SSH, without exposing anything
+ssh -L 20332:127.0.0.1:20332 root@45.126.126.139
+```
+
+Upgrades:
+
+```sh
+cd /opt/scarletcoin && git pull && uv sync && rc-service scarlet-node restart
+```
+
+The chain database survives restarts and upgrades. Back up
+`/var/lib/scarletcoin/mainnet/peers.json` if you like, but nothing there is
+irreplaceable — wallets are the only thing that cannot be re-downloaded, and
+yours is not on this machine.
+
 ## Launching a network
 
 ### 1. Get a machine that can be reached
@@ -60,7 +407,9 @@ You need one host with a port other people can open a TCP connection to:
 * at home, forward TCP **20333** (mainnet) or **30333** (testnet) from your
   router to the machine, and use a dynamic-DNS name since your address changes.
 
-Open the port in the firewall:
+Open the port in the firewall (see the
+[Alpine worked example](#worked-example-alpine-linux-caddy-and-a-ddns-name) for
+`iptables`):
 
 ```sh
 # firewalld (Fedora, RHEL)
@@ -328,6 +677,9 @@ glance whether your neighbours are ahead of you.
   N` lines are the heartbeat of a healthy node.
 * **Storage.** Blocks, the UTXO set and the indexes live in one SQLite file in
   WAL mode. Put it on a real disk, not a network share.
+* **Addressing.** The listener is IPv4 (`0.0.0.0`); outbound connections happily
+  use IPv6 when a peer advertises one. If you need to *accept* IPv6 connections,
+  that is a one-line change to the socket family in `net/node.py`.
 * **Upgrades.** Because consensus rules live in the code, treat any change to
   `ChainParams` as a hard fork: everyone must upgrade together, or the network
   splits. Ordinary bug fixes are safe to roll out one node at a time.
@@ -339,7 +691,10 @@ The explorer and the JSON-RPC interface share one HTTP server. `GET` requests
 exposing the port publishes a read-only explorer, and RPC stays shut to anyone
 without the token — but only if a token is set, which is the default.
 
-For anything public, put it behind a reverse proxy with TLS:
+For anything public, put it behind a reverse proxy with TLS. A full Caddy
+configuration, including blocking `/rpc`, is in the
+[Alpine worked example](#worked-example-alpine-linux-caddy-and-a-ddns-name);
+the nginx equivalent is:
 
 ```nginx
 server {
@@ -376,6 +731,11 @@ ssh -L 20332:127.0.0.1:20332 you@your-host   # then open http://127.0.0.1:20332
 | `timestamp … is too far in the future` | *Your* clock is behind. Fix NTP |
 | Your mined blocks are rejected | Usually a stale template or a wrong-network payout address. The error from `submitblock` says which rule failed |
 | Disk filling up | Nothing is pruned. Blocks are ~1 kB each on a quiet chain, but plan for growth |
+| `dig` returns an address that is not your server | The record is wrong, or your DNS provider is proxying it. A proxy cannot carry the peer-to-peer protocol: use a plain A record, or publish a second unproxied name for peers |
+| Explorer works over HTTPS but no peer ever connects | You proxied the wrong thing. Caddy serves 20332; peers need TCP 20333 open directly |
+| Caddy cannot get a certificate | Port 80 must be reachable and the DNS record must already point at the server |
+| On Alpine: `cryptography` tries to compile Rust | No musl wheel for your architecture. Use `apk add py3-cryptography` with a `--system-site-packages` venv |
+| The miner cannot authenticate | It must run as the user that owns `<datadir>/<network>/rpc.token`, or be given `--rpc-token` |
 
 ## Starting your own separate chain
 

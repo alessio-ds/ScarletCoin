@@ -154,9 +154,12 @@ MAINNET = ChainParams(
     genesis_bits=0x1E0FFFFF,
     genesis_nonce=366_905,
     genesis_message=_GENESIS_MESSAGE,
-    # Add the long-lived host names of your network's public nodes here, e.g.
-    # seeds=("seed.example.org", "seed2.example.org:20333").
-    seeds=(),
+    # Long-lived host names of the network's public nodes. A name may hold
+    # several A/AAAA records; a starting node tries all of them and then learns
+    # the rest of the network by gossip. Port 20333 is assumed when omitted.
+    # The literal address is a fallback for when DNS is broken, filtered, or
+    # answered by a proxy that cannot carry the peer-to-peer protocol.
+    seeds=("scarletcoin.remotewire.net", "45.126.126.139"),
 )
 
 TESTNET = ChainParams(
