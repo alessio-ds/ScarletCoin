@@ -31,15 +31,37 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $line = Get-Content src\scarletcoin\__init__.py | Select-String '__version__ = "([^"]+)"' | Select-Object -First 1
-          $version = $line.Matches[0].Groups[1].Value
-          $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $iscc)) {
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content src\scarletcoin\__init__.py |
+              Select-String '__version__ = "([^"]+)"' | Select-Object -First 1
+          ).Matches[0].Groups[1].Value
+          # GitHub runners ship Inno Setup; fall back to a direct download of
+          # the installer only when it is missing.  jrsoftware.org/download.php
+          # serves an HTML page, not the installer, so it must not be used.
+          $candidates = @(
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "Inno Setup is not pre-installed; downloading it..."
             $installer = "$env:RUNNER_TEMP\innosetup.exe"
-            Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $installer
+            Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" -OutFile $installer
+            if ((Get-Item $installer).Length -lt 1MB) {
+              throw "Inno Setup download looks wrong: $((Get-Item $installer).Length) bytes"
+            }
             Start-Process $installer -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER" -Wait
+            $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) {
+              throw "Inno Setup installed but ISCC.exe was not found"
+            }
           }
-          & $iscc "/DMyAppVersion=$version" "packaging\windows\scarletcoin.iss"
+          Write-Host "Compiling the installer with $iscc"
+          & $iscc /DMyAppVersion=$version packaging\windows\scarletcoin.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE"
+          }
 
       - name: Upload the release artifacts
         uses: actions/upload-artifact@v4
