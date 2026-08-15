@@ -19,12 +19,14 @@ QtCore, QtGui, QtWidgets = require_qt()
 
 from scarletcoin import __version__  # noqa: E402
 from scarletcoin.gui.common import (  # noqa: E402
+    ConnectionSettings,
     PollWorker,
     add_common_gui_arguments,
     apply_theme,
-    client_from_args,
+    ask_for_node,
     monospace,
     run_in_thread,
+    settings_from_args,
     show_error,
 )
 from scarletcoin.net.client import RpcClient, RpcClientError  # noqa: E402
@@ -63,10 +65,19 @@ def _fill(table: QtWidgets.QTableWidget, rows: list[list[str]], *, mono_columns:
 class WalletWindow(QtWidgets.QMainWindow):
     """The main wallet window."""
 
-    def __init__(self, keystore: Keystore, client: RpcClient) -> None:
+    def __init__(
+        self,
+        keystore: Keystore,
+        client: RpcClient,
+        *,
+        datadir: Path | None = None,
+        settings: ConnectionSettings | None = None,
+    ) -> None:
         super().__init__()
         self.keystore = keystore
         self.client = client
+        self.datadir = datadir
+        self.settings = settings or ConnectionSettings(client.url, client.token or "")
         self.wallet = Wallet(keystore, client)
         self._threads: list[QtCore.QThread] = []
         self._snapshot: dict = {}
@@ -92,6 +103,9 @@ class WalletWindow(QtWidgets.QMainWindow):
         wallet_menu.addAction("&Export private key...", self._export_key)
         wallet_menu.addSeparator()
         wallet_menu.addAction("Set or change &password...", self._change_password)
+
+        node_menu = self.menuBar().addMenu("&Node")
+        node_menu.addAction("&Connection...", self.change_node)
 
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction("Open block &explorer", self._open_explorer)
@@ -246,7 +260,7 @@ class WalletWindow(QtWidgets.QMainWindow):
 
     def _collect(self) -> dict:
         """Gather everything the window shows.  Runs in the worker thread."""
-        wallet = self.wallet
+        wallet = self.wallet  # re-read every poll, so reconnecting takes effect
         return {
             "info": wallet.client.getinfo(),
             "balance": wallet.balance(),
@@ -306,7 +320,26 @@ class WalletWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def _on_poll_error(self, message: str) -> None:
-        self.status.showMessage(f"cannot reach the node: {message}")
+        self.status.showMessage(
+            f"no answer from {self.client.url} - {message}"
+            "   (Node > Connection... to use a different one)"
+        )
+
+    def change_node(self) -> None:
+        """Ask for a different node and reconnect to it."""
+        chosen = ask_for_node(
+            self,
+            self.settings,
+            self.keystore.params.name,
+            self.datadir or self.keystore.path.parent.parent,
+        )
+        if chosen is None:
+            return
+        self.settings = chosen
+        self.client = chosen.client()
+        self.wallet = Wallet(self.keystore, self.client)
+        self.status.showMessage(f"now using {self.client.url}", 5000)
+        self._refresh_now()
 
     def _refresh_now(self) -> None:
         QtCore.QMetaObject.invokeMethod(self._poller, "poll", QtCore.Qt.QueuedConnection)
@@ -667,18 +700,27 @@ def main(argv: list[str] | None = None) -> int:
     if keystore is None:
         return 1
 
-    client = client_from_args(args)
+    settings = settings_from_args(args)
     try:
-        client.getinfo()
+        settings.client(timeout=10.0).getinfo()
     except RpcClientError as exc:
-        QtWidgets.QMessageBox.warning(
+        chosen = ask_for_node(
             None,
-            "No node",
-            f"Could not reach a node at {client.url}:\n{exc}\n\n"
-            "Start one with:  scarlet-node --network " + args.network,
+            settings,
+            args.network,
+            args.datadir,
+            reason=(
+                f"No {args.network} node answered at {settings.url}.\n\n"
+                f"{exc}\n\n"
+                "Run one here with  scarlet-node --network "
+                f"{args.network}  and keep this address, or enter the address of a "
+                "node somebody else runs."
+            ),
         )
+        if chosen is not None:
+            settings = chosen
 
-    window = WalletWindow(keystore, client)
+    window = WalletWindow(keystore, settings.client(), datadir=args.datadir, settings=settings)
     window.show()
     return application.exec_()
 

@@ -20,7 +20,7 @@ from scarletcoin.cli_common import (
 )
 from scarletcoin.net.client import RpcClientError
 from scarletcoin.net.node import Node, NodeConfig
-from scarletcoin.net.rpc import RpcServer
+from scarletcoin.net.rpc import PUBLIC_METHODS, RpcServer
 
 logger = logging.getLogger("scarletcoin.node")
 
@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="serve RPC without authentication (loopback only)",
     )
+    run.add_argument(
+        "--rpc-public",
+        action="store_true",
+        help="let anyone call the read-only and broadcast methods without the token,"
+        " so remote wallets and explorers can use this node",
+    )
 
     call = subparsers.add_parser("rpc", help="call a method on a running node")
     add_network_arguments(call)
@@ -129,7 +135,13 @@ def _run(args: argparse.Namespace) -> int:
     node = Node(config)
     rpc: RpcServer | None = None
     if config.rpc:
-        rpc = RpcServer(node, host=args.rpc_host, port=config.resolved_rpc_port(), token=token)
+        rpc = RpcServer(
+            node,
+            host=args.rpc_host,
+            port=config.resolved_rpc_port(),
+            token=token,
+            public=args.rpc_public,
+        )
         if token:
             path = write_rpc_token(args.datadir, args.network, token)
             logger.info("RPC token written to %s", path)
@@ -146,6 +158,12 @@ def _run(args: argparse.Namespace) -> int:
         if rpc is not None:
             rpc.start()
             print(f"explorer: {rpc.url}")
+            if args.rpc_public:
+                logger.info(
+                    "public RPC is on: anyone may call %d read-only and broadcast"
+                    " methods; everything else still needs the token",
+                    len(PUBLIC_METHODS),
+                )
         if not node.seed_hosts and not config.connect:
             logger.warning(
                 "no seeds and no --addnode peers: this node will stay alone unless"

@@ -162,9 +162,25 @@ install -d -o scarlet -g scarlet -m 0750 /var/lib/scarletcoin /var/log/scarletco
 
 git clone https://github.com/alessio-ds/ScarletCoin /opt/scarletcoin
 cd /opt/scarletcoin
-uv sync                      # creates /opt/scarletcoin/.venv
-.venv/bin/scarlet-node --version
+
+# Build the virtual environment against Alpine's own Python. Without this, uv
+# may download a Python of its own into /root/.local/share/uv/, which is mode
+# 700 -- the service user could not execute it, and the node would fail to start
+# with "failed to exec ...: Permission denied".
+UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3
+
+# The service runs as an unprivileged user, so everything it executes must be
+# readable and traversable by it.
+chmod 755 /opt /opt/scarletcoin
+chmod -R a+rX /opt/scarletcoin
+
+# Check as the service user, not as root: this is the exact call OpenRC makes.
+su -s /bin/sh scarlet -c '/opt/scarletcoin/.venv/bin/scarlet-node --version'
 ```
+
+That last command must print `scarletcoin 2.0.0`. If it does not, fix it now —
+the service will fail in exactly the same way, and `rc-service ... start` reports
+`[ ok ]` regardless, because it only means "the supervisor was launched".
 
 If your architecture has no musl wheel for `cryptography`, use Alpine's own build
 instead of compiling Rust:
@@ -199,6 +215,9 @@ firewall or security group, open the same three ports there too.
 
 ### 4. Run the node under OpenRC
 
+Before installing the service, make sure the service user can run the binary —
+step 2 ends with exactly that check.
+
 ```sh
 cat > /etc/init.d/scarlet-node <<'EOF'
 #!/sbin/openrc-run
@@ -211,7 +230,7 @@ description="ScarletCoin node"
 
 command="/opt/scarletcoin/.venv/bin/scarlet-node"
 command_args="--network ${network} --datadir ${datadir}
-    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332"
+    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332 --rpc-public"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
@@ -266,20 +285,18 @@ EOF
 Caddy proxies **only** the HTTP port, and the control interface is blocked so no
 one can even try a token against it:
 
+The node is started with `--rpc-public`, so `POST /rpc` answers the read-only and
+broadcast methods for anybody and keeps everything else behind the token. That is
+what lets someone else's wallet use your node, so Caddy passes `/rpc` through:
+
 ```caddyfile
 # /etc/caddy/Caddyfile
 scarletcoin.remotewire.net {
 	encode zstd gzip
 
-	# The JSON-RPC control interface is never public.
-	@rpc path /rpc /rpc/*
-	handle @rpc {
-		respond "the RPC interface is not public" 404
-	}
-
-	handle {
-		reverse_proxy 127.0.0.1:20332
-	}
+	# Wallets and explorers. The node itself decides what an anonymous caller
+	# may do: reads and sendrawtransaction yes, mining and control no.
+	reverse_proxy 127.0.0.1:20332
 
 	header {
 		Strict-Transport-Security "max-age=31536000"
@@ -292,6 +309,19 @@ scarletcoin.remotewire.net {
 		output file /var/log/caddy/scarletcoin.log
 	}
 }
+```
+
+If you would rather keep the node entirely to yourself, drop `--rpc-public` from
+the service and block the endpoint at the proxy instead:
+
+```caddyfile
+	@rpc path /rpc /rpc/*
+	handle @rpc {
+		respond "the RPC interface is not public" 404
+	}
+	handle {
+		reverse_proxy 127.0.0.1:20332
+	}
 ```
 
 ```sh
@@ -718,6 +748,64 @@ For your own use, an SSH tunnel is simpler and safer:
 ssh -L 20332:127.0.0.1:20332 you@your-host   # then open http://127.0.0.1:20332
 ```
 
+## Letting other people's wallets use your node
+
+A wallet needs *a* node. Two ways, and it is worth being clear about the
+trade-off.
+
+### The proper way: everyone runs a node
+
+```sh
+uv run scarlet-node --network mainnet      # joins through the seed, no config
+uv run scarlet-wallet-gui --network mainnet
+```
+
+The wallet defaults to `http://127.0.0.1:20332` and picks up the local node's
+token automatically, so this needs no configuration at all. The wallet then
+trusts nobody: balances come from a chain the user validated themselves.
+
+### The convenient way: point wallets at a public node
+
+Start the node with `--rpc-public` (the service in step 4 does). Anonymous callers
+may then use exactly the calls a wallet and an explorer need:
+
+```
+getinfo  getblockcount  getbestblockhash  getdifficulty  getsupply
+getblockhash  getblock  getblockheader  getrawblock
+gettransaction  getrawtransaction  getmempool
+validateaddress  getbalance  getutxos  getaddresshistory  getrichlist
+sendrawtransaction
+```
+
+Everything else — `getblocktemplate`, `submitblock`, `getpeers`, `getaddresses`,
+`addpeer`, `stop`, `generate` — still requires the bearer token, and an
+unauthenticated attempt is refused with JSON-RPC error `-32001`. Mining therefore
+cannot be done through a public node; a miner needs the token or its own node.
+
+Users point their wallet at it with no token:
+
+```sh
+uv run scarlet-wallet     --network mainnet --rpc-url https://scarletcoin.remotewire.net info
+uv run scarlet-wallet-gui --network mainnet --rpc-url https://scarletcoin.remotewire.net
+```
+
+The graphical wallet remembers the URL in `<datadir>/<network>/gui.json`, so it is
+typed once. It also offers **Node ▸ Connection…** with a *Test* button, and if no
+node answers at start-up it asks for one instead of opening a window full of
+zeroes.
+
+What you are accepting by running this:
+
+* **Privacy.** You see which addresses your users ask about. They are trusting you
+  for balances, too — a lying node can hide or invent a payment, which is why
+  running their own is strictly better.
+* **Abuse.** `sendrawtransaction` is validated exactly like a transaction from any
+  peer (signatures, fees, mempool limits), so it cannot be used to inject
+  nonsense, but it can be called in a loop. There is no rate limiting in the node:
+  put Caddy's `rate_limit` in front of it if that ever matters.
+* **Nothing else.** No key material exists on the node, and no public method can
+  change the chain, the peer set or the process.
+
 ## Troubleshooting
 
 | Problem | Cause and fix |
@@ -736,6 +824,13 @@ ssh -L 20332:127.0.0.1:20332 you@your-host   # then open http://127.0.0.1:20332
 | Caddy cannot get a certificate | Port 80 must be reachable and the DNS record must already point at the server |
 | On Alpine: `cryptography` tries to compile Rust | No musl wheel for your architecture. Use `apk add py3-cryptography` with a `--system-site-packages` venv |
 | The miner cannot authenticate | It must run as the user that owns `<datadir>/<network>/rpc.token`, or be given `--rpc-token` |
+| A remote wallet gets `401 unauthorised` | The node was not started with `--rpc-public`. Add it, or give that wallet the token |
+| A remote wallet gets `-32001 … needs the node's RPC token` | The method is not in the public set on purpose (mining, peers, control). Use a local node for those |
+| A remote miner cannot get work | `getblocktemplate` is never public. Give the miner the token, or run it beside its own node |
+| Test nodes on your laptop keep joining the real network | Start them with `--no-seeds`, or they will find the seed and sync (and relay anything they mine) |
+| `supervise-daemon: failed to exec …/scarlet-node: Permission denied` | The service user cannot execute the launcher **or its interpreter**. Check `readlink -f .venv/bin/python3`: if it points inside `/root/.local/share/uv/`, uv used a Python only root can read — rebuild with `UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3`. Otherwise it is directory permissions: `chmod 755 /opt /opt/scarletcoin && chmod -R a+rX /opt/scarletcoin`. Confirm with `su -s /bin/sh scarlet -c '/opt/scarletcoin/.venv/bin/scarlet-node --version'` |
+| `rc-service scarlet-node start` says `[ ok ]` but nothing runs | OpenRC only reports that the supervisor started. The real error is in `/var/log/scarletcoin/node.log` |
+| `failed to exec` and `/opt` is a separate mount | Check `mount | grep /opt` for `noexec`; if so, install somewhere else |
 
 ## Starting your own separate chain
 

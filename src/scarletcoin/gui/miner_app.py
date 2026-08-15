@@ -13,10 +13,12 @@ QtCore, QtGui, QtWidgets = require_qt()
 
 from scarletcoin import __version__  # noqa: E402
 from scarletcoin.gui.common import (  # noqa: E402
+    ConnectionSettings,
     add_common_gui_arguments,
     apply_theme,
-    client_from_args,
+    ask_for_node,
     monospace,
+    settings_from_args,
     show_error,
 )
 from scarletcoin.miner.miner import Miner  # noqa: E402
@@ -76,15 +78,26 @@ class MinerBridge(QtCore.QObject):
 class MinerWindow(QtWidgets.QMainWindow):
     """The miner window: pick an address, press start, watch the hash rate."""
 
-    def __init__(self, client: RpcClient, network: str, address: str = "") -> None:
+    def __init__(
+        self,
+        client: RpcClient,
+        network: str,
+        address: str = "",
+        *,
+        datadir: Path | None = None,
+        settings: ConnectionSettings | None = None,
+    ) -> None:
         super().__init__()
         self.client = client
         self.network = network
+        self.datadir = datadir
+        self.settings = settings or ConnectionSettings(client.url, client.token or "")
         self._bridge: MinerBridge | None = None
         self._thread: QtCore.QThread | None = None
 
         self.setWindowTitle(f"ScarletCoin miner - {network}")
         self.resize(640, 480)
+        self.menuBar().addMenu("&Node").addAction("&Connection...", self.change_node)
         self._build_ui(address)
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -143,11 +156,27 @@ class MinerWindow(QtWidgets.QMainWindow):
     def _log(self, message: str) -> None:
         self.log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {message}")
 
+    def change_node(self) -> None:
+        """Ask for a different node; mining always follows the node it is given."""
+        if self._bridge is not None:
+            show_error(self, "Miner", "Stop mining before changing the node.")
+            return
+        chosen = ask_for_node(self, self.settings, self.network, self.datadir or Path.cwd())
+        if chosen is None:
+            return
+        self.settings = chosen
+        self.client = chosen.client()
+        self._log(f"now using {self.client.url}")
+        self._refresh_node()
+
     def _refresh_node(self) -> None:
         try:
             info = self.client.getinfo()
         except RpcClientError as exc:
-            self.status.showMessage(f"cannot reach the node: {exc}")
+            self.status.showMessage(
+                f"no answer from {self.client.url} - {exc}"
+                "   (Node > Connection... to use a different one)"
+            )
             return
         self.status.showMessage(
             f"{info['network']}  ·  height {info['height']}"
@@ -264,7 +293,32 @@ def main(argv: list[str] | None = None) -> int:
     application.setApplicationName(f"ScarletCoin miner {__version__}")
 
     address = args.address or _wallet_address(args.datadir, args.network)
-    window = MinerWindow(client_from_args(args), args.network, address)
+    settings = settings_from_args(args)
+    try:
+        settings.client(timeout=10.0).getinfo()
+    except RpcClientError as exc:
+        chosen = ask_for_node(
+            None,
+            settings,
+            args.network,
+            args.datadir,
+            reason=(
+                f"No {args.network} node answered at {settings.url}.\n\n{exc}\n\n"
+                "Mining needs a node to get work from: run one here with  "
+                f"scarlet-node --network {args.network}  (a public node will not "
+                "hand out work without its token)."
+            ),
+        )
+        if chosen is not None:
+            settings = chosen
+
+    window = MinerWindow(
+        settings.client(),
+        args.network,
+        address,
+        datadir=args.datadir,
+        settings=settings,
+    )
     window.show()
     return application.exec_()
 

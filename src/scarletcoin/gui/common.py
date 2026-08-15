@@ -3,23 +3,32 @@
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from scarletcoin.cli_common import DEFAULT_DATADIR, read_rpc_token
 from scarletcoin.core.params import get_params, network_names
-from scarletcoin.net.client import RpcClient
+from scarletcoin.net.client import RpcClient, RpcClientError
 
 __all__ = [
     "STYLESHEET",
+    "ConnectionSettings",
+    "NodeDialog",
     "PollWorker",
     "add_common_gui_arguments",
     "apply_theme",
+    "ask_for_node",
     "client_from_args",
     "monospace",
+    "settings_from_args",
     "show_error",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: A dark, scarlet-accented theme applied to both applications.
 STYLESHEET = """
@@ -92,11 +101,28 @@ def add_common_gui_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rpc-token", help="node RPC token")
 
 
+def default_url(network: str) -> str:
+    """The node URL assumed when nothing else is configured."""
+    return f"http://127.0.0.1:{get_params(network).default_rpc_port}"
+
+
+def settings_from_args(args: argparse.Namespace) -> ConnectionSettings:
+    """Work out which node to use: command line first, then saved, then localhost.
+
+    Reading the local node's token file means a node running on this machine works
+    with no configuration at all.
+    """
+    saved = ConnectionSettings.load(args.datadir, args.network)
+    url = args.rpc_url or (saved.url if saved else default_url(args.network))
+    token = args.rpc_token or (saved.token if saved else "")
+    if not token and url == default_url(args.network):
+        token = read_rpc_token(args.datadir, args.network) or ""
+    return ConnectionSettings(url, token)
+
+
 def client_from_args(args: argparse.Namespace) -> RpcClient:
-    """Build an RPC client from parsed arguments."""
-    url = args.rpc_url or f"http://127.0.0.1:{get_params(args.network).default_rpc_port}"
-    token = args.rpc_token or read_rpc_token(args.datadir, args.network)
-    return RpcClient(url, token=token, timeout=20.0)
+    """Build an RPC client from parsed arguments and saved settings."""
+    return settings_from_args(args).client()
 
 
 class PollWorker(QtCore.QObject):
@@ -174,3 +200,167 @@ def run_in_thread(parent: QtCore.QObject, task, on_success, on_error) -> QtCore.
     thread._worker = worker  # type: ignore[attr-defined]
     thread.start()
     return thread
+
+
+@dataclass
+class ConnectionSettings:
+    """Where a desktop application should look for a node.
+
+    Saved next to the wallet, in ``<datadir>/<network>/gui.json``, so a URL typed
+    once is remembered. Command line options always win over the saved value.
+    """
+
+    url: str
+    token: str = ""
+
+    @staticmethod
+    def path(datadir: Path, network: str) -> Path:
+        """Location of the settings file."""
+        return Path(datadir) / network / "gui.json"
+
+    @classmethod
+    def load(cls, datadir: Path, network: str) -> ConnectionSettings | None:
+        """Read saved settings, or ``None`` if there are none."""
+        try:
+            data = json.loads(cls.path(datadir, network).read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+        url = str(data.get("rpc_url") or "").strip()
+        if not url:
+            return None
+        return cls(url, str(data.get("rpc_token") or ""))
+
+    def save(self, datadir: Path, network: str) -> None:
+        """Store the settings, keeping the file private."""
+        target = self.path(datadir, network)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps({"rpc_url": self.url, "rpc_token": self.token}, indent=1), "utf-8"
+            )
+            target.chmod(0o600)
+        except OSError as exc:  # pragma: no cover - disk errors
+            logger.warning("could not save the node settings: %s", exc)
+
+    def client(self, timeout: float = 20.0) -> RpcClient:
+        """Build a client from these settings."""
+        return RpcClient(self.url, token=self.token or None, timeout=timeout)
+
+
+class NodeDialog(QtWidgets.QDialog):
+    """Asks which node to talk to, and checks that it answers before accepting."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        settings: ConnectionSettings,
+        network: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Node connection")
+        self.setMinimumWidth(520)
+        self._network = network
+        self.settings = ConnectionSettings(settings.url, settings.token)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        message = reason or f"Choose the {network} node this application should use."
+        headline = QtWidgets.QLabel(message)
+        headline.setWordWrap(True)
+        layout.addWidget(headline)
+
+        hint = QtWidgets.QLabel(
+            "Either run a node on this machine and keep the address below, or point "
+            "this at somebody else's node. A public node needs no token; your own "
+            "node writes one to <datadir>/&lt;network&gt;/rpc.token."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        layout.addWidget(hint)
+
+        form = QtWidgets.QFormLayout()
+        self.url_edit = QtWidgets.QLineEdit(self.settings.url)
+        self.url_edit.setPlaceholderText("http://127.0.0.1:20332")
+        form.addRow("Node URL", self.url_edit)
+        self.token_edit = QtWidgets.QLineEdit(self.settings.token)
+        self.token_edit.setPlaceholderText("only for your own node")
+        self.token_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        form.addRow("RPC token", self.token_edit)
+        layout.addLayout(form)
+
+        self.status = QtWidgets.QLabel()
+        self.status.setWordWrap(True)
+        self.status.setObjectName("hint")
+        layout.addWidget(self.status)
+
+        buttons = QtWidgets.QHBoxLayout()
+        test_button = QtWidgets.QPushButton("Test")
+        test_button.clicked.connect(self._test)
+        buttons.addWidget(test_button)
+        buttons.addStretch(1)
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(cancel_button)
+        self.connect_button = QtWidgets.QPushButton("Connect")
+        self.connect_button.setObjectName("primary")
+        self.connect_button.setDefault(True)
+        self.connect_button.clicked.connect(self._accept)
+        buttons.addWidget(self.connect_button)
+        layout.addLayout(buttons)
+
+    def _current(self) -> ConnectionSettings:
+        return ConnectionSettings(self.url_edit.text().strip(), self.token_edit.text().strip())
+
+    def _describe(self, settings: ConnectionSettings) -> str:
+        """Try the node and return a human description of what happened."""
+        if not settings.url:
+            return "Enter the address of a node."
+        try:
+            info = settings.client(timeout=10.0).getinfo()
+        except RpcClientError as exc:
+            return f"No answer: {exc}"
+        if info.get("network") != self._network:
+            return (
+                f"That node runs the {info.get('network')} network,"
+                f" but this is a {self._network} wallet."
+            )
+        return f"Connected: {info['network']} at height {info['height']}, {info['peers']} peers."
+
+    def _test(self) -> None:
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self.status.setText(self._describe(self._current()))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _accept(self) -> None:
+        candidate = self._current()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            message = self._describe(candidate)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.status.setText(message)
+        if not message.startswith("Connected"):
+            return
+        self.settings = candidate
+        self.accept()
+
+
+def ask_for_node(
+    parent: QtWidgets.QWidget | None,
+    settings: ConnectionSettings,
+    network: str,
+    datadir: Path,
+    *,
+    reason: str = "",
+) -> ConnectionSettings | None:
+    """Show :class:`NodeDialog` and save the result if the user accepts."""
+    dialog = NodeDialog(parent, settings, network, reason=reason)
+    if dialog.exec_() != QtWidgets.QDialog.Accepted:
+        return None
+    dialog.settings.save(datadir, network)
+    return dialog.settings

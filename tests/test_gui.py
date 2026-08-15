@@ -97,6 +97,107 @@ class TestWalletWindow:
             pump(qt_app)
 
 
+class TestNodeConnection:
+    def test_settings_round_trip(self, tmp_path):
+        from scarletcoin.gui.common import ConnectionSettings
+
+        assert ConnectionSettings.load(tmp_path, "regtest") is None
+        ConnectionSettings("http://node.example:20332", "tok").save(tmp_path, "regtest")
+        loaded = ConnectionSettings.load(tmp_path, "regtest")
+        assert loaded == ConnectionSettings("http://node.example:20332", "tok")
+
+    def test_a_corrupt_settings_file_is_ignored(self, tmp_path):
+        from scarletcoin.gui.common import ConnectionSettings
+
+        path = ConnectionSettings.path(tmp_path, "regtest")
+        path.parent.mkdir(parents=True)
+        path.write_text("not json")
+        assert ConnectionSettings.load(tmp_path, "regtest") is None
+
+    def test_command_line_wins_over_saved_settings(self, tmp_path):
+        import argparse
+
+        from scarletcoin.gui.common import ConnectionSettings, settings_from_args
+
+        ConnectionSettings("http://saved:1", "saved-token").save(tmp_path, "regtest")
+        args = argparse.Namespace(network="regtest", datadir=tmp_path, rpc_url=None, rpc_token=None)
+        assert settings_from_args(args).url == "http://saved:1"
+        args.rpc_url = "http://given:2"
+        assert settings_from_args(args).url == "http://given:2"
+
+    def test_the_local_node_token_is_picked_up(self, tmp_path):
+        import argparse
+
+        from scarletcoin.cli_common import write_rpc_token
+        from scarletcoin.gui.common import default_url, settings_from_args
+
+        write_rpc_token(tmp_path, "regtest", "from-file")
+        args = argparse.Namespace(network="regtest", datadir=tmp_path, rpc_url=None, rpc_token=None)
+        settings = settings_from_args(args)
+        assert settings.url == default_url("regtest")
+        assert settings.token == "from-file"
+
+    def test_the_dialog_rejects_an_unreachable_node(self, qt_app, tmp_path):
+        from scarletcoin.gui.common import ConnectionSettings, NodeDialog
+
+        dialog = NodeDialog(None, ConnectionSettings("http://127.0.0.1:1"), "regtest")
+        dialog._accept()
+        assert dialog.result() != QtWidgets.QDialog.Accepted
+        assert "No answer" in dialog.status.text()
+
+    def test_the_dialog_rejects_the_wrong_network(self, qt_app, rpc):
+        from scarletcoin.gui.common import ConnectionSettings, NodeDialog
+
+        _, server, _ = rpc
+        dialog = NodeDialog(None, ConnectionSettings(server.url, "test-token"), "mainnet")
+        dialog._accept()
+        assert dialog.result() != QtWidgets.QDialog.Accepted
+        assert "regtest network" in dialog.status.text()
+
+    def test_the_dialog_accepts_a_working_node(self, qt_app, rpc):
+        from scarletcoin.gui.common import ConnectionSettings, NodeDialog
+
+        _, server, _ = rpc
+        dialog = NodeDialog(None, ConnectionSettings(server.url, "test-token"), "regtest")
+        dialog._accept()
+        assert dialog.result() == QtWidgets.QDialog.Accepted
+        assert dialog.status.text().startswith("Connected")
+
+    def test_the_wallet_window_can_switch_nodes(self, qt_app, rpc, wallet, monkeypatch, tmp_path):
+        from scarletcoin.gui.common import ConnectionSettings
+
+        _, server, client = rpc
+        client.call("generate", 3, wallet.keystore.default_address())
+        window = WalletWindow(wallet.keystore, client, datadir=tmp_path)
+        try:
+            monkeypatch.setattr(
+                "scarletcoin.gui.wallet_app.ask_for_node",
+                lambda *a, **k: ConnectionSettings(server.url, "test-token"),
+            )
+            window.change_node()
+            assert window.client.url == server.url
+            assert wait_until(lambda: (pump(qt_app), bool(window._snapshot))[1], timeout=15)
+        finally:
+            window.close()
+            pump(qt_app)
+
+    def test_an_unreachable_node_shows_a_hint_not_a_crash(self, qt_app, rpc, wallet, tmp_path):
+        from scarletcoin.net.client import RpcClient
+
+        window = WalletWindow(
+            wallet.keystore, RpcClient("http://127.0.0.1:1", timeout=1), datadir=tmp_path
+        )
+        try:
+            assert wait_until(
+                lambda: (pump(qt_app), "no answer from" in window.status.currentMessage())[1],
+                timeout=20,
+            )
+            assert "Connection" in window.status.currentMessage()
+        finally:
+            window.close()
+            pump(qt_app)
+
+
 class TestMinerWindow:
     def test_it_mines_and_stops(self, qt_app, rpc, key):
         _, _, client = rpc

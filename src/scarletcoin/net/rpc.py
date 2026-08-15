@@ -32,7 +32,7 @@ from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.net import explorer
 from scarletcoin.net.node import Node
 
-__all__ = ["RpcError", "RpcServer", "build_methods"]
+__all__ = ["PUBLIC_METHODS", "RpcError", "RpcServer", "build_methods"]
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,36 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 APPLICATION_ERROR = -32000
+UNAUTHORISED = -32001
+
+#: Methods a node may safely answer for anybody, when started with ``--rpc-public``.
+#:
+#: These are the calls a wallet and a block explorer need: they read the chain, or
+#: hand it a transaction that is validated like any other before being relayed.
+#: Everything outside this set — mining, peer management, shutdown — stays behind
+#: the bearer token.
+PUBLIC_METHODS = frozenset(
+    {
+        "getinfo",
+        "getblockcount",
+        "getbestblockhash",
+        "getdifficulty",
+        "getsupply",
+        "getblockhash",
+        "getblock",
+        "getblockheader",
+        "getrawblock",
+        "gettransaction",
+        "getrawtransaction",
+        "getmempool",
+        "validateaddress",
+        "getbalance",
+        "getutxos",
+        "getaddresshistory",
+        "getrichlist",
+        "sendrawtransaction",
+    }
+)
 
 MAX_BODY = 8 * 1024 * 1024
 
@@ -396,9 +426,12 @@ class RpcServer:
         host: str = "127.0.0.1",
         port: int = 0,
         token: str | None = None,
+        public: bool = False,
     ) -> None:
         self.node = node
         self.token = token
+        self.public = public
+        """Whether unauthenticated callers may use :data:`PUBLIC_METHODS`."""
         self.methods = build_methods(node)
         self._server = ThreadingHTTPServer((host, port), self._make_handler())
         self._server.daemon_threads = True
@@ -445,11 +478,16 @@ class RpcServer:
     # ------------------------------------------------------------------ internals
 
     def _authorised(self, header: str | None) -> bool:
+        """Whether a request carries the right token (or none is required)."""
         if not self.token:
             return True
         if not header or not header.startswith("Bearer "):
             return False
         return hmac.compare_digest(header[7:].strip(), self.token)
+
+    def allows_anonymous(self, method: str) -> bool:
+        """Whether ``method`` may be called without the token."""
+        return self.public and method in PUBLIC_METHODS
 
     def _dispatch(self, method: str, params: object) -> object:
         handler = self.methods.get(method)
@@ -469,23 +507,38 @@ class RpcServer:
             ) from exc
         raise RpcError("params must be a list or an object", INVALID_PARAMS)
 
-    def handle_rpc(self, body: bytes) -> dict | list:
-        """Execute one JSON-RPC request (or batch) and return the response object."""
+    def handle_rpc(self, body: bytes, *, authorised: bool = True) -> dict | list:
+        """Execute one JSON-RPC request (or batch) and return the response object.
+
+        Args:
+            body: The raw request body.
+            authorised: Whether the caller presented a valid token. When it did
+                not, only :data:`PUBLIC_METHODS` are answered, and only on a node
+                started with ``--rpc-public``.
+        """
         try:
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             return _error_response(None, PARSE_ERROR, f"invalid JSON: {exc}")
         if isinstance(request, list):
-            return [self._handle_single(item) for item in request]
-        return self._handle_single(request)
+            return [self._handle_single(item, authorised=authorised) for item in request]
+        return self._handle_single(request, authorised=authorised)
 
-    def _handle_single(self, request: object) -> dict:
+    def _handle_single(self, request: object, *, authorised: bool = True) -> dict:
         if not isinstance(request, dict):
             return _error_response(None, INVALID_REQUEST, "a request must be an object")
         request_id = request.get("id")
         method = request.get("method")
         if not isinstance(method, str):
             return _error_response(request_id, INVALID_REQUEST, "missing method name")
+        if not authorised and not self.allows_anonymous(method):
+            return _error_response(
+                request_id,
+                UNAUTHORISED,
+                f"{method} needs the node's RPC token"
+                if method in self.methods
+                else f"unknown method {method!r}",
+            )
         try:
             result = self._dispatch(method, request.get("params"))
         except RpcError as exc:
@@ -528,7 +581,8 @@ class RpcServer:
                 if url.path not in ("/", "/rpc"):
                     self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
                     return
-                if not server._authorised(self.headers.get("Authorization")):
+                authorised = server._authorised(self.headers.get("Authorization"))
+                if not authorised and not server.public:
                     self._json({"error": "unauthorised"}, HTTPStatus.UNAUTHORIZED)
                     return
                 try:
@@ -539,7 +593,7 @@ class RpcServer:
                     self._json({"error": "request too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                     return
                 body = self.rfile.read(length) if length else b""
-                self._json(server.handle_rpc(body))
+                self._json(server.handle_rpc(body, authorised=authorised))
 
             def do_GET(self) -> None:
                 url = urlparse(self.path)

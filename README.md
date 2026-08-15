@@ -59,6 +59,13 @@ or with pip:
 pip install -e ".[gui]"
 ```
 
+On Alpine (or anywhere the code runs as a dedicated service user), build the
+environment against the system Python so an unprivileged user can execute it:
+
+```sh
+UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3
+```
+
 ## Quick start on a private network
 
 `regtest` is a local network whose proof of work is trivial, which makes it
@@ -106,6 +113,23 @@ uv run scarlet-node --network mainnet --seed seed.example.org       # a name, al
 uv run scarlet-node --network mainnet --addnode 203.0.113.7:20333   # one specific peer
 ```
 
+### Using a wallet with somebody else's node
+
+A wallet needs a node. Run one yourself — the wallet defaults to
+`http://127.0.0.1:20332` and finds its token automatically — or point it at a node
+that was started with `--rpc-public`:
+
+```sh
+uv run scarlet-wallet     --network mainnet --rpc-url https://scarletcoin.remotewire.net info
+uv run scarlet-wallet-gui --network mainnet --rpc-url https://scarletcoin.remotewire.net
+```
+
+The desktop wallet remembers the address, has a **Node ▸ Connection…** dialog with
+a *Test* button, and asks for a node if none answers instead of showing an empty
+window. A public node answers reads and `sendrawtransaction` for anybody; mining,
+peer management and shutdown always need its token. Running your own node is still
+better: then you trust nobody for your balance.
+
 ### Running a public node
 
 A node needs **two** ports, and they are not interchangeable:
@@ -113,7 +137,7 @@ A node needs **two** ports, and they are not interchangeable:
 | Port | What | Who reaches it |
 |---|---|---|
 | 20333 | the peer-to-peer protocol, raw TCP | other nodes, directly — an HTTP proxy cannot carry it |
-| 20332 | JSON-RPC and the explorer, HTTP | localhost only; publish through a reverse proxy if you want |
+| 20332 | JSON-RPC and the explorer, HTTP | localhost; publish through a reverse proxy, and add `--rpc-public` if you want other people's wallets to use it |
 
 [docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) has the full guide,
 including a complete worked example for the reference node (Alpine Linux, OpenRC

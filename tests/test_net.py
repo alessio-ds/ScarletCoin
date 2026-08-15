@@ -15,6 +15,7 @@ from scarletcoin.net.addrbook import AddressBook, parse_address
 from scarletcoin.net.client import RpcClient, RpcClientError
 from scarletcoin.net.node import Node, NodeConfig
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
+from scarletcoin.net.rpc import RpcServer
 from tests.conftest import wait_until
 from tests.helpers import mine_block, spend
 
@@ -313,6 +314,123 @@ class TestRpc:
             assert "generate" not in build_methods(node)
         finally:
             node.stop()
+
+
+class TestPublicRpc:
+    """A node started with --rpc-public serves wallets without handing over control."""
+
+    def _server(self, node, **kwargs) -> RpcServer:
+        server = RpcServer(node, port=0, token="secret", **kwargs)
+        server.start()
+        return server
+
+    def test_public_methods_work_without_a_token(self, tmp_path, key):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "pub", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = self._server(node, public=True)
+        try:
+            owner = RpcClient(server.url, token="secret", timeout=10)
+            owner.call("generate", 3, str(key.address(REGTEST.address_version)))
+
+            anonymous = RpcClient(server.url, timeout=10)
+            assert anonymous.getblockcount() == 3
+            assert anonymous.getinfo()["network"] == "regtest"
+            assert anonymous.getbalance(str(key.address(REGTEST.address_version)))["balance"] > 0
+            assert anonymous.call("getblock", 1)["height"] == 1
+            assert anonymous.call("getmempool")["count"] == 0
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_private_methods_still_need_the_token(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "pub2", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = self._server(node, public=True)
+        try:
+            anonymous = RpcClient(server.url, timeout=10)
+            for method, params in (
+                ("generate", [1]),
+                ("stop", []),
+                ("addpeer", ["127.0.0.1"]),
+                ("getpeers", []),
+                ("getaddresses", []),
+                ("getblocktemplate", []),
+            ):
+                with pytest.raises(RpcClientError, match="needs the node's RPC token"):
+                    anonymous.call(method, *params)
+            assert node.chain.height == 0  # nothing happened
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_a_wallet_can_broadcast_through_a_public_node(self, tmp_path, key, other_key):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "pub3", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = self._server(node, public=True)
+        try:
+            RpcClient(server.url, token="secret", timeout=10).call(
+                "generate", 4, str(key.address(REGTEST.address_version))
+            )
+            transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+            anonymous = RpcClient(server.url, timeout=10)
+            assert (
+                anonymous.sendrawtransaction(transaction.serialize().hex())
+                == transaction.txid_hex()
+            )
+            assert transaction.txid() in node.mempool
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_public_mode_is_off_by_default(self, rpc):
+        _, server, _ = rpc
+        assert server.public is False
+        anonymous = RpcClient(server.url, timeout=10)
+        with pytest.raises(RpcClientError, match="401"):
+            anonymous.getblockcount()
+
+    def test_a_batch_is_checked_request_by_request(self, rpc):
+        _, server, _ = rpc
+        server.public = True
+        answer = server.handle_rpc(
+            json.dumps(
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "getblockcount"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "stop"},
+                ]
+            ).encode(),
+            authorised=False,
+        )
+        assert answer[0]["result"] == 0
+        assert answer[1]["error"]["code"] == -32001
+        server.public = False
+
+    def test_the_public_set_covers_what_a_wallet_needs(self):
+        from scarletcoin.net.rpc import PUBLIC_METHODS
+
+        needed = {
+            "getinfo",
+            "getblockcount",
+            "getbalance",
+            "getutxos",
+            "getaddresshistory",
+            "sendrawtransaction",
+        }
+        assert needed <= PUBLIC_METHODS
+        # and nothing that controls the node
+        assert not PUBLIC_METHODS & {"stop", "generate", "addpeer", "submitblock"}
 
 
 class TestExplorer:
