@@ -173,6 +173,42 @@ start a node by hand from inside the window use *Node > Start a local node*.
 The miner needs a node it owns for its mining token, so a public node will not
 do.
 
+## Desktop release
+
+Ready-to-run builds for Windows and Linux are attached to every
+[GitHub release](https://github.com/alessio-ds/ScarletCoin/releases). Each
+archive contains three executables and nothing else — no Python is required:
+
+| File | What it is |
+|---|---|
+| `scarlet-wallet-gui` | the desktop wallet |
+| `scarlet-miner-gui` | the desktop miner |
+| `scarlet-node` | the node, started in the background by the other two |
+
+Extract the archive anywhere and double-click the wallet or the miner. If no
+node is running yet, the first window to open starts a local node in the
+background (same network and datadir) and stops it again when the last window
+closes.
+
+* **Windows** — `ScarletCoin-<version>-win64.zip`, or the
+  `ScarletCoin-Setup-<version>.exe` installer, which installs per user (no
+  admin rights) and adds Start-menu shortcuts for both applications.
+* **Linux** — `ScarletCoin-<version>-linux-x86_64.tar.gz` (single directory of
+  executables; `chmod +x scarlet-*` after extracting). A desktop with the usual
+  Qt libraries is assumed; on Debian/Ubuntu `libxcb-cursor0` may need to be
+  installed.
+
+The `Release` workflow builds everything with
+[PyInstaller](https://pyinstaller.org/) when a tag like `v2.0.0` is pushed, and
+uploads the archives (plus the installer on Windows) to the release. To build
+locally:
+
+```sh
+python tools/build_release.py
+# on Windows, compile the installer as well:
+iscc /DMyAppVersion=2.0.0 packaging/windows/scarletcoin.iss
+```
+
 ## The three programs
 
 ### `scarlet-node`

@@ -4,7 +4,8 @@ __pycache__/
 build/
 dist/
 .venv/
-venv/
+.venv-release/
+release/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

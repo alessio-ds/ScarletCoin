@@ -10,6 +10,7 @@ a test just as well.
 
 from __future__ import annotations
 
+import os
 import secrets
 import socket
 import subprocess
@@ -157,7 +158,14 @@ class LocalNode:
             handle = log_path.open("a", encoding="utf-8")
             handle.write(f"\n--- started by {Path(sys.argv[0]).name} ---\n")
             handle.flush()
-            process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+            popen_kwargs: dict[str, object] = {}
+            if os.name == "nt":
+                # The node is a console program; without this flag Windows pops a
+                # console window every time the wallet or the miner starts it.
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            process = subprocess.Popen(
+                command, stdout=handle, stderr=subprocess.STDOUT, **popen_kwargs
+            )
         except OSError as exc:
             raise LocalNodeError(f"could not start a node: {exc}") from exc
 
