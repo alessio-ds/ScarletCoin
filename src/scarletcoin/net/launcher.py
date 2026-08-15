@@ -23,10 +23,26 @@ from scarletcoin.cli_common import write_rpc_token
 from scarletcoin.core.params import get_params
 from scarletcoin.net.client import RpcClient, RpcClientError
 
-__all__ = ["LocalNode", "LocalNodeError", "node_command", "start_local_node"]
+__all__ = [
+    "LocalNode",
+    "LocalNodeError",
+    "generate_token",
+    "node_command",
+    "start_local_node",
+]
 
 #: How long to wait for a freshly started node to answer, in seconds.
 STARTUP_TIMEOUT = 60.0
+
+
+def generate_token() -> str:
+    """A fresh RPC token that is safe on a command line.
+
+    ``secrets.token_urlsafe`` may begin with ``-``, which argparse would read as
+    another option rather than as the value of ``--rpc-token``; a leading letter
+    makes that impossible.
+    """
+    return "t" + secrets.token_urlsafe(32)
 
 
 class LocalNodeError(RuntimeError):
@@ -124,7 +140,7 @@ class LocalNode:
                 "already running here (your wallet may have started one). Stop that "
                 "node first, or connect to it instead of starting another."
             )
-        token = secrets.token_urlsafe(32)
+        token = generate_token()
         datadir = Path(datadir)
         log_path = datadir / network / "node.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)

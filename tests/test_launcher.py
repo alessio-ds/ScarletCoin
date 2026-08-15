@@ -9,6 +9,7 @@ import pytest
 from scarletcoin.net.launcher import (
     LocalNodeError,
     already_running,
+    generate_token,
     node_command,
     start_local_node,
 )
@@ -41,6 +42,13 @@ class TestNodeCommand:
         )
         assert "--p2p-port" in command
         assert "--no-seeds" in command
+
+    def test_tokens_are_safe_as_command_line_arguments(self):
+        """A token starting with '-' would be eaten by argparse as an option."""
+        tokens = [generate_token() for _ in range(400)]
+        assert all(token[0].isalpha() for token in tokens)
+        command = node_command(network="regtest", datadir=".", rpc_port=1234, rpc_token=tokens[0])
+        assert command[command.index("--rpc-token") + 1] == tokens[0]
 
 
 @pytest.mark.slow
