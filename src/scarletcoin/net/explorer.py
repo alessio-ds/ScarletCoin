@@ -111,7 +111,8 @@ def _page(server: RpcServer, title: str, body: str) -> str:
 </header>
 <main>{body}</main>
 <footer>
-  ScarletCoin node on the {network} network &mdash; block explorer served by the node itself
+  ScarletCoin node on the {network} network &mdash; block explorer served by the node itself<br>
+  <a href="https://github.com/alessio-ds/ScarletCoin">github.com/alessio-ds/ScarletCoin</a>
 </footer>
 </body>
 </html>
