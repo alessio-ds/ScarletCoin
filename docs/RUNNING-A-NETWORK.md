@@ -183,7 +183,7 @@ chmod -R a+rX /opt/scarletcoin
 su -s /bin/sh scarlet -c '/opt/scarletcoin/.venv/bin/scarlet-node --version'
 ```
 
-That last command must print `scarletcoin 2.1.2`. If it does not, fix it now —
+That last command must print `scarletcoin 2.1.3`. If it does not, fix it now —
 the service will fail in exactly the same way, and `rc-service ... start` reports
 `[ ok ]` regardless, because it only means "the supervisor was launched".
 
@@ -683,7 +683,7 @@ uv run scarlet-node rpc --network mainnet getinfo
 
 ```json
 { "network": "mainnet", "genesis": "00000ca129aa591d…", "magic": "SCRL",
-  "protocol_version": 1, "version": "2.1.2", "height": 1041, … }
+  "protocol_version": 1, "version": "2.1.3", "height": 1041, … }
 ```
 
 **Do we have the same history?** Compare a block hash at a height that is old
