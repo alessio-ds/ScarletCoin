@@ -294,11 +294,17 @@ class WalletWindow(QtWidgets.QMainWindow):
             chain = f"  ·  chain {info['chain_size']}"
         elif info.get("chain_bytes") is not None:
             chain = f"  ·  chain {format_bytes(info['chain_bytes'])}"
-        self.status.showMessage(
-            f"{info['network']}  ·  height {info['height']}  ·  {info['peers']} peers"
-            f"  ·  {info['mempool_size']} unconfirmed  ·  difficulty {info['difficulty']:.6g}"
-            f"{chain}"
-        )
+        # A node that cannot reach the network looks just like a healthy empty one.
+        # Say so here rather than leaving it in the log.
+        notes = info.get("warnings") or []
+        if notes:
+            self.status.showMessage(f"{info['network']}  ·  height {info['height']}  ·  {notes[0]}")
+        else:
+            self.status.showMessage(
+                f"{info['network']}  ·  height {info['height']}  ·  {info['peers']} peers"
+                f"  ·  {info['mempool_size']} unconfirmed  ·  difficulty {info['difficulty']:.6g}"
+                f"{chain}"
+            )
         _fill(
             self.address_table,
             [

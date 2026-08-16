@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
 from scarletcoin import __version__
+from scarletcoin.core.chain import BlockStatus
 from scarletcoin.core.params import REGTEST
 from scarletcoin.net import protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
@@ -655,6 +658,175 @@ class TestExplorer:
         assert status == 404
         assert "<script>" not in body
         assert "&lt;script&gt;" in body
+
+
+class TestWrongClock:
+    """A node whose clock is behind must not conclude the network is broken.
+
+    "Too far in the future" is the one rejection that is relative to the machine
+    doing the checking. Treated as a consensus violation it was catastrophic: a
+    fresh install with a slow clock refused every honest block, banned the seed
+    that served them, and sat at height zero looking perfectly healthy.
+    """
+
+    SKEW = 3 * 3600  # regtest allows two hours
+
+    def _slow_clock(self, monkeypatch, seconds: int) -> None:
+        real = time.time
+        monkeypatch.setattr(
+            "scarletcoin.core.chain.time",
+            SimpleNamespace(time=lambda: real() - seconds),
+        )
+
+    def test_a_block_from_the_future_is_not_a_consensus_violation(self, chain, key, monkeypatch):
+        block = mine_block(chain, key)
+        self._slow_clock(monkeypatch, self.SKEW)
+        result = chain.add_block(block)
+        assert result.status is BlockStatus.PREMATURE
+        assert "clock" in result.reason
+        assert not result.accepted
+
+    def test_it_is_not_remembered_as_invalid(self, chain, key, monkeypatch):
+        """Caching it would mean refusing the block for the life of the process,
+        even after the clock was put right."""
+        block = mine_block(chain, key)
+        self._slow_clock(monkeypatch, self.SKEW)
+        assert chain.add_block(block).status is BlockStatus.PREMATURE
+        assert chain._invalid == {}
+        monkeypatch.undo()
+        assert chain.add_block(block).status is BlockStatus.CONNECTED
+        assert chain.height == 1
+
+    def test_the_peer_that_sent_it_is_not_punished(self, tmp_path, key, monkeypatch):
+        good = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "good",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+            )
+        )
+        slow = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "slow",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+            )
+        )
+        good.start()
+        slow.start()
+        try:
+            for _ in range(3):
+                good.submit_block(mine_block(good.chain, key))
+            self._slow_clock(monkeypatch, self.SKEW)
+
+            assert slow.connect_peer("127.0.0.1", good.p2p_port)
+            assert wait_until(lambda: bool(slow.peers) and slow.peers[0].handshake_done.is_set())
+            peer = slow.peers[0]
+            assert wait_until(lambda: slow._premature_blocks > 0, timeout=20)
+
+            assert peer.misbehaviour == 0
+            assert not peer.closed
+            assert not slow.addrbook.is_banned("127.0.0.1")
+            assert slow.chain._invalid == {}
+            assert slow.chain.height == 0
+            assert slow._premature  # kept, to try again
+
+            # And it says so, rather than looking like an empty healthy chain.
+            note = " ".join(slow.info()["warnings"])
+            assert "clock" in note
+
+            # Once the clock is right the node catches up by itself.
+            monkeypatch.undo()
+            slow._retry_premature()
+            assert wait_until(lambda: slow.chain.height == good.chain.height, timeout=25)
+            assert not slow._premature
+            assert not any("clock" in note for note in slow.info()["warnings"])
+        finally:
+            slow.stop()
+            good.stop()
+
+    def test_a_deferred_block_is_not_requested_again_in_a_loop(self, node, key, monkeypatch):
+        """Re-requesting a block our own clock forbids would spin: every arrival
+        would be refused, then chased again."""
+        block = mine_block(node.chain, key)
+        self._slow_clock(monkeypatch, self.SKEW)
+        assert node.submit_block(block).status is BlockStatus.PREMATURE
+
+        sent: list[protocol.Message] = []
+        peer = SimpleNamespace(
+            send=sent.append,
+            note_inventory=lambda _hash: None,
+            requested_blocks=set(),
+            pending_blocks=deque(),
+        )
+        node._on_inv(peer, protocol.Inv((InvItem(InvType.BLOCK, block.hash()),)))  # type: ignore[arg-type]
+        assert not peer.pending_blocks
+        assert not sent
+
+
+class TestNodeWarnings:
+    def test_a_network_without_seeds_says_so(self, tmp_path, monkeypatch):
+        """The symptom of this is a node at height 0 with 0 peers, which is
+        indistinguishable from a healthy new chain unless it is spelled out."""
+        node = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "alone",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+                listen=True,
+            )
+        )
+        try:
+            monkeypatch.setattr(node, "started_at", time.time() - 60)
+            note = " ".join(node.warnings())
+            assert "no seed nodes built in" in note
+            assert "--addnode" in note
+            assert node.info()["warnings"]
+        finally:
+            node.stop()
+
+    def test_a_node_that_has_just_started_does_not_complain(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "young",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+            )
+        )
+        try:
+            assert node.warnings() == []
+        finally:
+            node.stop()
+
+    def test_a_connected_node_has_nothing_to_report(self, tmp_path, monkeypatch):
+        first = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "a", p2p_port=0, rpc=False, use_seeds=False
+            )
+        )
+        second = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "b", p2p_port=0, rpc=False, use_seeds=False
+            )
+        )
+        first.start()
+        second.start()
+        try:
+            assert second.connect_peer("127.0.0.1", first.p2p_port)
+            assert wait_until(lambda: bool(second.peers))
+            monkeypatch.setattr(second, "started_at", time.time() - 60)
+            assert second.warnings() == []
+        finally:
+            second.stop()
+            first.stop()
 
 
 class TestSeeds:

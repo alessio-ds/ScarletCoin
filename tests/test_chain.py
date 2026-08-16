@@ -121,11 +121,18 @@ class TestBlockAcceptance:
         assert result.status is BlockStatus.INVALID
         assert "difficulty" in result.reason
 
-    def test_a_timestamp_too_far_ahead_is_rejected(self, chain, key):
+    def test_a_timestamp_too_far_ahead_is_refused_but_not_condemned(self, chain, key):
+        """Still not accepted — but "too far ahead" is measured against *our* clock,
+        so it is not a verdict on the block. It must stay judgeable later, or a
+        node with a slow clock would permanently refuse the whole network."""
         block = mine_block(chain, key, timestamp=int(time.time()) + 3 * 60 * 60)
         result = chain.add_block(block)
-        assert result.status is BlockStatus.INVALID
-        assert "future" in result.reason
+        assert result.status is BlockStatus.PREMATURE
+        assert not result.accepted
+        assert "clock" in result.reason
+        assert chain.height == 0
+        assert not chain.has_block(block.hash())
+        assert chain._invalid == {}
 
     def test_an_old_timestamp_is_rejected(self, chain, key):
         mine_and_add(chain, key, count=3)

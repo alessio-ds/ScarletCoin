@@ -883,7 +883,7 @@ What you are accepting by running this:
 | `this database belongs to a different network` | The datadir was created by another network or a modified build. Use a different `--datadir` |
 | `message is for a different network` in the log | A peer from another chain (or a port scan). Harmless |
 | Height stuck, peers connected | Give it the poll interval (up to five minutes) to re-ask; then check the log for rejected blocks, and check the clock |
-| `timestamp … is too far in the future` | *Your* clock is behind. Fix NTP |
+| `refusing blocks that are ahead of this machine's clock` | *Your* clock is behind by more than two hours, so every honest block looks invalid and the node cannot follow the network. Fix NTP; the node re-checks the blocks it held back once a minute and catches up on its own. `getinfo.warnings` reports this, and the wallet shows it in the status bar |
 | A transaction stays in the mempool while blocks are mined | The miner does not have it. Check with `scarlet-node rpc --rpc-url <miner> getmempool`. Nodes re-offer their pool every two minutes and on every reconnect, so it should heal by itself; to force it, rebroadcast the raw transaction straight at the mining node. Note that mempools are memory-only: if every node holding it restarts, the transaction is gone and has to be sent again |
 | Your mined blocks are rejected | Usually a stale template or a wrong-network payout address. The error from `submitblock` says which rule failed |
 | Disk filling up | Check with `scarlet-node size`. Blocks are ~1 kB each on a quiet chain, but plan for growth; `scarlet-node prune --keep 5000` drops old bodies, and `--prune 5000` keeps doing it. A pruned node can no longer help a new one sync, so do not prune the seed |

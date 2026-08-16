@@ -66,6 +66,8 @@ _POLL_INTERVAL = 60.0
 #: yet — would otherwise never hear about it again.  Miners are the peers this
 #: matters for: an unconfirmed transaction nobody re-offers is never mined.
 MEMPOOL_REANNOUNCE_INTERVAL = 120.0
+#: How often deferred blocks are re-offered to the chain, in case the clock was fixed.
+_PREMATURE_RETRY_INTERVAL = 60.0
 #: How often a pruning node trims the blocks that have fallen behind its horizon.
 _PRUNE_INTERVAL = 600.0
 
@@ -159,6 +161,11 @@ class Node:
         self.started_at = time.time()
         self._last_block_at = time.time()
         self._last_poll_at = 0.0
+        self._premature: OrderedDict[bytes, tuple[Block, float]] = OrderedDict()
+        """Blocks deferred because they are ahead of this machine's clock."""
+        self._premature_blocks = 0
+        self._premature_reason = ""
+        self._premature_logged_at = 0.0
 
         for peer_address in config.connect:
             self._add_address(peer_address, source="config")
@@ -580,6 +587,10 @@ class Node:
             if item.is_block:
                 if self.chain.has_block(item.hash) or item.hash in self._orphans:
                     continue
+                if item.hash in self._premature:
+                    # Held back by our own clock, not missing. Re-requesting it
+                    # would spin: every arrival would be refused again.
+                    continue
                 if item.hash in peer.requested_blocks or item.hash in peer.pending_blocks:
                     continue
                 peer.pending_blocks.append(item.hash)
@@ -652,6 +663,9 @@ class Node:
         result = self.submit_block(block, source=peer)
         if result.status is BlockStatus.INVALID:
             self._misbehave(peer, 50, result.reason)
+        elif result.status is BlockStatus.PREMATURE:
+            # Our clock, our problem. Asking for more would only refuse more.
+            return
         elif result.status is BlockStatus.ORPHAN:
             self._maybe_sync(peer, force=True)
         if not peer.requested_blocks and not peer.pending_blocks:
@@ -733,6 +747,10 @@ class Node:
         if result.status is BlockStatus.ORPHAN:
             self._remember_orphan(block)
             return result
+        if result.status is BlockStatus.PREMATURE:
+            self._note_premature_block(result.reason)
+            self._defer_premature(block)
+            return result
         if result.status is BlockStatus.INVALID:
             logger.info("rejected block %s: %s", block.hash_hex(), result.reason)
             return result
@@ -783,6 +801,64 @@ class Node:
             while len(self._orphans) > MAX_ORPHANS:
                 self._orphans.popitem(last=False)
 
+    def _note_premature_block(self, reason: str) -> None:
+        """Record that a block arrived from beyond this machine's clock.
+
+        Almost always the clock here is wrong, and the consequence is severe: a
+        node whose clock is slow rejects every honest block on the network. The
+        peers serving them are blameless, so nothing is held against them; instead
+        the operator is told, loudly and repeatedly enough to be noticed, because
+        the node will otherwise sit at its current height for ever looking
+        healthy.
+        """
+        now = time.time()
+        with self._lock:
+            self._premature_blocks += 1
+            count = self._premature_blocks
+            self._premature_reason = reason
+            due = now - self._premature_logged_at > 60.0
+            if due:
+                self._premature_logged_at = now
+        if due:
+            logger.warning(
+                "refusing blocks that are ahead of this machine's clock (%d so far): %s."
+                " The network's blocks are almost certainly fine — check the system"
+                " clock and time zone here, then this node will catch up on its own.",
+                count,
+                reason,
+            )
+
+    def _defer_premature(self, block: Block) -> None:
+        """Keep a block that is ahead of our clock, to try again shortly."""
+        with self._lock:
+            self._premature[block.hash()] = (block, time.time())
+            while len(self._premature) > MAX_ORPHANS:
+                self._premature.popitem(last=False)
+
+    def _retry_premature(self) -> None:
+        """Re-offer deferred blocks to the chain; the clock may be right by now.
+
+        Without this, recovering from a wrong clock would mean restarting the
+        node: the blocks are not stored, and a peer only announces a block once.
+        """
+        with self._lock:
+            waiting = list(self._premature.items())
+        for block_hash, (block, first_seen) in waiting:
+            result = self.chain.add_block(block)
+            expired = time.time() - first_seen > 1800.0
+            if result.status is not BlockStatus.PREMATURE or expired:
+                with self._lock:
+                    self._premature.pop(block_hash, None)
+            if result.accepted:
+                logger.info(
+                    "accepted block %s at height %s now that the clock allows it",
+                    block.hash_hex(),
+                    result.height,
+                )
+                self._last_block_at = time.time()
+                self._relay(InvItem(InvType.BLOCK, block_hash))
+                self._connect_orphans_of(block_hash)
+
     def _connect_orphans_of(self, parent_hash: bytes) -> None:
         """Connect stored orphans that were waiting for ``parent_hash``."""
         pending = [parent_hash]
@@ -809,6 +885,7 @@ class Node:
         last_save = last_check = time.time()
         last_prune = 0.0
         last_reannounce = time.time()
+        last_premature_retry = 0.0
         while not self._stop.wait(_TICK):
             now = time.time()
             if now - last_check < _MAINTENANCE_INTERVAL:
@@ -838,6 +915,10 @@ class Node:
 
             if not self.peers and not len(self.addrbook) and self.seed_hosts:
                 self._bootstrap_seeds()
+
+            if self._premature and now - last_premature_retry > _PREMATURE_RETRY_INTERVAL:
+                last_premature_retry = now
+                self._retry_premature()
 
             if (
                 len(self.mempool)
@@ -894,6 +975,49 @@ class Node:
             "keep_blocks": max(keep, self.chain.min_prune_keep),
         }
 
+    def warnings(self) -> list[str]:
+        """Things wrong with this node that a person should be told about.
+
+        A node with no way to reach the network looks exactly like a healthy one
+        that happens to be at height zero, and the difference only shows up in the
+        log. These come out through ``getinfo``, so the wallet and the miner can
+        put them on screen instead of showing a plausible-looking empty chain.
+
+        Nothing is reported in the first few seconds: a node that has only just
+        started has no peers yet, and that is not a fault.
+        """
+        notes: list[str] = []
+        settled = time.time() - self.started_at > 20.0
+        if self._premature and self._premature_blocks:
+            notes.append(
+                f"Refused {self._premature_blocks} block(s) for being ahead of this"
+                " machine's clock, so this node cannot follow the network. Check the"
+                f" system clock and time zone here. ({self._premature_reason})"
+            )
+        if not settled or self.peers:
+            return notes
+        if not self.config.listen and not self.config.connect and not self.seed_hosts:
+            notes.append("This node neither listens nor has anywhere to connect to.")
+        elif not self.seed_hosts and not self.config.connect:
+            notes.append(
+                f"The {self.params.name} network has no seed nodes built in, so this node"
+                " cannot find peers by itself. Give it --addnode HOST:PORT, or use a"
+                " network that has seeds."
+            )
+        elif not len(self.addrbook):
+            notes.append(
+                "No peer addresses are known yet. If this persists, the seed may be"
+                " unreachable from this network — check that outbound TCP to port"
+                f" {self.params.default_p2p_port} is allowed."
+            )
+        else:
+            notes.append(
+                f"Not connected to any peer, though {len(self.addrbook)} address(es) are"
+                " known: every attempt is failing. Check that outbound TCP to port"
+                f" {self.params.default_p2p_port} is allowed from this machine."
+            )
+        return notes
+
     def info(self) -> dict:
         """Return a summary of the node, used by the ``getinfo`` RPC."""
         peers = self.peers
@@ -915,6 +1039,8 @@ class Node:
                 "mempool_size": len(self.mempool),
                 "mempool_bytes": self.mempool.total_bytes,
                 "orphan_blocks": len(self._orphans),
+                "premature_blocks": self._premature_blocks,
+                "warnings": self.warnings(),
                 # What a wallet needs to know before it trusts this node with
                 # anything: whether it may call without a token, whether it will
                 # hand out mining work, and whether it still has the old blocks.

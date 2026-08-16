@@ -43,6 +43,7 @@ from scarletcoin.core.storage import (
 from scarletcoin.core.transaction import OutPoint, Transaction, TransactionError
 from scarletcoin.core.utxo import Coin, CoinOverlay
 from scarletcoin.core.validation import (
+    PrematureBlockError,
     ValidationError,
     check_transaction_final,
     check_transaction_inputs,
@@ -81,6 +82,13 @@ class BlockStatus(Enum):
     """Already known."""
     ORPHAN = "orphan"
     """Its parent is unknown, so it could not be validated yet."""
+    PREMATURE = "premature"
+    """Ahead of this machine's clock, so it cannot be judged yet.
+
+    Not a verdict on the block: almost always this node's clock is wrong. Nothing
+    is stored and nothing is remembered, so the block is accepted as soon as it is
+    offered again with the clock put right.
+    """
     INVALID = "invalid"
     """Broke a consensus rule."""
 
@@ -355,6 +363,12 @@ class Blockchain:
             height = parent.height + 1
             try:
                 self._check_context(block, parent, height)
+            except PrematureBlockError as exc:
+                # Deliberately not cached and not stored. The block is fine; this
+                # machine's clock is behind the network's. Remembering it as
+                # invalid would mean refusing it for the rest of the process even
+                # after the clock was fixed.
+                return AddBlockResult(BlockStatus.PREMATURE, block_hash, height, reason=str(exc))
             except ValidationError as exc:
                 self._invalid[block_hash] = str(exc)
                 return AddBlockResult(BlockStatus.INVALID, block_hash, height, reason=str(exc))
@@ -392,7 +406,11 @@ class Blockchain:
             )
         limit = int(time.time()) + self.params.max_future_time
         if block.header.timestamp > limit:
-            raise ValidationError(f"timestamp {block.header.timestamp} is too far in the future")
+            raise PrematureBlockError(
+                f"timestamp {block.header.timestamp} is more than"
+                f" {self.params.max_future_time // 3600}h ahead of this machine's clock"
+                f" (now {int(time.time())}); check the clock on this machine"
+            )
         try:
             claimed = coinbase_height(block.coinbase)
         except (TransactionError, BlockError) as exc:

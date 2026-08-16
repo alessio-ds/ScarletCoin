@@ -10,6 +10,7 @@ from scarletcoin.crypto.keys import InvalidKeyError, InvalidSignatureError
 
 __all__ = [
     "MissingInputError",
+    "PrematureBlockError",
     "ValidationError",
     "check_transaction_final",
     "check_transaction_inputs",
@@ -18,6 +19,18 @@ __all__ = [
 
 class ValidationError(Exception):
     """Raised when a transaction or block breaks a consensus rule."""
+
+
+class PrematureBlockError(ValidationError):
+    """Raised when a block cannot be judged yet because it is ahead of our clock.
+
+    This is the one rejection that says nothing about the block and nothing about
+    the peer that sent it: a timestamp is only "too far in the future" relative to
+    the clock of the machine doing the checking. A node whose clock is slow would
+    otherwise reject every honest block on the network, punish the peers serving
+    them, and end up alone at height zero — so this is kept separate from a real
+    consensus violation, is never cached, and is never held against a peer.
+    """
 
 
 class MissingInputError(ValidationError):
