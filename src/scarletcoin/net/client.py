@@ -5,10 +5,13 @@ from __future__ import annotations
 import http.client
 import itertools
 import json
+import ssl
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+import certifi
 
 from scarletcoin.core.params import get_params
 
@@ -60,6 +63,11 @@ class RpcClient:
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self._context = (
+            ssl.create_default_context(cafile=certifi.where())
+            if self.url.startswith("https://")
+            else None
+        )
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke ``method`` and return its result.
@@ -77,17 +85,22 @@ class RpcClient:
             "method": method,
             "params": kwargs if kwargs else list(args),
         }
-        request = urllib.request.Request(
-            f"{self.url}/rpc",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        try:
+            request = urllib.request.Request(
+                f"{self.url}/rpc",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        except (ValueError, http.client.InvalidURL) as exc:
+            raise RpcClientError(f"cannot reach the node at {self.url}: {exc}") from exc
         if self.token:
             request.add_header("Authorization", f"Bearer {self.token}")
         for attempt in range(MAX_ATTEMPTS):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout, context=self._context
+                ) as response:
                     body = response.read()
                 break
             except urllib.error.HTTPError as exc:
@@ -100,6 +113,8 @@ class RpcClient:
                     raise RpcClientError(
                         f"cannot reach the node at {self.url}: {exc.reason}"
                     ) from exc
+            except (ValueError, http.client.InvalidURL) as exc:
+                raise RpcClientError(f"cannot reach the node at {self.url}: {exc}") from exc
             except TimeoutError as exc:
                 raise RpcClientError(f"the node did not answer within {self.timeout}s") from exc
             except (http.client.IncompleteRead, http.client.RemoteDisconnected, OSError) as exc:

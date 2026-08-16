@@ -330,7 +330,7 @@ class TestRpcClientRetry:
 
         calls = []
 
-        def fake_open(request, timeout=None):
+        def fake_open(request, timeout=None, context=None):
             calls.append(1)
             outcome = responses.pop(0)
             if isinstance(outcome, Exception):

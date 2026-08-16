@@ -1,4 +1,4 @@
-"""Build the standalone desktop release for Windows and Linux.
+"""Build the standalone desktop release for Windows, Linux and macOS.
 
 Runs PyInstaller once per program (wallet GUI, miner GUI, node), drops the three
 executables into ``release/bundle`` and packages that folder into an archive.
@@ -11,8 +11,9 @@ Usage::
     python tools/build_release.py
 
 Writes ``release/ScarletCoin-<version>-<platform>.zip`` on Windows and
-``release/ScarletCoin-<version>-<platform>.tar.gz`` on Linux.  The Windows
-installer is compiled separately with Inno Setup (see ``packaging/windows``).
+``release/ScarletCoin-<version>-<platform>.tar.gz`` on Linux and macOS.  The
+Windows installer is compiled separately with Inno Setup (see
+``packaging/windows``).
 """
 
 from __future__ import annotations
@@ -66,7 +67,8 @@ def platform_tag() -> str:
     arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "arm64", "arm64": "arm64"}.get(
         machine, machine
     )
-    return f"linux-{arch}"
+    system = "macos" if sys.platform == "darwin" else "linux"
+    return f"{system}-{arch}"
 
 
 def venv_python() -> Path:
