@@ -59,6 +59,13 @@ _CONNECT_INTERVAL = 1.0
 _MAINTENANCE_INTERVAL = 5.0
 #: Never re-ask every peer for blocks more often than this.
 _POLL_INTERVAL = 60.0
+#: How often a node re-offers its unconfirmed transactions to its peers.
+#:
+#: A transaction is only relayed once, at the moment it is broadcast, so a peer
+#: that was not connected then — or that rejected it because it had not caught up
+#: yet — would otherwise never hear about it again.  Miners are the peers this
+#: matters for: an unconfirmed transaction nobody re-offers is never mined.
+MEMPOOL_REANNOUNCE_INTERVAL = 120.0
 #: How often a pruning node trims the blocks that have fallen behind its horizon.
 _PRUNE_INTERVAL = 600.0
 
@@ -545,8 +552,14 @@ class Node:
         )
         peer.send(protocol.GetAddr())
         self._maybe_sync(peer)
-        if self.chain.height >= peer.start_height and len(self.mempool):
-            self._announce_mempool(peer)
+        # Exchange pools in both directions, unconditionally.
+        #
+        # Asking matters most: a miner is by definition the node that is ahead,
+        # and a node that is behind used to stay silent about its pool, so the
+        # one peer that needed to hear about a pending transaction was the one
+        # least likely to be told. Offering ours costs one message.
+        peer.send(protocol.Mempool())
+        self._announce_mempool(peer)
 
     def _on_getaddr(self, peer: Peer) -> None:
         addresses = [
@@ -656,9 +669,34 @@ class Node:
             self._misbehave(peer, 10, str(exc))
 
     def _announce_mempool(self, peer: Peer) -> None:
-        txids = self.mempool.txids()
+        """Offer ``peer`` every unconfirmed transaction this node holds.
+
+        Capped at what one ``inv`` may carry: a pool larger than that would make
+        :meth:`protocol.Inv.encode` raise, which the peer loop reads as
+        misbehaviour — and the node would ban a peer for its own oversized
+        message.
+        """
+        txids = self.mempool.txids()[: protocol.MAX_INV_ITEMS]
         if txids:
             peer.send(protocol.Inv(tuple(InvItem(InvType.TX, txid) for txid in txids)))
+
+    def _reannounce_mempool(self) -> None:
+        """Re-offer the pool to every peer, so a missed transaction still lands.
+
+        Relay is a single announcement at broadcast time. Anything that goes
+        wrong then — the miner was offline, the link dropped, or the peer was
+        still syncing and dropped the transaction as spending unknown inputs —
+        used to be permanent: the transaction sat in one node's pool for ever
+        while the miner produced empty blocks. Re-offering it on a slow timer is
+        what makes that self-healing.
+        """
+        for peer in self.peers:
+            if not peer.handshake_done.is_set():
+                continue
+            try:
+                self._announce_mempool(peer)
+            except PeerDisconnected:
+                continue
 
     @property
     def stale_tip_seconds(self) -> float:
@@ -770,6 +808,7 @@ class Node:
     def _maintenance_loop(self) -> None:
         last_save = last_check = time.time()
         last_prune = 0.0
+        last_reannounce = time.time()
         while not self._stop.wait(_TICK):
             now = time.time()
             if now - last_check < _MAINTENANCE_INTERVAL:
@@ -799,6 +838,15 @@ class Node:
 
             if not self.peers and not len(self.addrbook) and self.seed_hosts:
                 self._bootstrap_seeds()
+
+            if (
+                len(self.mempool)
+                and self.peers
+                and now - last_reannounce > MEMPOOL_REANNOUNCE_INTERVAL
+            ):
+                last_reannounce = now
+                logger.debug("re-offering %d pooled transaction(s)", len(self.mempool))
+                self._reannounce_mempool()
 
             if self.config.prune and now - last_prune > _PRUNE_INTERVAL:
                 last_prune = now

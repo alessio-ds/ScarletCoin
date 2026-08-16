@@ -884,6 +884,7 @@ What you are accepting by running this:
 | `message is for a different network` in the log | A peer from another chain (or a port scan). Harmless |
 | Height stuck, peers connected | Give it the poll interval (up to five minutes) to re-ask; then check the log for rejected blocks, and check the clock |
 | `timestamp … is too far in the future` | *Your* clock is behind. Fix NTP |
+| A transaction stays in the mempool while blocks are mined | The miner does not have it. Check with `scarlet-node rpc --rpc-url <miner> getmempool`. Nodes re-offer their pool every two minutes and on every reconnect, so it should heal by itself; to force it, rebroadcast the raw transaction straight at the mining node. Note that mempools are memory-only: if every node holding it restarts, the transaction is gone and has to be sent again |
 | Your mined blocks are rejected | Usually a stale template or a wrong-network payout address. The error from `submitblock` says which rule failed |
 | Disk filling up | Check with `scarlet-node size`. Blocks are ~1 kB each on a quiet chain, but plan for growth; `scarlet-node prune --keep 5000` drops old bodies, and `--prune 5000` keeps doing it. A pruned node can no longer help a new one sync, so do not prune the seed |
 | `dig` returns an address that is not your server | The record is wrong, or your DNS provider is proxying it. A proxy cannot carry the peer-to-peer protocol: use a plain A record, or publish a second unproxied name for peers |

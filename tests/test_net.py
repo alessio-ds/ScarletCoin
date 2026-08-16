@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
@@ -835,6 +836,102 @@ class TestPeerToPeer:
                 fresh.stop()
         finally:
             pruned.stop()
+
+    def test_a_late_joining_miner_is_told_about_pending_transactions(
+        self, tmp_path, key, other_key
+    ):
+        """A miner is the node that is *ahead*, and it is the one that has to hear
+        about an unconfirmed transaction. Offering the pool only when we are not
+        behind meant the one peer that mattered was never told, and the
+        transaction sat unconfirmed for ever while the miner made empty blocks."""
+        sender = self._node(tmp_path, "sender")
+        miner = self._node(tmp_path, "miner")
+        try:
+            sender.connect_peer("127.0.0.1", miner.p2p_port)
+            assert wait_until(
+                lambda: bool(sender.peers) and sender.peers[0].handshake_done.is_set()
+            )
+            for _ in range(5):
+                sender.submit_block(mine_block(sender.chain, key))
+            assert wait_until(lambda: miner.chain.height == 5)
+
+            # The link drops and the miner pulls ahead, as a miner does.
+            for peer in [*sender.peers, *miner.peers]:
+                peer.close()
+            assert wait_until(lambda: not sender.peers and not miner.peers)
+            for _ in range(3):
+                miner.submit_block(mine_block(miner.chain, other_key))
+            assert sender.chain.height < miner.chain.height
+
+            transaction = spend(
+                sender.chain, key, other_key.address(REGTEST.address_version), 10**8
+            )
+            sender.submit_transaction(transaction)
+            txid = transaction.txid()
+
+            sender.connect_peer("127.0.0.1", miner.p2p_port)
+            assert wait_until(
+                lambda: bool(sender.peers) and sender.peers[0].handshake_done.is_set()
+            )
+            assert wait_until(lambda: txid in miner.mempool, timeout=20)
+
+            miner.submit_block(mine_block(miner.chain, other_key, miner.mempool))
+            assert miner.chain.get_transaction(txid) is not None
+            assert wait_until(lambda: txid not in sender.mempool, timeout=20)
+        finally:
+            sender.stop()
+            miner.stop()
+
+    def test_the_pool_is_re_offered_so_a_lost_transaction_comes_back(
+        self, tmp_path, key, other_key
+    ):
+        """Relay happens once. A peer that was mid-sync and dropped the
+        transaction, or that restarted and lost its pool, has to be told again."""
+        sender = self._node(tmp_path, "sender")
+        miner = self._node(tmp_path, "miner")
+        try:
+            sender.connect_peer("127.0.0.1", miner.p2p_port)
+            assert wait_until(
+                lambda: bool(sender.peers) and sender.peers[0].handshake_done.is_set()
+            )
+            for _ in range(5):
+                sender.submit_block(mine_block(sender.chain, key))
+            assert wait_until(lambda: miner.chain.height == 5)
+
+            transaction = spend(
+                sender.chain, key, other_key.address(REGTEST.address_version), 10**8
+            )
+            sender.submit_transaction(transaction)
+            txid = transaction.txid()
+            assert wait_until(lambda: txid in miner.mempool)
+
+            # The miner forgets it: a restart, or an earlier rejection while it
+            # was still catching up. Nothing else would ever mention it again.
+            miner.mempool.clear()
+            assert txid not in miner.mempool
+
+            sender._reannounce_mempool()
+            assert wait_until(lambda: txid in miner.mempool, timeout=20)
+        finally:
+            sender.stop()
+            miner.stop()
+
+    def test_announcing_a_huge_pool_does_not_ban_the_peer(self, tmp_path, monkeypatch):
+        """``Inv`` refuses more than MAX_INV_ITEMS, and the peer loop reads that
+        refusal as misbehaviour — so an oversized announcement would have banned
+        a peer for our own mistake."""
+        node = self._node(tmp_path, "big")
+        try:
+            fake = [bytes([index % 256]) * 32 for index in range(protocol.MAX_INV_ITEMS + 50)]
+            monkeypatch.setattr(node.mempool, "txids", lambda: fake)
+            sent: list[protocol.Message] = []
+            peer = SimpleNamespace(send=sent.append)
+            node._announce_mempool(peer)  # type: ignore[arg-type]
+            assert len(sent) == 1
+            assert len(sent[0].items) == protocol.MAX_INV_ITEMS
+            sent[0].encode()  # would raise if the cap were not applied
+        finally:
+            node.stop()
 
     def test_transactions_propagate(self, tmp_path, key, other_key):
         first = self._node(tmp_path, "a")
