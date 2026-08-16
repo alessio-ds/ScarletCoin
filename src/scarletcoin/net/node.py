@@ -59,6 +59,8 @@ _CONNECT_INTERVAL = 1.0
 _MAINTENANCE_INTERVAL = 5.0
 #: Never re-ask every peer for blocks more often than this.
 _POLL_INTERVAL = 60.0
+#: How often a pruning node trims the blocks that have fallen behind its horizon.
+_PRUNE_INTERVAL = 600.0
 
 
 @dataclass
@@ -74,6 +76,16 @@ class NodeConfig:
     rpc_host: str = "127.0.0.1"
     rpc_port: int | None = None
     rpc_token: str | None = None
+    rpc_public: bool = False
+    """Serve the read-only and broadcast RPC methods without a token."""
+    rpc_public_mining: bool = False
+    """Also hand out and accept mining work without a token (implies public)."""
+    rpc_advertise: str | None = None
+    """Base URL other people should use to reach this node's public RPC."""
+    public_peers: tuple[str, ...] = ()
+    """Other public nodes to tell clients about, on top of the network's own."""
+    prune: int = 0
+    """Keep only this many recent blocks whole; 0 stores the entire chain."""
     max_outbound: int = 8
     max_inbound: int = 64
     connect: tuple[str, ...] = ()
@@ -111,6 +123,11 @@ class NodeConfig:
         """The RPC port (0 means "pick any free port")."""
         return self.params.default_rpc_port if self.rpc_port is None else self.rpc_port
 
+    @property
+    def serves_public_rpc(self) -> bool:
+        """Whether anonymous callers get anything at all."""
+        return self.rpc_public or self.rpc_public_mining
+
 
 class Node:
     """A full node: chain, mempool and peer-to-peer networking."""
@@ -145,6 +162,27 @@ class Node:
         if not self.config.use_seeds:
             return tuple(self.config.seeds)
         return tuple(self.params.seeds) + tuple(self.config.seeds)
+
+    def public_nodes(self) -> list[str]:
+        """Public RPC endpoints a client could use, this node's own first.
+
+        A wallet with no chain of its own starts from the list built into its
+        build and then asks whoever answers for the rest, so a new public node
+        only has to be known to one existing one to be found by everybody.
+        """
+        urls: list[str] = []
+        if self.config.serves_public_rpc and self.config.rpc_advertise:
+            urls.append(self.config.rpc_advertise)
+        urls.extend(self.config.public_peers)
+        urls.extend(self.params.public_nodes)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for url in urls:
+            cleaned = url.strip().rstrip("/")
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                unique.append(cleaned)
+        return unique
 
     def _add_address(self, text: str, *, source: str) -> None:
         try:
@@ -576,6 +614,18 @@ class Node:
 
     def _on_getblocks(self, peer: Peer, message: protocol.GetBlocks) -> None:
         fork_height = self.chain.find_fork_height(message.locator)
+        horizon = self.chain.prune_height
+        if fork_height < horizon:
+            # The peer needs blocks whose bodies this node has thrown away.
+            # Announcing what comes after the horizon would only give it orphans,
+            # so say nothing and let it find a node that kept the whole chain.
+            logger.debug(
+                "%s is syncing from height %d, pruned here up to %d: cannot help",
+                peer,
+                fork_height,
+                horizon,
+            )
+            return
         hashes = self.chain.active_hashes_after(fork_height, protocol.MAX_BLOCKS_PER_INV)
         if message.stop_hash != b"\x00" * 32 and message.stop_hash in hashes:
             hashes = hashes[: hashes.index(message.stop_hash) + 1]
@@ -719,6 +769,7 @@ class Node:
 
     def _maintenance_loop(self) -> None:
         last_save = last_check = time.time()
+        last_prune = 0.0
         while not self._stop.wait(_TICK):
             now = time.time()
             if now - last_check < _MAINTENANCE_INTERVAL:
@@ -749,6 +800,10 @@ class Node:
             if not self.peers and not len(self.addrbook) and self.seed_hosts:
                 self._bootstrap_seeds()
 
+            if self.config.prune and now - last_prune > _PRUNE_INTERVAL:
+                last_prune = now
+                self.prune_now()
+
             with self._lock:
                 for block_hash, (_, seen) in list(self._orphans.items()):
                     if now - seen > 600:
@@ -759,6 +814,37 @@ class Node:
                 last_save = now
 
     # ----------------------------------------------------------------- reporting
+
+    def prune_now(self, keep_blocks: int | None = None) -> dict:
+        """Trim the chain to the configured horizon and report what went.
+
+        Called on a slow timer while ``--prune`` is in force, and by the ``prune``
+        RPC method.  Vacuuming is left to the caller: reclaiming the space needs
+        an exclusive lock and a full rewrite of the database, which is not
+        something a background thread should do behind a user's back.
+        """
+        keep = self.config.prune if keep_blocks is None else int(keep_blocks)
+        if keep <= 0:
+            return {"blocks": 0, "freed_bytes": 0, "prune_height": self.chain.prune_height}
+        try:
+            result = self.chain.prune(keep)
+        except Exception:  # pragma: no cover - defensive, must not kill the thread
+            logger.exception("pruning failed")
+            return {"blocks": 0, "freed_bytes": 0, "prune_height": self.chain.prune_height}
+        if result.blocks:
+            logger.info(
+                "pruned %d block(s) up to height %d, freeing %d bytes",
+                result.blocks,
+                result.prune_height,
+                result.freed_bytes,
+            )
+        return {
+            "blocks": result.blocks,
+            "transactions": result.transactions,
+            "freed_bytes": result.freed_bytes,
+            "prune_height": result.prune_height,
+            "keep_blocks": max(keep, self.chain.min_prune_keep),
+        }
 
     def info(self) -> dict:
         """Return a summary of the node, used by the ``getinfo`` RPC."""
@@ -781,6 +867,13 @@ class Node:
                 "mempool_size": len(self.mempool),
                 "mempool_bytes": self.mempool.total_bytes,
                 "orphan_blocks": len(self._orphans),
+                # What a wallet needs to know before it trusts this node with
+                # anything: whether it may call without a token, whether it will
+                # hand out mining work, and whether it still has the old blocks.
+                "public": self.config.rpc_public,
+                "public_mining": self.config.rpc_public_mining,
+                "public_url": self.config.rpc_advertise or "",
+                "prune_target": self.config.prune,
             }
         )
         return data

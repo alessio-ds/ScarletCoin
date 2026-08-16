@@ -14,12 +14,13 @@ QtCore, QtGui, QtWidgets = require_qt()
 from scarletcoin import __version__  # noqa: E402
 from scarletcoin.gui.common import (  # noqa: E402
     ConnectionSettings,
+    LocalNodeDialog,
+    PublicNodeDialog,
     add_common_gui_arguments,
     apply_theme,
     ask_for_node,
-    is_loopback,
     monospace,
-    settings_from_args,
+    resolve_startup,
     show_error,
     start_node_with_progress,
 )
@@ -104,7 +105,8 @@ class MinerWindow(QtWidgets.QMainWindow):
         self.resize(640, 480)
         node_menu = self.menuBar().addMenu("&Node")
         node_menu.addAction("&Connection...", self.change_node)
-        node_menu.addAction("&Start a local node", self.start_local_node)
+        node_menu.addAction("Choose a &public node...", self.choose_public_node)
+        node_menu.addAction("&Start a local node...", self.start_local_node)
         self._build_ui(address)
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -164,7 +166,7 @@ class MinerWindow(QtWidgets.QMainWindow):
         self.log.appendPlainText(f"{time.strftime('%H:%M:%S')}  {message}")
 
     def start_local_node(self) -> None:
-        """Start a node here; mining needs one, and a public node will not do."""
+        """Start a node here; mining always works against one of your own."""
         if self._bridge is not None:
             show_error(self, "Miner", "Stop mining before changing the node.")
             return
@@ -173,8 +175,12 @@ class MinerWindow(QtWidgets.QMainWindow):
                 self, "Node", f"A node started here is already running at {self.client.url}."
             )
             return
+        datadir = self.datadir or Path.cwd()
+        options = LocalNodeDialog(self, self.network, datadir)
+        if options.exec_() != QtWidgets.QDialog.Accepted:
+            return
         node = start_node_with_progress(
-            self, network=self.network, datadir=self.datadir or Path.cwd()
+            self, network=self.network, datadir=datadir, extra=options.extra_arguments()
         )
         if node is None:
             return
@@ -182,6 +188,21 @@ class MinerWindow(QtWidgets.QMainWindow):
         self.settings = ConnectionSettings(node.url, node.token)
         self.client = node.client(timeout=20.0)
         self._log(f"started a node at {node.url}")
+        self._refresh_node()
+
+    def choose_public_node(self) -> None:
+        """Pick a public node that will hand out mining work."""
+        if self._bridge is not None:
+            show_error(self, "Miner", "Stop mining before changing the node.")
+            return
+        datadir = self.datadir or Path.cwd()
+        picker = PublicNodeDialog(self, self.network, datadir, for_mining=True)
+        if picker.exec_() != QtWidgets.QDialog.Accepted or picker.settings is None:
+            return
+        picker.settings.save(datadir, self.network)
+        self.settings = picker.settings
+        self.client = picker.settings.client()
+        self._log(f"now using {self.client.url}")
         self._refresh_node()
 
     def change_node(self) -> None:
@@ -206,10 +227,12 @@ class MinerWindow(QtWidgets.QMainWindow):
                 "   (Node > Connection... to use a different one)"
             )
             return
+        chain = info.get("chain_size") or ""
         self.status.showMessage(
             f"{info['network']}  ·  height {info['height']}"
             f"  ·  difficulty {info['difficulty']:.6g}"
             f"  ·  supply {format_amount(info['supply'])} SCT"
+            + (f"  ·  chain {chain}" if chain else "")
         )
 
     def _toggle(self) -> None:
@@ -227,6 +250,21 @@ class MinerWindow(QtWidgets.QMainWindow):
             self.client.getinfo()
         except RpcClientError as exc:
             show_error(self, "Miner", f"Cannot reach a node at {self.client.url}:\n{exc}")
+            return
+        try:
+            self.client.getblocktemplate()
+        except RpcClientError as exc:
+            if exc.code in (401, -32001):
+                show_error(
+                    self,
+                    "Miner",
+                    f"The node at {self.client.url} will not hand out mining work "
+                    "without its token.\n\nUse Node > Start a local node to run one "
+                    "here, pick a public node that hands out work, or enter that "
+                    "node's token under Node > Connection.",
+                )
+            else:
+                show_error(self, "Miner", f"That node cannot give out work:\n{exc}")
             return
 
         self._bridge = MinerBridge(self.client, address, self.workers_box.value())
@@ -325,39 +363,9 @@ def main(argv: list[str] | None = None) -> int:
     application.setApplicationName(f"ScarletCoin miner {__version__}")
 
     address = args.address or _wallet_address(args.datadir, args.network)
-    settings = settings_from_args(args)
-    local_node: LocalNode | None = None
-    try:
-        settings.client(timeout=10.0).getinfo()
-    except RpcClientError as exc:
-        if exc.code is None and is_loopback(settings.url) and not args.no_start_node:
-            local_node = start_node_with_progress(None, network=args.network, datadir=args.datadir)
-            if local_node is not None:
-                settings = ConnectionSettings(local_node.url, local_node.token)
-                settings.save(args.datadir, args.network)
-        if local_node is None:
-            if exc.code == 401:
-                reason = (
-                    f"A node is already running at {settings.url} but refused the "
-                    "RPC token, so it was probably started by another process. Stop "
-                    "that node first, or enter its token here."
-                )
-            else:
-                reason = (
-                    f"No {args.network} node answered at {settings.url}.\n\n{exc}\n\n"
-                    "Mining needs a node to get work from. Start one from "
-                    "Node > Start a local node (a public node will not hand out "
-                    "work without its token)."
-                )
-            chosen = ask_for_node(
-                None,
-                settings,
-                args.network,
-                args.datadir,
-                reason=reason,
-            )
-            if chosen is not None:
-                settings = chosen
+    settings, local_node = resolve_startup(args, for_mining=True)
+    if settings is None:
+        return 1
 
     window = MinerWindow(
         settings.client(),

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from scarletcoin.core.transaction import Transaction
 from scarletcoin.crypto.keys import Address, InvalidKeyError
-from scarletcoin.units import format_amount
+from scarletcoin.units import format_amount, format_bytes
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type checking
     from scarletcoin.net.rpc import RpcServer
@@ -233,6 +233,27 @@ def _amount(scar: int) -> str:
     return f'<span class="amount">{escape(format_amount(scar))}</span>'
 
 
+def _weight(info: dict) -> str:
+    """How big this blockchain is: serialised blocks, and what they cost on disk.
+
+    The headline number is the serialised active chain, because that is what
+    every node on the network has to carry.  The database underneath it is bigger
+    — indexes, the UTXO set, SQLite's own bookkeeping — so that goes on the
+    second line, where it explains the difference instead of hiding it.
+
+    Every value here is a number this node produced, so there is nothing to
+    escape; the separator is deliberate markup.
+    """
+    parts = [f"{format_bytes(info.get('disk_bytes') or 0)} on disk"]
+    average = info.get("average_block_bytes") or 0
+    if average:
+        parts.append(f"{format_bytes(average)} per block")
+    if info.get("pruned_blocks"):
+        parts.append(f"pruned to height {int(info['prune_height'])}")
+    detail = " &middot; ".join(parts)
+    return f'{format_bytes(info.get("chain_bytes") or 0)}<div class="sub">{detail}</div>'
+
+
 def _tag(label: str, kind: str = "") -> str:
     """A small pill-shaped label, such as "coinbase" or "active chain"."""
     classes = f"tag {kind}".strip()
@@ -290,7 +311,11 @@ def _overview(server: RpcServer) -> str:
         [
             ("Network", escape(info["network"])),
             ("Height", str(info["height"])),
-            ("Circulating supply", _amount(info["supply"])),
+            (
+                "Circulating supply",
+                _amount(info["supply"])
+                + f'<div class="sub">{info["utxo_count"]} unspent outputs</div>',
+            ),
             ("Mempool", f"{info['mempool_size']} tx"),
         ]
     )
@@ -303,7 +328,7 @@ def _overview(server: RpcServer) -> str:
             ("Last block", f"{_duration(stats['seconds_since_last_block'])} ago"),
             ("Blocks last hour", str(stats["blocks_last_hour"])),
             ("Blocks last 24 h", str(stats["blocks_last_day"])),
-            ("Unspent outputs", str(info["utxo_count"])),
+            ("Chain weight", _weight(info)),
             ("Peers", str(info["peers"])),
             ("Node version", escape(info["version"])),
         ]
@@ -330,8 +355,22 @@ def _blocks_page(server: RpcServer, query: dict[str, list[str]]) -> str:
     rows = []
     for height in range(end, start - 1, -1):
         entry = chain.get_entry_by_height(height)
-        block = None if entry is None else chain.get_block(entry.hash)
-        if entry is None or block is None:  # pragma: no cover
+        if entry is None:  # pragma: no cover - the active chain has no gaps
+            continue
+        block = chain.get_block(entry.hash)
+        if block is None:
+            # Pruned: the row stays, so the list has no holes, but there is
+            # nothing left to count.
+            rows.append(
+                [
+                    _html(_height_link(height), numeric=True),
+                    _html(_block_link(entry.hash[::-1].hex())),
+                    _text(_when(entry.timestamp)),
+                    _html(_tag("pruned", "warn"), numeric=True),
+                    _text("", numeric=True),
+                    _text("", numeric=True),
+                ]
+            )
             continue
         rows.append(
             [
@@ -410,8 +449,45 @@ def _block_page(server: RpcServer, identifier: str) -> str:
     if entry is None:
         raise NotFound("no block with that height or hash")
     block = chain.get_block(entry.hash)
-    if block is None:  # pragma: no cover
+    if block is None and not entry.pruned:  # pragma: no cover
         raise NotFound("block data is missing")
+
+    status = _tag("active chain", "ok") if entry.in_chain else _tag("side branch", "warn")
+    if block is None:
+        # A pruned block: the header is all this node kept. Say so plainly rather
+        # than pretending the block does not exist.
+        body = _cards(
+            [
+                ("Height", str(entry.height)),
+                ("Confirmations", str(chain.confirmations(entry.height) if entry.in_chain else 0)),
+                ("Time", escape(_when(entry.timestamp))),
+                ("Difficulty target", escape(f"{entry.bits:#010x}")),
+                ("Nonce", str(entry.header.nonce)),
+                ("Body", _tag("pruned", "warn")),
+            ]
+        )
+        body += (
+            '<p class="empty">This node has pruned the body of this block: only the '
+            "header is still stored, so its transactions cannot be shown here. Ask a "
+            "node that keeps the whole chain.</p>"
+        )
+        body += "<h2>Header</h2>" + _rows(
+            ["Field", "Value"],
+            [
+                [_text("Hash"), _html(f"{_hash_span(entry.hash[::-1].hex())} {status}")],
+                [
+                    _text("Previous block"),
+                    _html(
+                        _block_link(entry.prev_hash[::-1].hex(), short=False)
+                        if entry.height
+                        else "<em>none</em>"
+                    ),
+                ],
+                [_text("Merkle root"), _html(_hash_span(entry.header.merkle_root[::-1].hex()))],
+                [_text("Cumulative work"), _text(entry.chainwork)],
+            ],
+        )
+        return _page(server, f"Block {entry.height}", body)
 
     total_out = sum(tx.total_output() for tx in block.transactions)
     body = _cards(
@@ -420,13 +496,12 @@ def _block_page(server: RpcServer, identifier: str) -> str:
             ("Confirmations", str(chain.confirmations(entry.height) if entry.in_chain else 0)),
             ("Time", escape(_when(entry.timestamp))),
             ("Transactions", str(len(block.transactions))),
-            ("Size", f"{block.size()} bytes"),
+            ("Size", escape(format_bytes(block.size()))),
             ("Difficulty target", escape(f"{entry.bits:#010x}")),
             ("Nonce", str(block.header.nonce)),
             ("Value moved", _amount(total_out)),
         ]
     )
-    status = _tag("active chain", "ok") if entry.in_chain else _tag("side branch", "warn")
     previous = (
         _block_link(entry.prev_hash[::-1].hex(), short=False) if entry.height else "<em>none</em>"
     )

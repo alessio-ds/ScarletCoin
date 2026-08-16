@@ -77,7 +77,12 @@ two host names, and from then on new nodes bootstrap from them automatically.
 
 ```python
     seeds=("scarletcoin.remotewire.net", "45.126.126.139"),
+    public_nodes=("https://scarletcoin.remotewire.net",),
 ```
+
+`seeds` are for nodes (raw TCP, port 20333) and `public_nodes` for wallets and
+miners (HTTPS, the RPC port behind a proxy). The two lists are separate because the
+two protocols are: an HTTP proxy can serve the second and cannot carry the first.
 
 The name is what makes the network movable — repoint the record and every node
 follows. The literal address next to it is a fallback for when DNS is broken,
@@ -230,8 +235,11 @@ description="ScarletCoin node"
 
 command="/opt/scarletcoin/.venv/bin/scarlet-node"
 # --no-seeds: this node *is* the seed, so it has nothing to bootstrap from.
+# --rpc-advertise: tells wallets and other public nodes where to find this one,
+# so `--node public` in a fresh wallet can discover it.
 command_args="--network ${network} --datadir ${datadir}
-    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332 --rpc-public --no-seeds"
+    --p2p-port 20333 --rpc-host 127.0.0.1 --rpc-port 20332 --rpc-public --no-seeds
+    --rpc-advertise https://scarletcoin.remotewire.net"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
@@ -263,6 +271,11 @@ starting mainnet node at height 0 (/var/lib/scarletcoin/mainnet)
 listening for peers on 20333
 RPC and explorer listening on http://127.0.0.1:20332
 ```
+
+The node also prints how much room its chain takes up as it starts
+(`chain: height 41207, 6.71 MB of blocks (9.84 MB on disk)`), and
+`scarlet-node size` answers the same question at any time without touching the
+running node.
 
 `supervise-daemon` restarts the node if it ever dies, and `respawn_max=0` means it
 keeps trying forever. Rotate the log so it cannot fill the disk:
@@ -546,7 +559,13 @@ in `src/scarletcoin/core/params.py`, commit, and tag a release:
 
 ```python
     seeds=("seed.example.org", "seed2.example.org"),
+    # And, for wallets that do not want to run a node at all:
+    public_nodes=("https://seed.example.org",),
 ```
+
+`seeds` are peer-to-peer addresses for nodes; `public_nodes` are HTTPS endpoints
+for wallets and miners, and only need to get one client started — after that they
+find the rest through `getpublicnodes`.
 
 Now anyone who installs that version and runs `scarlet-node --network mainnet`
 joins with **no configuration at all**.
@@ -777,35 +796,70 @@ The wallet defaults to `http://127.0.0.1:20332` and picks up the local node's
 token automatically, so this needs no configuration at all. The wallet then
 trusts nobody: balances come from a chain the user validated themselves.
 
+If a user has no node yet, the wallet and the miner offer to start one and show,
+before they commit to it, how big the chain already on disk is — with the option to
+prune it, to make it public, and to let others mine through it. Nothing is
+downloaded behind their back.
+
 ### The convenient way: point wallets at a public node
 
 Start the node with `--rpc-public` (the service in step 4 does). Anonymous callers
 may then use exactly the calls a wallet and an explorer need:
 
 ```
-getinfo  getblockcount  getbestblockhash  getdifficulty  getsupply
+getinfo  getblockcount  getbestblockhash  getdifficulty  getsupply  getchainsize
+getnetworkstats  getpublicnodes
 getblockhash  getblock  getblockheader  getrawblock
 gettransaction  getrawtransaction  getmempool
 validateaddress  getbalance  getutxos  getaddresshistory  getrichlist
 sendrawtransaction
 ```
 
-Everything else — `getblocktemplate`, `submitblock`, `getpeers`, `getaddresses`,
-`addpeer`, `stop`, `generate` — still requires the bearer token, and an
-unauthenticated attempt is refused with JSON-RPC error `-32001`. Mining therefore
-cannot be done through a public node; a miner needs the token or its own node.
+Everything else — `getpeers`, `getaddresses`, `addpeer`, `prune`, `stop`,
+`generate` — still requires the bearer token, and an unauthenticated attempt is
+refused with JSON-RPC error `-32001`.
 
-Users point their wallet at it with no token:
+`getblocktemplate` and `submitblock` sit in between. They are private by default,
+so mining through a public node needs its token; add `--rpc-public-mining` if you
+are willing to hand out block templates to strangers. It is a separate flag because
+it costs you a template per request, and because a miner and a wallet are asking for
+very different things.
+
+### Being findable
+
+A wallet with no configuration at all starts from the addresses compiled into its
+release, so a node that is not on that list has to be found some other way.
+`getpublicnodes` is that other way:
 
 ```sh
-uv run scarlet-wallet     --network mainnet --rpc-url https://scarletcoin.remotewire.net info
-uv run scarlet-wallet-gui --network mainnet --rpc-url https://scarletcoin.remotewire.net
+scarlet-node --network mainnet --rpc-public \
+    --rpc-advertise https://scarletcoin.example.net \
+    --public-peer https://scarletcoin.remotewire.net
 ```
 
-The graphical wallet remembers the URL in `<datadir>/<network>/gui.json`, so it is
-typed once. It also offers **Node ▸ Connection…** with a *Test* button, and if no
-node answers at start-up it asks for one instead of opening a window full of
-zeroes.
+* `--rpc-advertise` is the address *you* are reachable at. Without it your node
+  works fine but can never tell anybody where it is, and no other public node can
+  pass it on.
+* `--public-peer` is another public node you are willing to vouch for; repeat it
+  for as many as you like.
+
+A wallet running `--node public` probes everything it knows about at once, then asks
+whichever nodes answered for their lists and probes those too. One reciprocal
+`--public-peer` between two operators is enough to make both discoverable to every
+wallet in the network.
+
+Users point their wallet at it with no token, or simply let it ask:
+
+```sh
+uv run scarlet-wallet     --network mainnet --node public info
+uv run scarlet-wallet-gui --network mainnet --node https://scarletcoin.remotewire.net
+```
+
+The chosen node is remembered in `<datadir>/<network>/node.json`, which the command
+line tools and the desktop applications share, so it is typed once. The graphical
+wallet also offers **Node ▸ Choose a public node…** (a live list with heights and
+latencies) and **Node ▸ Connection…** with a *Test* button, and if no node answers
+at start-up it asks which one to use instead of opening a window full of zeroes.
 
 What you are accepting by running this:
 
@@ -831,15 +885,17 @@ What you are accepting by running this:
 | Height stuck, peers connected | Give it the poll interval (up to five minutes) to re-ask; then check the log for rejected blocks, and check the clock |
 | `timestamp … is too far in the future` | *Your* clock is behind. Fix NTP |
 | Your mined blocks are rejected | Usually a stale template or a wrong-network payout address. The error from `submitblock` says which rule failed |
-| Disk filling up | Nothing is pruned. Blocks are ~1 kB each on a quiet chain, but plan for growth |
+| Disk filling up | Check with `scarlet-node size`. Blocks are ~1 kB each on a quiet chain, but plan for growth; `scarlet-node prune --keep 5000` drops old bodies, and `--prune 5000` keeps doing it. A pruned node can no longer help a new one sync, so do not prune the seed |
 | `dig` returns an address that is not your server | The record is wrong, or your DNS provider is proxying it. A proxy cannot carry the peer-to-peer protocol: use a plain A record, or publish a second unproxied name for peers |
 | Explorer works over HTTPS but no peer ever connects | You proxied the wrong thing. Caddy serves 20332; peers need TCP 20333 open directly |
 | Caddy cannot get a certificate | Port 80 must be reachable and the DNS record must already point at the server |
 | On Alpine: `cryptography` tries to compile Rust | No musl wheel for your architecture. Use `apk add py3-cryptography` with a `--system-site-packages` venv |
 | The miner cannot authenticate | It must run as the user that owns `<datadir>/<network>/rpc.token`, or be given `--rpc-token` |
 | A remote wallet gets `401 unauthorised` | The node was not started with `--rpc-public`. Add it, or give that wallet the token |
-| A remote wallet gets `-32001 … needs the node's RPC token` | The method is not in the public set on purpose (mining, peers, control). Use a local node for those |
-| A remote miner cannot get work | `getblocktemplate` is never public. Give the miner the token, or run it beside its own node |
+| A remote wallet gets `-32001 … needs the node's RPC token` | The method is not in the public set on purpose (peers, pruning, control). Use a local node for those |
+| A remote miner cannot get work | `getblocktemplate` is private unless the operator passed `--rpc-public-mining`. Give the miner the token, run it beside its own node, or add that flag |
+| A wallet cannot find any public node | Its release only knows the addresses compiled into it. Pass `--node <URL>` once, set `SCARLETCOIN_PUBLIC_NODES`, or ask an operator to list yours with `--public-peer` |
+| `has been pruned by this node` from `getblock` | That node keeps only recent bodies. Ask one that keeps the whole chain |
 | Test nodes on your laptop keep joining the real network | Start them with `--no-seeds`, or they will find the seed and sync (and relay anything they mine) |
 | The seed node logs `connected` / `disconnected` once a second, peer numbers climbing | It is dialling its own published address. Fixed in the code (the address is remembered after the first attempt); also give the seed node `--no-seeds`, since it has nothing to bootstrap from. `getinfo.own_addresses` lists the addresses it knows are itself |
 | Caddy: `setting up custom log … permission denied` | `/var/log/caddy` is missing or not writable by Caddy's user: `install -d -m 0755 /var/log/caddy && chown -R caddy:caddy /var/log/caddy` |

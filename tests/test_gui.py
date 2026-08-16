@@ -224,6 +224,222 @@ class TestNodeConnection:
             pump(qt_app)
 
 
+class TestChoosingANode:
+    """The question a newcomer is asked, and the three answers it accepts."""
+
+    def test_the_startup_dialog_offers_a_local_and_a_public_node(self, qt_app, tmp_path):
+        from scarletcoin.gui.common import StartupDialog
+
+        dialog = StartupDialog(None, "regtest", tmp_path, reason="No node answered.")
+        try:
+            assert dialog.answer is None
+            dialog._pick(StartupDialog.PUBLIC)
+            assert dialog.answer == StartupDialog.PUBLIC
+            assert dialog.result() == QtWidgets.QDialog.Accepted
+        finally:
+            dialog.close()
+
+    def test_the_startup_dialog_reports_the_size_of_the_chain_already_here(
+        self, qt_app, tmp_path, key
+    ):
+        from scarletcoin.core.chain import Blockchain
+        from scarletcoin.core.storage import Storage
+        from scarletcoin.gui.common import StartupDialog
+        from scarletcoin.net.node import NodeConfig
+        from tests.helpers import mine_and_add
+
+        storage = Storage(NodeConfig(network="regtest", datadir=tmp_path).chain_path)
+        mine_and_add(Blockchain(storage, REGTEST), key, count=3)
+        storage.close()
+
+        dialog = StartupDialog(None, "regtest", tmp_path)
+        try:
+            text = " ".join(
+                widget.text() for widget in dialog.findChildren(QtWidgets.QLabel) if widget.text()
+            )
+            assert "height 3" in text
+            assert "on disk" in text
+        finally:
+            dialog.close()
+
+    def test_the_local_node_dialog_turns_answers_into_node_options(self, qt_app, tmp_path):
+        from scarletcoin.core.chain import MIN_PRUNE_KEEP
+        from scarletcoin.gui.common import LocalNodeDialog
+
+        dialog = LocalNodeDialog(None, "regtest", tmp_path)
+        try:
+            assert dialog.extra_arguments() == ()
+            assert dialog.keep_spin.minimum() == MIN_PRUNE_KEEP
+            assert not dialog.keep_spin.isEnabled()
+            assert not dialog.public_mining_box.isEnabled()
+
+            dialog.prune_box.setChecked(True)
+            dialog.keep_spin.setValue(5000)
+            dialog.public_box.setChecked(True)
+            dialog.public_mining_box.setChecked(True)
+            dialog.advertise_edit.setText("https://mine.example")
+            assert dialog.extra_arguments() == (
+                "--prune",
+                "5000",
+                "--rpc-public",
+                "--rpc-public-mining",
+                "--rpc-advertise",
+                "https://mine.example",
+            )
+        finally:
+            dialog.close()
+
+    def test_the_local_node_dialog_shows_the_size_before_anything_starts(
+        self, qt_app, tmp_path, key
+    ):
+        from scarletcoin.core.chain import Blockchain
+        from scarletcoin.core.storage import Storage
+        from scarletcoin.gui.common import LocalNodeDialog
+        from scarletcoin.net.node import NodeConfig
+        from tests.helpers import mine_and_add
+
+        empty = LocalNodeDialog(None, "regtest", tmp_path)
+        assert "No regtest chain here yet" in empty.size_label.text()
+        assert not empty.prune_now_button.isEnabled()
+        empty.close()
+
+        storage = Storage(NodeConfig(network="regtest", datadir=tmp_path).chain_path)
+        mine_and_add(Blockchain(storage, REGTEST), key, count=4)
+        storage.close()
+
+        dialog = LocalNodeDialog(None, "regtest", tmp_path)
+        try:
+            assert "height 4" in dialog.size_label.text()
+            assert "on disk" in dialog.size_label.text()
+            # Pruning an existing chain is offered only once it is asked for.
+            assert not dialog.prune_now_button.isEnabled()
+            dialog.prune_box.setChecked(True)
+            assert dialog.prune_now_button.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_pruning_from_the_dialog_shrinks_the_chain(self, qt_app, tmp_path, key, monkeypatch):
+        from scarletcoin.core.chain import Blockchain
+        from scarletcoin.core.storage import Storage
+        from scarletcoin.gui.common import LocalNodeDialog
+        from scarletcoin.net.node import NodeConfig
+        from tests.helpers import mine_and_add
+
+        storage = Storage(NodeConfig(network="regtest", datadir=tmp_path).chain_path)
+        mine_and_add(Blockchain(storage, REGTEST), key, count=20)
+        storage.close()
+
+        dialog = LocalNodeDialog(None, "regtest", tmp_path)
+        try:
+            dialog.prune_box.setChecked(True)
+            dialog.keep_spin.setMinimum(2)
+            dialog.keep_spin.setValue(2)
+            monkeypatch.setattr(
+                QtWidgets.QMessageBox, "question", lambda *a, **k: QtWidgets.QMessageBox.Yes
+            )
+            dialog._prune_now()
+            assert "pruned 18 block(s)" in dialog.status.text()
+            assert "freeing" in dialog.status.text()
+            assert "pruned" in dialog.size_label.text().lower()
+        finally:
+            dialog.close()
+
+    def test_the_public_node_picker_lists_what_actually_answers(
+        self, qt_app, tmp_path, monkeypatch, rpc
+    ):
+        from scarletcoin.gui.common import PublicNodeDialog
+
+        node, server, _ = rpc
+        node.config.rpc_public = True
+        server.public = True
+        monkeypatch.setenv("SCARLETCOIN_PUBLIC_NODES", f"{server.url},http://127.0.0.1:1")
+
+        dialog = PublicNodeDialog(None, "regtest", tmp_path)
+        try:
+            assert wait_until(
+                lambda: (pump(qt_app), not dialog.status.text().startswith("looking"))[1],
+                timeout=25,
+            )
+            assert dialog.table.rowCount() == 2
+            assert "1 node(s) answered" in dialog.status.text()
+            dialog._accept()
+            assert dialog.settings is not None
+            assert dialog.settings.url == server.url
+            assert dialog.settings.token == ""
+        finally:
+            dialog.close()
+            pump(qt_app)
+
+    def test_the_picker_refuses_a_node_that_did_not_answer(self, qt_app, tmp_path, monkeypatch):
+        from scarletcoin.gui.common import PublicNodeDialog
+
+        monkeypatch.setenv("SCARLETCOIN_PUBLIC_NODES", "http://127.0.0.1:1")
+        dialog = PublicNodeDialog(None, "regtest", tmp_path)
+        try:
+            assert wait_until(
+                lambda: (pump(qt_app), not dialog.status.text().startswith("looking"))[1],
+                timeout=25,
+            )
+            assert "no public regtest node answered" in dialog.status.text()
+            assert not dialog.use_button.isEnabled()
+            dialog.table.selectRow(0)
+            dialog._accept()
+            assert dialog.settings is None
+            assert "cannot be used" in dialog.status.text()
+        finally:
+            dialog.close()
+            pump(qt_app)
+
+    def test_a_node_that_answers_is_used_without_asking(self, qt_app, tmp_path, rpc):
+        """The question is only worth asking when there is no obvious answer."""
+        import argparse
+
+        from scarletcoin.gui.common import ConnectionSettings, resolve_startup
+
+        _, server, _ = rpc
+        ConnectionSettings(server.url, "test-token").save(tmp_path, "regtest")
+        args = argparse.Namespace(
+            network="regtest",
+            datadir=tmp_path,
+            rpc_url=None,
+            rpc_token=None,
+            node=None,
+            no_start_node=True,
+        )
+        settings, local_node = resolve_startup(args)
+        assert settings is not None and settings.url == server.url
+        assert local_node is None
+
+    def test_a_node_on_the_wrong_network_is_not_silently_accepted(
+        self, qt_app, tmp_path, rpc, monkeypatch
+    ):
+        import argparse
+
+        from scarletcoin.gui import common
+
+        _, server, _ = rpc
+        settings = common.ConnectionSettings(server.url, "test-token")
+        assert "regtest network" in common._why_not(settings, "mainnet")
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            common,
+            "choose_startup_node",
+            lambda *a, **kwargs: (asked.append(kwargs.get("reason", "")), (None, None))[1],
+        )
+        args = argparse.Namespace(
+            network="mainnet",
+            datadir=tmp_path,
+            rpc_url=server.url,
+            rpc_token="test-token",
+            node=None,
+            no_start_node=True,
+        )
+        # The user is asked rather than shown mainnet balances from a regtest node.
+        assert common.resolve_startup(args) == (None, None)
+        assert asked and "regtest" in asked[0]
+
+
 class TestMinerWindow:
     def test_it_mines_and_stops(self, qt_app, rpc, key):
         _, _, client = rpc

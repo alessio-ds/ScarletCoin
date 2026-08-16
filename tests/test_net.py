@@ -567,6 +567,37 @@ class TestExplorer:
         assert "H/s" in body
         assert "Measured over the last" in body
 
+    def test_overview_shows_how_big_the_chain_is(self, rpc):
+        """The "chain weight" card replaced the unspent-output count: how much
+        room the chain takes up is the question a newcomer actually has."""
+        _, server, client = rpc
+        client.call("generate", 5)
+        status, body = self._get(server.url + "/")
+        assert status == 200
+        assert "Chain weight" in body
+        assert "on disk" in body
+        assert "per block" in body
+        # The UTXO count did not vanish, it moved under the supply it explains.
+        assert "unspent outputs" in body
+        network_section = body.split("<h2>Network</h2>", 1)[1]
+        assert "Unspent outputs" not in network_section
+
+    def test_a_pruned_block_says_so_instead_of_looking_missing(self, rpc, key):
+        node, server, client = rpc
+        client.call("generate", 20, str(key.address(REGTEST.address_version)))
+        node.chain.prune(2)
+
+        status, body = self._get(server.url + "/block/1")
+        assert status == 200
+        assert "pruned" in body
+        assert "only the header is still stored" in body
+
+        status, listing = self._get(server.url + "/blocks")
+        assert status == 200
+        # Every height still has a row, pruned or not, so the list has no holes.
+        for height in range(1, 21):
+            assert f'/block/{height}"' in listing
+
     def test_missing_pages_answer_404(self, rpc):
         _, server, _ = rpc
         for path in ("/nowhere", "/block/999", "/tx/" + "00" * 32, "/address/nonsense"):
@@ -760,6 +791,50 @@ class TestPeerToPeer:
                 second.stop()
         finally:
             first.stop()
+
+    def test_a_pruned_node_still_relays_what_it_receives(self, tmp_path, key):
+        """Pruning costs the ability to serve history, not to take part."""
+        first = self._node(tmp_path, "a")
+        second = self._node(tmp_path, "b")
+        try:
+            for _ in range(10):
+                first.submit_block(mine_block(first.chain, key))
+            second.connect_peer("127.0.0.1", first.p2p_port)
+            assert wait_until(lambda: second.chain.height == 10, timeout=30)
+
+            second.chain.prune(2)
+            assert second.chain.prune_height == 8
+            # New blocks still arrive, validate and connect on the pruned node.
+            for _ in range(3):
+                first.submit_block(mine_block(first.chain, key))
+            assert wait_until(lambda: second.chain.height == 13, timeout=30)
+            assert second.chain.tip_hash == first.chain.tip_hash
+        finally:
+            first.stop()
+            second.stop()
+
+    def test_a_pruned_node_does_not_offer_history_it_cannot_send(self, tmp_path, key):
+        """Announcing blocks it has thrown away would only hand a syncing node
+        orphans, so a pruned node stays quiet and lets it ask somebody else."""
+        pruned = self._node(tmp_path, "pruned")
+        try:
+            for _ in range(10):
+                pruned.submit_block(mine_block(pruned.chain, key))
+            pruned.chain.prune(2)
+            assert pruned.chain.prune_height == 8
+
+            fresh = self._node(tmp_path, "fresh", connect=(f"127.0.0.1:{pruned.p2p_port}",))
+            try:
+                assert wait_until(lambda: bool(fresh.peers), timeout=15)
+                assert fresh.peers[0].handshake_done.wait(10)
+                # It connects and stays connected, but is never sent the old chain.
+                assert not wait_until(lambda: fresh.chain.height > 0, timeout=6)
+                assert fresh.chain.height == 0
+                assert fresh.peers
+            finally:
+                fresh.stop()
+        finally:
+            pruned.stop()
 
     def test_transactions_propagate(self, tmp_path, key, other_key):
         first = self._node(tmp_path, "a")

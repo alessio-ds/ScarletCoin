@@ -297,7 +297,9 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `getbestblockhash` | — | tip hash |
 | `getdifficulty` | — | current difficulty |
 | `getsupply` | — | circulating supply and UTXO count |
+| `getchainsize` | — | how many bytes the chain occupies, and per-block average |
 | `getnetworkstats` | `window` | block rate, hash rate, difficulty, retarget estimate |
+| `getpublicnodes` | — | base URLs of public nodes this one knows |
 | `getblockhash` | `height` | block hash |
 | `getblock` | `hash_or_height`, `verbose=true` | block with transactions |
 | `getblockheader` | `hash_or_height` | header fields |
@@ -316,8 +318,49 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `getpeers` | — | connected peers |
 | `addpeer` | `host`, `port` | connect to a peer |
 | `getaddresses` | — | the address book |
+| `prune` | `keep=<--prune>`, `vacuum=false` | drop old block bodies; irreversible |
 | `stop` | — | shut the node down |
 | `generate` | `count=1`, `address=None` | mine blocks immediately (**regtest only**) |
+
+Everything down to and including `sendrawtransaction`, plus `getchainsize` and
+`getpublicnodes`, is in `PUBLIC_METHODS`: a node started with `--rpc-public`
+answers those without a token. `getblocktemplate` and `submitblock` join them only
+with `--rpc-public-mining`. `getpeers`, `addpeer`, `getaddresses`, `prune` and
+`stop` always need the token.
+
+### How big the chain is
+
+`getchainsize` and the size fields in `getinfo` distinguish three numbers:
+
+| Field | Meaning |
+|---|---|
+| `chain_bytes` | serialised blocks of the **active chain** — what every node carries |
+| `block_bytes` | the same, plus stored side branches |
+| `disk_bytes` | the node's database: blocks, undo data, indexes, UTXO set, SQLite overhead, and the write-ahead log |
+
+`chain_size`, `block_size` and `disk_size` are the same values pre-formatted
+(`"6.71 MB"`), so every front end spells a size the same way. On a pruned node
+`chain_bytes` counts what is actually stored, and `pruned_blocks` with
+`prune_height` says how much was dropped; `average_block_bytes` is measured only
+over blocks whose bodies are still there.
+
+### Pruning
+
+`prune` replaces the body of every block at or below `height - keep` with its
+80-byte header, and deletes that block's undo data and index entries. Genesis is
+never pruned. `keep` is raised to at least 2880 blocks (2 × `coinbase_maturity` on
+regtest). The header chain, the UTXO set and every balance are unaffected, so a
+pruned node validates and relays new blocks normally, but:
+
+* `getblock`, `getrawblock` and `gettransaction` fail for pruned data, and a
+  `getdata` from a peer is answered with `notfound`, so a pruned node cannot serve
+  a node syncing from scratch;
+* a reorganisation deeper than the horizon is impossible, because the undo data it
+  would need is gone.
+
+Databases written before this existed are migrated on first open (schema version 1
+→ 2 adds `blocks.pruned`); a database from a *newer* build is refused rather than
+guessed at.
 
 The same HTTP server answers `GET /api/info` with the `getinfo` document, and
 serves the HTML explorer at `/`, `/blocks`, `/block/<hash-or-height>`,

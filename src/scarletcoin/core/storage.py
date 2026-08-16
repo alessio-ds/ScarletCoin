@@ -6,7 +6,8 @@ or not at all.  The schema is:
 
 ``blocks``
     Every block we have ever validated, whether or not it is on the active
-    chain, with its height and cumulative proof of work.
+    chain, with its height and cumulative proof of work.  A pruned block keeps
+    its 80-byte header and loses its body.
 ``utxo``
     The current set of unspent outputs (active chain only).
 ``undo``
@@ -19,8 +20,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,9 +31,23 @@ from scarletcoin.core.serialize import Reader, Writer
 from scarletcoin.core.transaction import OutPoint, Transaction
 from scarletcoin.core.utxo import Coin
 
-__all__ = ["BlockIndexEntry", "Storage", "StorageError", "TxLocation"]
+__all__ = [
+    "BlockIndexEntry",
+    "PruneResult",
+    "Storage",
+    "StorageError",
+    "TxLocation",
+    "database_files",
+    "database_size",
+    "inspect_database",
+]
 
-SCHEMA_VERSION = 1
+#: 1: the original schema.  2: ``blocks.pruned``, so a body can be dropped while
+#: the header stays.  Older databases are migrated in place on first open.
+SCHEMA_VERSION = 2
+
+#: How long :meth:`Storage.size_stats` may reuse its last measurement.
+SIZE_CACHE_SECONDS = 5.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -46,7 +62,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     chainwork BLOB NOT NULL,
     in_chain  INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
-    raw       BLOB NOT NULL
+    raw       BLOB NOT NULL,
+    pruned    INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blocks_prev ON blocks (prev_hash);
 CREATE INDEX IF NOT EXISTS blocks_chain ON blocks (in_chain, height);
@@ -99,6 +116,8 @@ class BlockIndexEntry:
     chainwork: int
     in_chain: bool
     header: BlockHeader
+    pruned: bool = False
+    """``True`` when only the header of this block is still stored."""
 
     @property
     def timestamp(self) -> int:
@@ -120,6 +139,103 @@ class TxLocation:
     height: int
 
 
+@dataclass(frozen=True, slots=True)
+class PruneResult:
+    """What a call to :meth:`Storage.prune_to` did."""
+
+    blocks: int
+    """How many block bodies were dropped."""
+    transactions: int
+    """How many transactions were removed from the lookup indexes."""
+    freed_bytes: int
+    """Bytes of block bodies and undo data that stopped being stored."""
+    prune_height: int
+    """Everything at or below this height has been pruned."""
+
+
+def database_files(path: str | Path) -> list[Path]:
+    """Return every file SQLite keeps for the database at ``path``.
+
+    In write-ahead-log mode the real size of a database is the main file plus its
+    log and shared-memory companions, which can be a large fraction of the total
+    just after a burst of blocks.
+    """
+    main = Path(path)
+    return [main, Path(f"{main}-wal"), Path(f"{main}-shm")]
+
+
+def database_size(path: str | Path) -> int:
+    """Total number of bytes the database at ``path`` occupies on disk."""
+    total = 0
+    for candidate in database_files(path):
+        try:
+            total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def inspect_database(path: str | Path) -> dict:
+    """Summarise a chain database without opening it for writing.
+
+    Used before a node is started, to tell somebody how much disk the chain they
+    already have takes up.  It never migrates, never creates and never locks the
+    database for writing, so it is safe to call while a node is running.
+
+    Returns:
+        A dictionary that always has ``exists`` and ``disk_bytes``; the remaining
+        keys are ``None`` when the database could not be read.
+    """
+    target = Path(path)
+    summary: dict = {
+        "path": str(target),
+        "exists": target.exists(),
+        "disk_bytes": database_size(target),
+        "height": None,
+        "blocks": None,
+        "chain_bytes": None,
+        "block_bytes": None,
+        "pruned_blocks": None,
+        "prune_height": None,
+        "error": "",
+    }
+    if not summary["exists"]:
+        return summary
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(blocks)")}
+        pruned = "SUM(pruned)" if "pruned" in columns else "0"
+        row = connection.execute(
+            "SELECT COUNT(*) AS blocks,"
+            " COALESCE(MAX(CASE WHEN in_chain = 1 THEN height END), 0) AS height,"
+            " COALESCE(SUM(LENGTH(raw)), 0) AS block_bytes,"
+            " COALESCE(SUM(CASE WHEN in_chain = 1 THEN LENGTH(raw) ELSE 0 END), 0) AS chain_bytes,"
+            f" COALESCE({pruned}, 0) AS pruned_blocks"
+            " FROM blocks"
+        ).fetchone()
+        summary.update(
+            {
+                "blocks": int(row["blocks"]),
+                "height": int(row["height"]),
+                "block_bytes": int(row["block_bytes"]),
+                "chain_bytes": int(row["chain_bytes"]),
+                "pruned_blocks": int(row["pruned_blocks"]),
+            }
+        )
+        marker = connection.execute("SELECT value FROM meta WHERE key = 'prune_height'").fetchone()
+        if marker is not None:
+            summary["prune_height"] = int(bytes(marker["value"]))
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        summary["error"] = str(exc)
+    finally:
+        if connection is not None:
+            with suppress(sqlite3.Error):
+                connection.close()
+    return summary
+
+
 def _work_to_blob(work: int) -> bytes:
     if work < 0:
         raise StorageError("cumulative work must not be negative")
@@ -139,6 +255,8 @@ class Storage:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._depth = 0
+        self._size_cache: dict | None = None
+        self._size_measured_at = 0.0
         self._connection = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None, timeout=30.0
         )
@@ -156,11 +274,29 @@ class Storage:
         stored = self.get_meta("schema_version")
         if stored is None:
             self.set_meta("schema_version", str(SCHEMA_VERSION).encode())
-        elif int(stored) != SCHEMA_VERSION:
+            return
+        version = int(stored)
+        if version > SCHEMA_VERSION:
             raise StorageError(
-                f"database {self.path} uses schema version {int(stored)},"
+                f"database {self.path} uses schema version {version},"
                 f" this build understands {SCHEMA_VERSION}"
             )
+        if version < SCHEMA_VERSION:
+            self._migrate(version)
+
+    def _migrate(self, from_version: int) -> None:
+        """Bring an older database up to :data:`SCHEMA_VERSION`.
+
+        Migrations only ever add to the schema, so a database stays readable by
+        the build that wrote it until the next block is stored.
+        """
+        if from_version < 2:
+            columns = {
+                row["name"] for row in self._query("SELECT name FROM pragma_table_info('blocks')")
+            }
+            if "pruned" not in columns:
+                self._execute("ALTER TABLE blocks ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0")
+        self.set_meta("schema_version", str(SCHEMA_VERSION).encode())
 
     def close(self) -> None:
         """Flush and close the database."""
@@ -246,6 +382,7 @@ class Storage:
             chainwork=_blob_to_work(bytes(row["chainwork"])),
             in_chain=bool(row["in_chain"]),
             header=BlockHeader.deserialize(raw[:80]),
+            pruned=bool(row["pruned"]),
         )
 
     def put_block(
@@ -255,8 +392,8 @@ class Storage:
         block_hash = block.hash()
         self._execute(
             "INSERT OR REPLACE INTO blocks"
-            " (hash, height, prev_hash, chainwork, in_chain, timestamp, raw)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " (hash, height, prev_hash, chainwork, in_chain, timestamp, raw, pruned)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 block_hash,
                 height,
@@ -267,6 +404,7 @@ class Storage:
                 block.serialize(),
             ),
         )
+        self._forget_sizes()
         return BlockIndexEntry(
             hash=block_hash,
             height=height,
@@ -286,9 +424,11 @@ class Storage:
         return None if row is None else self._entry(row)
 
     def get_block(self, block_hash: bytes) -> Block | None:
-        """Return a stored block."""
-        row = self._one("SELECT raw FROM blocks WHERE hash = ?", (block_hash,))
-        return None if row is None else Block.deserialize(bytes(row["raw"]))
+        """Return a stored block, or ``None`` if it is unknown or pruned."""
+        row = self._one("SELECT raw, pruned FROM blocks WHERE hash = ?", (block_hash,))
+        if row is None or row["pruned"]:
+            return None
+        return Block.deserialize(bytes(row["raw"]))
 
     def set_in_chain(self, block_hash: bytes, in_chain: bool) -> None:
         """Mark a block as being on (or off) the active chain."""
@@ -296,6 +436,7 @@ class Storage:
             "UPDATE blocks SET in_chain = ? WHERE hash = ?",
             (1 if in_chain else 0, block_hash),
         )
+        self._forget_sizes()
 
     def get_chain_entry(self, height: int) -> BlockIndexEntry | None:
         """Return the active-chain block at ``height``."""
@@ -329,6 +470,158 @@ class Storage:
         """Total number of stored blocks, including side branches."""
         row = self._one("SELECT COUNT(*) AS n FROM blocks")
         return 0 if row is None else int(row["n"])
+
+    # ------------------------------------------------------------------- sizes
+
+    def _forget_sizes(self) -> None:
+        """Drop the cached size measurement after the chain changed."""
+        with self._lock:
+            self._size_cache = None
+
+    def size_stats(self, *, max_age: float = SIZE_CACHE_SECONDS) -> dict:
+        """Measure how much room the chain takes up.
+
+        Summing the length of every stored block is a full table scan, and
+        ``getinfo`` is polled once a few seconds by the desktop applications, so
+        the answer is cached until the chain changes or ``max_age`` passes.
+
+        Returns:
+            ``chain_bytes`` is the serialised size of the active chain — the
+            honest answer to "how big is this blockchain". ``block_bytes`` adds
+            side branches, ``disk_bytes`` adds the indexes, the UTXO set and
+            SQLite's own overhead.
+        """
+        with self._lock:
+            fresh = self._size_cache is not None and time.monotonic() - self._size_measured_at < (
+                max_age
+            )
+            if fresh:
+                assert self._size_cache is not None
+                return dict(self._size_cache)
+            blocks = self._one(
+                "SELECT COUNT(*) AS blocks,"
+                " COALESCE(SUM(LENGTH(raw)), 0) AS block_bytes,"
+                " COALESCE(SUM(CASE WHEN in_chain = 1 THEN LENGTH(raw) ELSE 0 END), 0)"
+                "     AS chain_bytes,"
+                " COALESCE(SUM(CASE WHEN in_chain = 1 THEN 1 ELSE 0 END), 0) AS chain_blocks,"
+                " COALESCE(SUM(pruned), 0) AS pruned_blocks,"
+                " COALESCE(SUM(CASE WHEN in_chain = 1 AND pruned = 0 THEN LENGTH(raw) ELSE 0 END),"
+                "     0) AS full_bytes,"
+                " COALESCE(SUM(CASE WHEN in_chain = 1 AND pruned = 0 THEN 1 ELSE 0 END), 0)"
+                "     AS full_blocks"
+                " FROM blocks"
+            )
+            undo = self._one("SELECT COALESCE(SUM(LENGTH(data)), 0) AS total FROM undo")
+            chain_blocks = 0 if blocks is None else int(blocks["chain_blocks"])
+            chain_bytes = 0 if blocks is None else int(blocks["chain_bytes"])
+            full_blocks = 0 if blocks is None else int(blocks["full_blocks"])
+            full_bytes = 0 if blocks is None else int(blocks["full_bytes"])
+            stats = {
+                "blocks": 0 if blocks is None else int(blocks["blocks"]),
+                "chain_blocks": chain_blocks,
+                "block_bytes": 0 if blocks is None else int(blocks["block_bytes"]),
+                "chain_bytes": chain_bytes,
+                "undo_bytes": 0 if undo is None else int(undo["total"]),
+                "disk_bytes": database_size(self.path),
+                "pruned_blocks": 0 if blocks is None else int(blocks["pruned_blocks"]),
+                "prune_height": self.prune_height,
+                # Averaged over the blocks whose bodies are still here, so a
+                # pruned node does not report a suspiciously tiny block size.
+                "average_block_bytes": (0 if full_blocks == 0 else round(full_bytes / full_blocks)),
+            }
+            self._size_cache = stats
+            self._size_measured_at = time.monotonic()
+            return dict(stats)
+
+    def vacuum(self) -> int:
+        """Rebuild the database so freed pages are handed back to the filesystem.
+
+        SQLite reuses the space a delete frees, but it does not shrink the file
+        on its own, so pruning only shows up in ``du`` after this.  Returns how
+        many bytes the file lost.
+
+        Raises:
+            StorageError: if called inside a write transaction, which SQLite
+                forbids.
+        """
+        with self._lock:
+            if self._depth:
+                raise StorageError("cannot vacuum inside a transaction")
+            before = database_size(self.path)
+            self._connection.execute("VACUUM")
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._forget_sizes()
+            return max(0, before - database_size(self.path))
+
+    # ----------------------------------------------------------------- pruning
+
+    @property
+    def prune_height(self) -> int:
+        """Highest pruned height; 0 when the whole chain is still stored."""
+        stored = self.get_meta("prune_height")
+        return 0 if stored is None else int(stored)
+
+    def prunable_blocks(self, height: int) -> list[bytes]:
+        """Hashes of stored blocks at or below ``height`` that still have a body.
+
+        Genesis is never included: it costs almost nothing and every node is
+        expected to be able to show the first block of its own chain.
+        """
+        rows = self._query(
+            "SELECT hash FROM blocks WHERE pruned = 0 AND height BETWEEN 1 AND ? ORDER BY height",
+            (height,),
+        )
+        return [bytes(row["hash"]) for row in rows]
+
+    def prune_to(self, height: int) -> PruneResult:
+        """Drop the bodies of every block at or below ``height``.
+
+        The 80-byte header stays, so the block index, the difficulty schedule and
+        the timestamp rules keep working, and the UTXO set is untouched, so
+        balances stay exactly right.  What goes is the ability to show or serve
+        those old blocks and the transactions in them.
+
+        Undo data goes too, which is what makes this irreversible: the node can
+        no longer reorganise past ``height``.  Callers are expected to keep a
+        generous margin (see :data:`scarletcoin.core.chain.MIN_PRUNE_KEEP`).
+
+        Must be called inside :meth:`write`.
+        """
+        candidates = self.prunable_blocks(height)
+        marker = self.prune_height
+        freed = 0
+        transactions = 0
+        for block_hash in candidates:
+            row = self._one("SELECT raw FROM blocks WHERE hash = ?", (block_hash,))
+            if row is None:  # pragma: no cover - selected a moment ago
+                continue
+            raw = bytes(row["raw"])
+            try:
+                block = Block.deserialize(raw)
+            except Exception:  # pragma: no cover - stored blocks always parse
+                continue
+            for transaction in block.transactions:
+                self.unindex_transaction(transaction.txid())
+                transactions += 1
+            undo = self._one(
+                "SELECT LENGTH(data) AS size FROM undo WHERE block_hash = ?", (block_hash,)
+            )
+            freed += len(raw) - 80 + (0 if undo is None else int(undo["size"]))
+            self.delete_undo(block_hash)
+            self._execute(
+                "UPDATE blocks SET raw = ?, pruned = 1 WHERE hash = ?",
+                (raw[:80], block_hash),
+            )
+        if candidates:
+            marker = max(height, marker)
+            self.set_meta("prune_height", str(marker).encode())
+            self._forget_sizes()
+        return PruneResult(
+            blocks=len(candidates),
+            transactions=transactions,
+            freed_bytes=freed,
+            prune_height=marker,
+        )
 
     # ---------------------------------------------------------------- UTXO set
 

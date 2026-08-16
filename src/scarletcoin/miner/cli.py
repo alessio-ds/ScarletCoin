@@ -13,11 +13,12 @@ from scarletcoin import __version__
 from scarletcoin.cli_common import (
     add_connection_arguments,
     add_network_arguments,
+    add_node_choice_arguments,
     die,
-    make_client,
     setup_logging,
 )
 from scarletcoin.miner.miner import Miner, MiningError
+from scarletcoin.net.chooser import NodeChoiceError, resolve_client
 from scarletcoin.net.client import RpcClientError
 
 __all__ = ["main"]
@@ -63,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="only report mined blocks")
     add_network_arguments(parser)
     add_connection_arguments(parser)
+    add_node_choice_arguments(parser)
     return parser
 
 
@@ -75,7 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     # is the only record, so leave the logger audible there.
     if args.log_level == "info" and sys.stdout.isatty():
         logging.getLogger("scarletcoin.miner").setLevel(logging.WARNING)
-    client = make_client(args)
+    try:
+        client = resolve_client(args, for_mining=True)
+    except NodeChoiceError as exc:
+        die(str(exc))
 
     try:
         info = client.getinfo()
@@ -86,6 +91,16 @@ def main(argv: list[str] | None = None) -> int:
         f" difficulty {info['difficulty']:.6g}, paying {args.address}",
         flush=True,
     )
+    try:
+        client.getblocktemplate()
+    except RpcClientError as exc:
+        if exc.code in (401, -32001):
+            die(
+                f"the node at {client.url} will not hand out mining work without its"
+                " token.\nUse a node of your own (--node local), or ask that operator"
+                " for the token\nand pass it with --rpc-token."
+            )
+        die(str(exc))
 
     last_report = 0.0
 

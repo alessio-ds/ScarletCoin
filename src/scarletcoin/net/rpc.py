@@ -31,8 +31,9 @@ from scarletcoin.core.validation import ValidationError
 from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.net import explorer
 from scarletcoin.net.node import Node
+from scarletcoin.units import format_bytes
 
-__all__ = ["PUBLIC_METHODS", "RpcError", "RpcServer", "build_methods"]
+__all__ = ["MINING_METHODS", "PUBLIC_METHODS", "RpcError", "RpcServer", "build_methods"]
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,9 @@ PUBLIC_METHODS = frozenset(
         "getbestblockhash",
         "getdifficulty",
         "getsupply",
+        "getchainsize",
         "getnetworkstats",
+        "getpublicnodes",
         "getblockhash",
         "getblock",
         "getblockheader",
@@ -72,6 +75,14 @@ PUBLIC_METHODS = frozenset(
         "sendrawtransaction",
     }
 )
+
+#: Mining methods, public only when the operator asks with ``--rpc-public-mining``.
+#:
+#: Handing out work costs the node a block template per request, and a public
+#: node is by definition asked by strangers, so this is a separate decision from
+#: serving the read-only set.  A miner needs both of these or none of them, which
+#: is why they travel together.
+MINING_METHODS = frozenset({"getblocktemplate", "submitblock"})
 
 MAX_BODY = 8 * 1024 * 1024
 
@@ -94,6 +105,16 @@ def _hash_from_hex(text: str, what: str = "hash") -> bytes:
     if len(raw) != 32:
         raise RpcError(f"{what} must be 32 bytes ({len(raw)} given)", INVALID_PARAMS)
     return raw[::-1]
+
+
+def _pruned_or_missing(entry: object) -> str:
+    """Explain why a block the index knows about cannot be handed over."""
+    if getattr(entry, "pruned", False):
+        return (
+            f"block {getattr(entry, 'height', '?')} has been pruned by this node:"
+            " only its header is still stored. Ask a node that keeps the whole chain."
+        )
+    return "no block with that hash"  # pragma: no cover - index and data go together
 
 
 def build_methods(node: Node) -> dict[str, Callable[..., object]]:
@@ -144,6 +165,30 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         count, total = node.storage.utxo_stats()
         return {"supply": total, "utxo_count": count, "height": chain.height}
 
+    def getchainsize() -> dict:
+        """How much room this chain takes up, in bytes and in words."""
+        sizes = node.storage.size_stats()
+        return {
+            "height": chain.height,
+            "blocks": sizes["blocks"],
+            "chain_blocks": sizes["chain_blocks"],
+            "chain_bytes": sizes["chain_bytes"],
+            "chain_size": format_bytes(sizes["chain_bytes"]),
+            "block_bytes": sizes["block_bytes"],
+            "block_size": format_bytes(sizes["block_bytes"]),
+            "undo_bytes": sizes["undo_bytes"],
+            "disk_bytes": sizes["disk_bytes"],
+            "disk_size": format_bytes(sizes["disk_bytes"]),
+            "average_block_bytes": sizes["average_block_bytes"],
+            "average_block_size": format_bytes(sizes["average_block_bytes"]),
+            "pruned_blocks": sizes["pruned_blocks"],
+            "prune_height": sizes["prune_height"],
+        }
+
+    def getpublicnodes() -> list[str]:
+        """Public RPC endpoints this node knows about, so clients can hop on."""
+        return node.public_nodes()
+
     def getnetworkstats(window: int | None = None) -> dict:
         return chain.network_stats(None if window is None else int(window))
 
@@ -157,8 +202,8 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         block_hash = resolve_block(block)
         entry = entry_or_error(block_hash)
         stored = chain.get_block(block_hash)
-        if stored is None:  # pragma: no cover - index and data are written together
-            raise RpcError("block data is missing")
+        if stored is None:
+            raise RpcError(_pruned_or_missing(entry))
         data = stored.to_dict(params.address_version, verbose=bool(verbose))
         data.update(
             {
@@ -178,9 +223,10 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         return data
 
     def getrawblock(block: object) -> str:
-        stored = chain.get_block(resolve_block(block))
+        block_hash = resolve_block(block)
+        stored = chain.get_block(block_hash)
         if stored is None:
-            raise RpcError("no block with that hash")
+            raise RpcError(_pruned_or_missing(chain.get_entry(block_hash)))
         return stored.serialize().hex()
 
     # ------------------------------------------------------------- transactions
@@ -365,13 +411,38 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         threading.Thread(target=node.stop, name="scarlet-stop", daemon=True).start()
         return "stopping"
 
+    # ------------------------------------------------------------------ storage
+
+    def prune(keep: int | None = None, vacuum: bool = False) -> dict:
+        """Drop the bodies of old blocks, keeping the last ``keep`` of them.
+
+        Irreversible: the node can no longer show those blocks, serve them to a
+        syncing peer, or reorganise past them.  Behind the token, because it
+        permanently changes what the node can do.
+        """
+        target = node.config.prune if keep is None else int(keep)
+        if target <= 0:
+            raise RpcError(
+                "give the number of recent blocks to keep, for example prune 5000",
+                INVALID_PARAMS,
+            )
+        result = node.prune_now(target)
+        if vacuum:
+            result["reclaimed_bytes"] = node.storage.vacuum()
+        result["disk_bytes"] = node.storage.size_stats(max_age=0.0)["disk_bytes"]
+        result["disk_size"] = format_bytes(result["disk_bytes"])
+        result["freed_size"] = format_bytes(result["freed_bytes"])
+        return result
+
     methods: dict[str, Callable[..., object]] = {
         "getinfo": getinfo,
         "getblockcount": getblockcount,
         "getbestblockhash": getbestblockhash,
         "getdifficulty": getdifficulty,
         "getsupply": getsupply,
+        "getchainsize": getchainsize,
         "getnetworkstats": getnetworkstats,
+        "getpublicnodes": getpublicnodes,
         "getblockhash": getblockhash,
         "getblock": getblock,
         "getblockheader": getblockheader,
@@ -390,6 +461,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getpeers": getpeers,
         "addpeer": addpeer,
         "getaddresses": getaddresses,
+        "prune": prune,
         "stop": stop,
     }
 
@@ -431,12 +503,24 @@ class RpcServer:
         host: str = "127.0.0.1",
         port: int = 0,
         token: str | None = None,
-        public: bool = False,
+        public: bool | None = None,
+        public_mining: bool | None = None,
     ) -> None:
         self.node = node
         self.token = token
-        self.public = public
+        self.public = node.config.rpc_public if public is None else bool(public)
         """Whether unauthenticated callers may use :data:`PUBLIC_METHODS`."""
+        self.public_mining = (
+            node.config.rpc_public_mining if public_mining is None else bool(public_mining)
+        )
+        """Whether unauthenticated callers may also use :data:`MINING_METHODS`."""
+        if self.public_mining:
+            self.public = True
+        # The server decides the policy, so the node's configuration is brought
+        # into line with it: ``getinfo`` reports these, and a wallet on the other
+        # side of the internet has no other way to find out.
+        node.config.rpc_public = self.public
+        node.config.rpc_public_mining = self.public_mining
         self.methods = build_methods(node)
         self._server = ThreadingHTTPServer((host, port), self._make_handler())
         self._server.daemon_threads = True
@@ -467,11 +551,17 @@ class RpcServer:
         logger.info("RPC and explorer listening on %s", self.url)
 
     def stop(self) -> None:
-        """Stop serving and release the socket."""
-        self._server.shutdown()
-        self._server.server_close()
+        """Stop serving and release the socket.
+
+        Safe on a server that was never started: ``shutdown`` waits for the
+        serving loop to acknowledge it, which never happens if there is no loop,
+        so it is only called when there is a thread to stop.
+        """
         if self._thread is not None:
+            self._server.shutdown()
             self._thread.join(timeout=5.0)
+            self._thread = None
+        self._server.server_close()
 
     def __enter__(self) -> RpcServer:
         self.start()
@@ -492,7 +582,11 @@ class RpcServer:
 
     def allows_anonymous(self, method: str) -> bool:
         """Whether ``method`` may be called without the token."""
-        return self.public and method in PUBLIC_METHODS
+        if not self.public:
+            return False
+        if method in PUBLIC_METHODS:
+            return True
+        return self.public_mining and method in MINING_METHODS
 
     def _dispatch(self, method: str, params: object) -> object:
         handler = self.methods.get(method)

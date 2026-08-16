@@ -11,10 +11,11 @@ from scarletcoin import __version__
 from scarletcoin.cli_common import (
     add_connection_arguments,
     add_network_arguments,
+    add_node_choice_arguments,
     die,
-    make_client,
     setup_logging,
 )
+from scarletcoin.net.chooser import NodeChoiceError, resolve_client
 from scarletcoin.net.client import RpcClientError
 from scarletcoin.units import format_amount, parse_amount
 from scarletcoin.wallet.builder import InsufficientFundsError
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_network_arguments(parser)
     add_connection_arguments(parser)
+    add_node_choice_arguments(parser)
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -127,7 +129,12 @@ def _load_keystore(args: argparse.Namespace, *, need_keys: bool) -> Keystore:
 
 
 def _make_wallet(args: argparse.Namespace, *, need_keys: bool = False) -> Wallet:
-    return Wallet(_load_keystore(args, need_keys=need_keys), make_client(args))
+    keystore = _load_keystore(args, need_keys=need_keys)
+    try:
+        client = resolve_client(args)
+    except NodeChoiceError as exc:
+        die(str(exc))
+    return Wallet(keystore, client)
 
 
 def _amount(scar: int) -> str:

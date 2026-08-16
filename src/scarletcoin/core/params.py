@@ -85,6 +85,17 @@ class ChainParams:
     add more at run time with ``--seed``.
     """
 
+    public_nodes: tuple[str, ...] = field(default_factory=tuple)
+    """Base URLs of nodes that serve the read-only RPC methods to anybody.
+
+    These are the nodes a wallet or a miner can use without downloading the
+    chain first: a node started with ``--rpc-public`` answers
+    :data:`scarletcoin.net.rpc.PUBLIC_METHODS` with no token at all. Unlike
+    :attr:`seeds`, which are peer-to-peer addresses, these are HTTP endpoints,
+    and they are only a starting point: a client asks whichever one answers for
+    the rest of the list (``getpublicnodes``).
+    """
+
     # ------------------------------------------------------------------ derived
 
     @cached_property
@@ -160,6 +171,11 @@ MAINNET = ChainParams(
     # The literal address is a fallback for when DNS is broken, filtered, or
     # answered by a proxy that cannot carry the peer-to-peer protocol.
     seeds=("scarletcoin.remotewire.net", "45.126.126.139"),
+    # Nodes that serve the public RPC methods over HTTPS, so a wallet or a miner
+    # can be useful before it has a chain of its own. Whichever of these answers
+    # first is asked for the others, so this list only has to get a client
+    # started, not stay complete.
+    public_nodes=("https://scarletcoin.remotewire.net",),
 )
 
 TESTNET = ChainParams(

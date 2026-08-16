@@ -26,13 +26,20 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from scarletcoin.core.block import Block, BlockError
 from scarletcoin.core.coinbase import coinbase_height
 from scarletcoin.core.params import ChainParams
 from scarletcoin.core.pow import block_work, difficulty, next_bits
-from scarletcoin.core.storage import BlockIndexEntry, Storage, TxLocation
+from scarletcoin.core.storage import (
+    BlockIndexEntry,
+    PruneResult,
+    Storage,
+    TxLocation,
+    database_size,
+)
 from scarletcoin.core.transaction import OutPoint, Transaction, TransactionError
 from scarletcoin.core.utxo import Coin, CoinOverlay
 from scarletcoin.core.validation import (
@@ -40,11 +47,27 @@ from scarletcoin.core.validation import (
     check_transaction_final,
     check_transaction_inputs,
 )
+from scarletcoin.units import format_bytes
 
-__all__ = ["AddBlockResult", "BlockStatus", "Blockchain", "ChainListener"]
+__all__ = [
+    "MIN_PRUNE_KEEP",
+    "AddBlockResult",
+    "BlockStatus",
+    "Blockchain",
+    "ChainListener",
+    "prune_database",
+]
 
 _MAX_CANDIDATES = 64
 _MAX_REMEMBERED_INVALID = 5_000
+
+#: Fewest recent blocks a pruned node keeps.
+#:
+#: Pruning throws away the undo data that a reorganisation needs, so the margin
+#: has to be wider than any reorganisation the network could plausibly produce,
+#: and wider than the coinbase maturity period so mined coins can still be
+#: traced. At one block a minute this is two days of history.
+MIN_PRUNE_KEEP = 2880
 
 
 class BlockStatus(Enum):
@@ -574,6 +597,49 @@ class Blockchain:
         """Total value of all unspent outputs, in scar."""
         return self.storage.utxo_stats()[1]
 
+    # ------------------------------------------------------------------ pruning
+
+    @property
+    def min_prune_keep(self) -> int:
+        """Fewest recent blocks this network allows a pruned node to keep."""
+        if self.params.name == "regtest":
+            return max(2, self.params.coinbase_maturity)
+        return MIN_PRUNE_KEEP
+
+    @property
+    def prune_height(self) -> int:
+        """Highest height whose block bodies have been dropped (0 if none)."""
+        return self.storage.prune_height
+
+    def prune(self, keep_blocks: int, *, vacuum: bool = False) -> PruneResult:
+        """Throw away the bodies of all but the last ``keep_blocks`` blocks.
+
+        Headers, the UTXO set and therefore every balance are kept, so a pruned
+        node still validates new blocks exactly as strictly as a full one. What
+        it can no longer do is show old blocks and transactions, serve them to a
+        peer that is syncing from scratch, or reorganise past the horizon.
+
+        Args:
+            keep_blocks: How many recent blocks to keep whole. Raised to
+                :attr:`min_prune_keep` if it is smaller.
+            vacuum: Rebuild the database afterwards so the freed space is
+                actually returned to the filesystem. Slow on a big chain, and it
+                needs room for a second copy while it runs.
+
+        Returns:
+            What was pruned; ``blocks`` is 0 when there was nothing to do.
+        """
+        with self._lock:
+            keep = max(self.min_prune_keep, int(keep_blocks))
+            horizon = self.height - keep
+            if horizon < 1:
+                return PruneResult(0, 0, 0, self.storage.prune_height)
+            with self.storage.write():
+                result = self.storage.prune_to(horizon)
+        if vacuum and result.blocks:
+            self.storage.vacuum()
+        return result
+
     def network_stats(self, window: int | None = None) -> dict:
         """Measure how fast the chain is actually moving.
 
@@ -647,6 +713,7 @@ class Blockchain:
     def stats(self) -> dict:
         """Return a summary of the chain, for RPC and the explorer."""
         utxo_count, supply = self.storage.utxo_stats()
+        sizes = self.storage.size_stats()
         return {
             "network": self.params.name,
             "height": self.height,
@@ -657,7 +724,46 @@ class Blockchain:
             "next_bits": f"{self.next_bits():#010x}",
             "difficulty": self.difficulty(),
             "chainwork": self._tip.chainwork,
-            "blocks_stored": self.storage.block_count(),
+            "blocks_stored": sizes["blocks"],
             "utxo_count": utxo_count,
             "supply": supply,
+            # How big the chain is. ``chain_bytes`` is the serialised active
+            # chain; ``disk_bytes`` is what the node's database actually costs,
+            # indexes and all. The pre-formatted strings are here so every front
+            # end spells a size the same way.
+            "chain_bytes": sizes["chain_bytes"],
+            "chain_size": format_bytes(sizes["chain_bytes"]),
+            "disk_bytes": sizes["disk_bytes"],
+            "disk_size": format_bytes(sizes["disk_bytes"]),
+            "average_block_bytes": sizes["average_block_bytes"],
+            "pruned_blocks": sizes["pruned_blocks"],
+            "prune_height": sizes["prune_height"],
         }
+
+
+def prune_database(
+    path: str | Path,
+    params: ChainParams,
+    keep_blocks: int,
+    *,
+    vacuum: bool = True,
+) -> tuple[PruneResult, int]:
+    """Prune a chain database that no node currently has open.
+
+    The offline counterpart of :meth:`Blockchain.prune`, used by
+    ``scarlet-node prune`` and by the desktop applications before they start a
+    node.  Opening the database read-write while a node is running would fight
+    that node for the write lock, so callers check first.
+
+    Returns:
+        What was pruned, and how many bytes the file occupies afterwards.
+    """
+    storage = Storage(path)
+    try:
+        chain = Blockchain(storage, params)
+        result = chain.prune(keep_blocks)
+        if vacuum and result.blocks:
+            storage.vacuum()
+        return result, database_size(storage.path)
+    finally:
+        storage.close()

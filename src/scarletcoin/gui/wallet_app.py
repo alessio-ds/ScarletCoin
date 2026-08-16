@@ -20,20 +20,21 @@ QtCore, QtGui, QtWidgets = require_qt()
 from scarletcoin import __version__  # noqa: E402
 from scarletcoin.gui.common import (  # noqa: E402
     ConnectionSettings,
+    LocalNodeDialog,
     PollWorker,
+    PublicNodeDialog,
     add_common_gui_arguments,
     apply_theme,
     ask_for_node,
-    is_loopback,
     monospace,
+    resolve_startup,
     run_in_thread,
-    settings_from_args,
     show_error,
     start_node_with_progress,
 )
-from scarletcoin.net.client import RpcClient, RpcClientError  # noqa: E402
+from scarletcoin.net.client import RpcClient  # noqa: E402
 from scarletcoin.net.launcher import LocalNode  # noqa: E402
-from scarletcoin.units import format_amount, parse_amount  # noqa: E402
+from scarletcoin.units import format_amount, format_bytes, parse_amount  # noqa: E402
 from scarletcoin.wallet.cli import default_wallet_path  # noqa: E402
 from scarletcoin.wallet.keystore import Keystore, WalletError  # noqa: E402
 from scarletcoin.wallet.wallet import Wallet  # noqa: E402
@@ -112,7 +113,8 @@ class WalletWindow(QtWidgets.QMainWindow):
 
         node_menu = self.menuBar().addMenu("&Node")
         node_menu.addAction("&Connection...", self.change_node)
-        node_menu.addAction("&Start a local node", self.start_local_node)
+        node_menu.addAction("Choose a &public node...", self.choose_public_node)
+        node_menu.addAction("&Start a local node...", self.start_local_node)
         node_menu.addAction("Open the node's &log", self.open_node_log)
 
         view_menu = self.menuBar().addMenu("&View")
@@ -287,9 +289,15 @@ class WalletWindow(QtWidgets.QMainWindow):
         if balance.immature:
             details.append(f"{format_amount(balance.immature)} SCT still maturing")
         self.detail_label.setText("  ·  ".join(details))
+        chain = ""
+        if info.get("chain_size"):
+            chain = f"  ·  chain {info['chain_size']}"
+        elif info.get("chain_bytes") is not None:
+            chain = f"  ·  chain {format_bytes(info['chain_bytes'])}"
         self.status.showMessage(
             f"{info['network']}  ·  height {info['height']}  ·  {info['peers']} peers"
             f"  ·  {info['mempool_size']} unconfirmed  ·  difficulty {info['difficulty']:.6g}"
+            f"{chain}"
         )
         _fill(
             self.address_table,
@@ -340,16 +348,37 @@ class WalletWindow(QtWidgets.QMainWindow):
                 self, "Node", f"A node started here is already running at {self.client.url}."
             )
             return
+        network = self.keystore.params.name
+        options = LocalNodeDialog(self, network, self._datadir())
+        if options.exec_() != QtWidgets.QDialog.Accepted:
+            return
         node = start_node_with_progress(
-            self, network=self.keystore.params.name, datadir=self._datadir()
+            self,
+            network=network,
+            datadir=self._datadir(),
+            extra=options.extra_arguments(),
         )
         if node is None:
             return
         self.local_node = node
-        self.settings = ConnectionSettings(node.url, node.token)
-        self.client = node.client(timeout=20.0)
-        self.wallet = Wallet(self.keystore, self.client)
+        self._use(ConnectionSettings(node.url, node.token))
         self.status.showMessage(f"started a node at {node.url}", 5000)
+
+    def choose_public_node(self) -> None:
+        """Pick from the public nodes that are up right now."""
+        network = self.keystore.params.name
+        picker = PublicNodeDialog(self, network, self._datadir())
+        if picker.exec_() != QtWidgets.QDialog.Accepted or picker.settings is None:
+            return
+        picker.settings.save(self._datadir(), network)
+        self._use(picker.settings)
+        self.status.showMessage(f"now using {self.client.url}", 5000)
+
+    def _use(self, settings: ConnectionSettings) -> None:
+        """Point the window at a different node."""
+        self.settings = settings
+        self.client = settings.client()
+        self.wallet = Wallet(self.keystore, self.client)
         self._refresh_now()
 
     def open_node_log(self) -> None:
@@ -375,11 +404,8 @@ class WalletWindow(QtWidgets.QMainWindow):
         chosen = ask_for_node(self, self.settings, self.keystore.params.name, self._datadir())
         if chosen is None:
             return
-        self.settings = chosen
-        self.client = chosen.client()
-        self.wallet = Wallet(self.keystore, self.client)
+        self._use(chosen)
         self.status.showMessage(f"now using {self.client.url}", 5000)
-        self._refresh_now()
 
     def _refresh_now(self) -> None:
         QtCore.QMetaObject.invokeMethod(self._poller, "poll", QtCore.Qt.QueuedConnection)
@@ -744,41 +770,9 @@ def main(argv: list[str] | None = None) -> int:
     if keystore is None:
         return 1
 
-    settings = settings_from_args(args)
-    local_node: LocalNode | None = None
-    try:
-        settings.client(timeout=10.0).getinfo()
-    except RpcClientError as exc:
-        if exc.code is None and is_loopback(settings.url) and not args.no_start_node:
-            # Nothing answers on a local port, so start a node rather than send
-            # the user off to a terminal.
-            local_node = start_node_with_progress(None, network=args.network, datadir=args.datadir)
-            if local_node is not None:
-                settings = ConnectionSettings(local_node.url, local_node.token)
-                settings.save(args.datadir, args.network)
-        if local_node is None:
-            if exc.code == 401:
-                reason = (
-                    f"A node is already running at {settings.url} but refused the "
-                    "RPC token, so it was probably started by another process. Stop "
-                    "that node first, or enter its token here."
-                )
-            else:
-                reason = (
-                    f"No {args.network} node answered at {settings.url}.\n\n"
-                    f"{exc}\n\n"
-                    "Start one here from Node > Start a local node, or enter the "
-                    "address of a node somebody else runs."
-                )
-            chosen = ask_for_node(
-                None,
-                settings,
-                args.network,
-                args.datadir,
-                reason=reason,
-            )
-            if chosen is not None:
-                settings = chosen
+    settings, local_node = resolve_startup(args)
+    if settings is None:
+        return 1
 
     window = WalletWindow(
         keystore,

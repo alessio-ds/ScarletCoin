@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -12,22 +11,40 @@ from urllib.parse import urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from scarletcoin.cli_common import DEFAULT_DATADIR, read_rpc_token
+from scarletcoin.cli_common import (
+    DEFAULT_DATADIR,
+    NodeConnection,
+    connection_path,
+    load_connection,
+    local_url,
+    read_rpc_token,
+    save_connection,
+)
+from scarletcoin.core.chain import MIN_PRUNE_KEEP, prune_database
 from scarletcoin.core.params import get_params, network_names
+from scarletcoin.core.storage import inspect_database
+from scarletcoin.net import directory
 from scarletcoin.net.client import RpcClient, RpcClientError
-from scarletcoin.net.launcher import LocalNode, LocalNodeError
+from scarletcoin.net.launcher import LocalNode, LocalNodeError, already_running
+from scarletcoin.net.node import NodeConfig
+from scarletcoin.units import format_bytes
 
 __all__ = [
     "STYLESHEET",
     "ConnectionSettings",
+    "LocalNodeDialog",
     "NodeDialog",
     "PollWorker",
+    "PublicNodeDialog",
+    "StartupDialog",
     "add_common_gui_arguments",
     "apply_theme",
     "ask_for_node",
+    "choose_startup_node",
     "client_from_args",
     "is_loopback",
     "monospace",
+    "resolve_startup",
     "settings_from_args",
     "show_error",
     "start_node_with_progress",
@@ -105,6 +122,12 @@ def add_common_gui_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rpc-url", help="node RPC URL")
     parser.add_argument("--rpc-token", help="node RPC token")
     parser.add_argument(
+        "--node",
+        metavar="local|public|ask|URL",
+        help="which node to use: 'local' for one on this machine, 'public' to pick a"
+        " public node, 'ask' to be offered the choice again, or a node URL",
+    )
+    parser.add_argument(
         "--no-start-node",
         action="store_true",
         help="do not start a node automatically when none is running locally",
@@ -113,7 +136,7 @@ def add_common_gui_arguments(parser: argparse.ArgumentParser) -> None:
 
 def default_url(network: str) -> str:
     """The node URL assumed when nothing else is configured."""
-    return f"http://127.0.0.1:{get_params(network).default_rpc_port}"
+    return local_url(network)
 
 
 def settings_from_args(args: argparse.Namespace) -> ConnectionSettings:
@@ -220,8 +243,9 @@ def run_in_thread(parent: QtCore.QObject, task, on_success, on_error) -> QtCore.
 class ConnectionSettings:
     """Where a desktop application should look for a node.
 
-    Saved next to the wallet, in ``<datadir>/<network>/gui.json``, so a URL typed
-    once is remembered. Command line options always win over the saved value.
+    Saved in ``<datadir>/<network>/node.json`` — the same file the command line
+    tools read — so a node chosen in the wallet is also the one ``scarlet-wallet``
+    uses in a terminal. Command line options always win over the saved value.
     """
 
     url: str
@@ -230,35 +254,29 @@ class ConnectionSettings:
     @staticmethod
     def path(datadir: Path, network: str) -> Path:
         """Location of the settings file."""
-        return Path(datadir) / network / "gui.json"
+        return connection_path(datadir, network)
 
     @classmethod
     def load(cls, datadir: Path, network: str) -> ConnectionSettings | None:
         """Read saved settings, or ``None`` if there are none."""
-        try:
-            data = json.loads(cls.path(datadir, network).read_text("utf-8"))
-        except (OSError, ValueError):
-            return None
-        url = str(data.get("rpc_url") or "").strip()
-        if not url:
-            return None
-        return cls(url, str(data.get("rpc_token") or ""))
+        found = load_connection(datadir, network)
+        return None if found is None else cls(found.url, found.token)
 
     def save(self, datadir: Path, network: str) -> None:
         """Store the settings, keeping the file private."""
-        target = self.path(datadir, network)
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                json.dumps({"rpc_url": self.url, "rpc_token": self.token}, indent=1), "utf-8"
-            )
-            target.chmod(0o600)
-        except OSError as exc:  # pragma: no cover - disk errors
-            logger.warning("could not save the node settings: %s", exc)
+        save_connection(datadir, network, NodeConnection(self.url, self.token))
 
     def client(self, timeout: float = 20.0) -> RpcClient:
         """Build a client from these settings."""
         return RpcClient(self.url, token=self.token or None, timeout=timeout)
+
+    def answers(self, timeout: float = 6.0) -> bool:
+        """Whether a node actually replies here."""
+        try:
+            self.client(timeout=timeout).getinfo()
+        except RpcClientError:
+            return False
+        return True
 
 
 class NodeDialog(QtWidgets.QDialog):
@@ -392,8 +410,17 @@ def start_node_with_progress(
     network: str,
     datadir: Path,
     rpc_port: int | None = None,
+    extra: tuple[str, ...] = (),
 ) -> LocalNode | None:
     """Start a node, showing progress and keeping the interface responsive.
+
+    Args:
+        parent: Dialog parent.
+        network: Which network the node should join.
+        datadir: Where its chain lives.
+        rpc_port: Bind the RPC server here instead of the network default.
+        extra: Further ``scarlet-node run`` options, such as ``--rpc-public`` or
+            ``--prune``, as produced by :meth:`LocalNodeDialog.extra_arguments`.
 
     Returns:
         The running node, or ``None`` if the user cancelled or it failed (in
@@ -410,7 +437,9 @@ def start_node_with_progress(
 
     node: LocalNode | None = None
     try:
-        node = LocalNode.launch(network=network, datadir=datadir, rpc_port=rpc_port)
+        node = LocalNode.launch(
+            network=network, datadir=datadir, rpc_port=rpc_port, extra=list(extra)
+        )
         deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline:
             QtWidgets.QApplication.processEvents()
@@ -431,3 +460,646 @@ def start_node_with_progress(
         return None
     finally:
         dialog.close()
+
+
+# ------------------------------------------------------------------- local nodes
+
+
+def chain_summary(network: str, datadir: Path) -> dict:
+    """Read what is known about the chain already stored on this machine."""
+    return inspect_database(NodeConfig(network=network, datadir=Path(datadir)).chain_path)
+
+
+class LocalNodeDialog(QtWidgets.QDialog):
+    """Shown before a node is started here: how big the chain is, and what to do.
+
+    Three decisions belong to the person starting the node and to nobody else:
+    how much disk to spend on old blocks, whether strangers may use this node,
+    and whether they may mine through it.  All three are on this one screen, with
+    the size of the existing chain in plain sight, because that is the number
+    that makes the pruning question worth asking.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        network: str,
+        datadir: Path,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Start a node on this machine")
+        self.setMinimumWidth(560)
+        self._network = network
+        self._datadir = Path(datadir)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        headline = QtWidgets.QLabel(
+            f"A {network} node on this machine validates every block itself and needs "
+            "no one's permission. It costs disk space and, the first time, a while to "
+            "catch up with the network."
+        )
+        headline.setWordWrap(True)
+        layout.addWidget(headline)
+
+        self.size_label = QtWidgets.QLabel()
+        self.size_label.setWordWrap(True)
+        self.size_label.setTextFormat(QtCore.Qt.RichText)
+        layout.addWidget(self.size_label)
+
+        disk = QtWidgets.QGroupBox("Disk")
+        disk_layout = QtWidgets.QVBoxLayout(disk)
+        self.prune_box = QtWidgets.QCheckBox("Keep only recent blocks (prune)")
+        self.prune_box.setToolTip(
+            "Balances stay exact. What goes is the ability to show old blocks, "
+            "serve them to a peer syncing from scratch, and reorganise past them."
+        )
+        disk_layout.addWidget(self.prune_box)
+        keep_row = QtWidgets.QHBoxLayout()
+        keep_row.addSpacing(22)
+        keep_row.addWidget(QtWidgets.QLabel("keep the last"))
+        self.keep_spin = QtWidgets.QSpinBox()
+        self.keep_spin.setRange(MIN_PRUNE_KEEP, 100_000_000)
+        self.keep_spin.setSingleStep(1000)
+        self.keep_spin.setValue(MIN_PRUNE_KEEP)
+        self.keep_spin.setSuffix(" blocks")
+        self.keep_spin.setEnabled(False)
+        keep_row.addWidget(self.keep_spin)
+        self.prune_now_button = QtWidgets.QPushButton("Prune the chain now")
+        self.prune_now_button.setEnabled(False)
+        self.prune_now_button.clicked.connect(self._prune_now)
+        keep_row.addWidget(self.prune_now_button)
+        keep_row.addStretch(1)
+        disk_layout.addLayout(keep_row)
+        self.prune_box.toggled.connect(self.keep_spin.setEnabled)
+        self.prune_box.toggled.connect(self._update_prune_button)
+        layout.addWidget(disk)
+
+        sharing = QtWidgets.QGroupBox("Sharing")
+        sharing_layout = QtWidgets.QVBoxLayout(sharing)
+        self.public_box = QtWidgets.QCheckBox("Let other people's wallets use this node")
+        self.public_box.setToolTip(
+            "--rpc-public: read-only and broadcast calls are answered without the "
+            "token. Everything else still needs it."
+        )
+        sharing_layout.addWidget(self.public_box)
+        mining_row = QtWidgets.QHBoxLayout()
+        mining_row.addSpacing(22)
+        self.public_mining_box = QtWidgets.QCheckBox("...and let them mine through it")
+        self.public_mining_box.setToolTip("--rpc-public-mining: hands out block templates too.")
+        self.public_mining_box.setEnabled(False)
+        mining_row.addWidget(self.public_mining_box)
+        mining_row.addStretch(1)
+        sharing_layout.addLayout(mining_row)
+        advertise_row = QtWidgets.QHBoxLayout()
+        advertise_row.addSpacing(22)
+        advertise_row.addWidget(QtWidgets.QLabel("public address"))
+        self.advertise_edit = QtWidgets.QLineEdit()
+        self.advertise_edit.setPlaceholderText("https://node.example.net  (optional)")
+        self.advertise_edit.setEnabled(False)
+        advertise_row.addWidget(self.advertise_edit, 1)
+        sharing_layout.addLayout(advertise_row)
+        self.public_box.toggled.connect(self.public_mining_box.setEnabled)
+        self.public_box.toggled.connect(self.advertise_edit.setEnabled)
+        layout.addWidget(sharing)
+
+        self.status = QtWidgets.QLabel()
+        self.status.setWordWrap(True)
+        self.status.setObjectName("hint")
+        layout.addWidget(self.status)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        start = QtWidgets.QPushButton("Start node")
+        start.setObjectName("primary")
+        start.setDefault(True)
+        start.clicked.connect(self.accept)
+        buttons.addWidget(start)
+        layout.addLayout(buttons)
+
+        self._refresh_sizes()
+
+    # --------------------------------------------------------------------- sizes
+
+    def _refresh_sizes(self) -> None:
+        summary = chain_summary(self._network, self._datadir)
+        if not summary["exists"]:
+            self.size_label.setText(
+                f"<b>No {self._network} chain here yet.</b><br>"
+                "The node will download it from the network, starting at the genesis "
+                "block."
+            )
+            self._update_prune_button()
+            return
+        lines = [
+            f"<b>Chain on this machine:</b> height {summary['height']}, "
+            f"{format_bytes(summary['chain_bytes'] or 0)} of blocks, "
+            f"<b>{format_bytes(summary['disk_bytes'])} on disk</b>."
+        ]
+        if summary["pruned_blocks"]:
+            lines.append(
+                f"Already pruned: {summary['pruned_blocks']} block bodies up to height "
+                f"{summary['prune_height']} are gone."
+            )
+        lines.append(f"<span style='color:#97877f'>{summary['path']}</span>")
+        self.size_label.setText("<br>".join(lines))
+        self._update_prune_button()
+
+    def _update_prune_button(self, *_ignored: object) -> None:
+        summary = chain_summary(self._network, self._datadir)
+        can_prune = bool(summary["exists"]) and self.prune_box.isChecked()
+        self.prune_now_button.setEnabled(can_prune)
+
+    def _prune_now(self) -> None:
+        """Prune the stored chain before the node starts using it."""
+        keep = self.keep_spin.value()
+        if already_running(local_url(self._network)):
+            show_error(
+                self,
+                "Prune",
+                "A node is already running here and has the chain open. Stop it "
+                "first, or prune from its own window.",
+            )
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Prune the chain",
+            f"Drop the bodies of every block except the last {keep:,}?\n\n"
+            "Balances stay exact, but this node will no longer be able to show "
+            "those blocks, serve them to a peer syncing from scratch, or "
+            "reorganise past them.\n\nThis cannot be undone.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        progress = QtWidgets.QProgressDialog("Pruning...", "", 0, 0, self)
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            result, disk = prune_database(
+                NodeConfig(network=self._network, datadir=self._datadir).chain_path,
+                get_params(self._network),
+                keep,
+            )
+        except Exception as exc:  # pragma: no cover - disk or lock failures
+            progress.close()
+            show_error(self, "Prune failed", str(exc))
+            return
+        progress.close()
+        self.status.setText(
+            f"pruned {result.blocks} block(s) up to height {result.prune_height},"
+            f" freeing {format_bytes(result.freed_bytes)};"
+            f" the database is now {format_bytes(disk)}"
+        )
+        self._refresh_sizes()
+
+    # ----------------------------------------------------------------- the answer
+
+    def extra_arguments(self) -> tuple[str, ...]:
+        """The ``scarlet-node run`` options this dialog's answers translate to."""
+        extra: list[str] = []
+        if self.prune_box.isChecked():
+            extra += ["--prune", str(self.keep_spin.value())]
+        if self.public_box.isChecked():
+            extra.append("--rpc-public")
+            if self.public_mining_box.isChecked():
+                extra.append("--rpc-public-mining")
+            advertise = self.advertise_edit.text().strip()
+            if advertise:
+                extra += ["--rpc-advertise", advertise]
+        return tuple(extra)
+
+
+# ------------------------------------------------------------------ public nodes
+
+
+class PublicNodeDialog(QtWidgets.QDialog):
+    """A list of the public nodes that are up, so picking one is a single click.
+
+    The list comes from :mod:`scarletcoin.net.directory`: the addresses built
+    into this release, the ones this machine has saved, and the ones those nodes
+    say they know.  Every entry is probed, so what is on screen is what is
+    actually answering right now, not a hopeful list of names.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        network: str,
+        datadir: Path,
+        *,
+        for_mining: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Public {network} nodes")
+        self.setMinimumSize(700, 380)
+        self._network = network
+        self._datadir = Path(datadir)
+        self._for_mining = for_mining
+        self._statuses: list[directory.NodeStatus] = []
+        self.settings: ConnectionSettings | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        hint = QtWidgets.QLabel(
+            "A public node lets you use ScarletCoin without downloading the chain. "
+            "You are trusting its view of the network, so prefer one at the same "
+            "height as the others — or run your own."
+            + (
+                "\n\nMining needs a node that hands out work; those are marked below."
+                if for_mining
+                else ""
+            )
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        layout.addWidget(hint)
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Node", "Status", "Height", "Source"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.doubleClicked.connect(self._accept)
+        layout.addWidget(self.table, 1)
+
+        self.status = QtWidgets.QLabel("looking for public nodes...")
+        self.status.setObjectName("hint")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.refresh_button = QtWidgets.QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh)
+        buttons.addWidget(self.refresh_button)
+        add_button = QtWidgets.QPushButton("Add a node...")
+        add_button.clicked.connect(self._add)
+        buttons.addWidget(add_button)
+        buttons.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        self.use_button = QtWidgets.QPushButton("Use this node")
+        self.use_button.setObjectName("primary")
+        self.use_button.setDefault(True)
+        self.use_button.setEnabled(False)
+        self.use_button.clicked.connect(self._accept)
+        buttons.addWidget(self.use_button)
+        layout.addLayout(buttons)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Probe every known public node again, off the interface thread."""
+        self.refresh_button.setEnabled(False)
+        self.use_button.setEnabled(False)
+        self.status.setText("looking for public nodes...")
+        network, datadir = self._network, self._datadir
+        run_in_thread(
+            self,
+            lambda: directory.discover(network, datadir),
+            self._show,
+            self._failed,
+        )
+
+    @QtCore.pyqtSlot(object)
+    def _show(self, statuses: object) -> None:
+        self._statuses = list(statuses)  # type: ignore[arg-type]
+        self.refresh_button.setEnabled(True)
+        font = monospace()
+        self.table.setRowCount(len(self._statuses))
+        for row, status in enumerate(self._statuses):
+            host = QtWidgets.QTableWidgetItem(status.node.label)
+            host.setFont(font)
+            self.table.setItem(row, 0, host)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(status.describe()))
+            height = "" if status.height is None else f"{status.height:,}"
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(height))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(status.node.source))
+            if not status.usable(self._network, for_mining=self._for_mining):
+                for column in range(4):
+                    item = self.table.item(row, column)
+                    if item is not None:
+                        item.setForeground(QtGui.QColor("#6b5e58"))
+        self.table.resizeColumnsToContents()
+        usable = [
+            index
+            for index, status in enumerate(self._statuses)
+            if status.usable(self._network, for_mining=self._for_mining)
+        ]
+        if usable:
+            self.table.selectRow(usable[0])
+            self.use_button.setEnabled(True)
+            self.status.setText(f"{len(usable)} node(s) answered on {self._network}")
+        else:
+            self.status.setText(
+                f"no public {self._network} node answered. Add one with the button "
+                "below, or run a node of your own."
+            )
+
+    @QtCore.pyqtSlot(str)
+    def _failed(self, message: str) -> None:
+        self.refresh_button.setEnabled(True)
+        self.status.setText(f"could not look for public nodes: {message}")
+
+    def _add(self) -> None:
+        text, accepted = QtWidgets.QInputDialog.getText(
+            self, "Add a public node", "Address of the node:", text="https://"
+        )
+        if not accepted:
+            return
+        url = directory.normalise_url(text)
+        if not url:
+            show_error(self, "Add a public node", f"{text!r} is not an address.")
+            return
+        directory.remember_node(self._datadir, self._network, url)
+        self.refresh()
+
+    def _selected(self) -> directory.NodeStatus | None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._statuses):
+            return self._statuses[row]
+        return None
+
+    def _accept(self) -> None:
+        chosen = self._selected()
+        if chosen is None:
+            return
+        if not chosen.usable(self._network, for_mining=self._for_mining):
+            self.status.setText(f"that node cannot be used: {chosen.describe()}")
+            return
+        directory.remember_node(self._datadir, self._network, chosen.url)
+        self.settings = ConnectionSettings(chosen.url, "")
+        self.accept()
+
+
+# ------------------------------------------------------------------- the question
+
+
+class StartupDialog(QtWidgets.QDialog):
+    """Asks the one question a newcomer cannot avoid: whose node?
+
+    Running a node is the honest answer and the default; using a public one is
+    the quick answer. Both are offered plainly, with what each costs, rather than
+    one being hidden behind a menu.
+    """
+
+    LOCAL = "local"
+    PUBLIC = "public"
+    MANUAL = "manual"
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        network: str,
+        datadir: Path,
+        *,
+        reason: str = "",
+        for_mining: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("ScarletCoin")
+        self.setMinimumWidth(560)
+        self.answer: str | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(14)
+
+        title = QtWidgets.QLabel(f"Which {network} node should this use?")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        if reason:
+            note = QtWidgets.QLabel(reason)
+            note.setWordWrap(True)
+            note.setObjectName("hint")
+            layout.addWidget(note)
+
+        summary = chain_summary(network, datadir)
+        if summary["exists"]:
+            local_detail = (
+                f"Validates everything itself. The chain here is at height "
+                f"{summary['height']} and takes {format_bytes(summary['disk_bytes'])} "
+                "on disk; you can prune it on the next screen."
+            )
+        else:
+            local_detail = (
+                "Validates everything itself, trusting nobody. It has to download "
+                "the chain first, which takes time and disk space."
+            )
+        layout.addWidget(
+            self._option(
+                "Run a node on this machine",
+                local_detail,
+                self.LOCAL,
+                primary=True,
+            )
+        )
+        public_detail = (
+            "Ready immediately and stores nothing, but you are trusting somebody "
+            "else's view of the chain. Your keys never leave this machine either way."
+        )
+        if for_mining:
+            public_detail += " Mining only works if that node hands out work."
+        layout.addWidget(self._option("Connect to a public node", public_detail, self.PUBLIC))
+        layout.addWidget(
+            self._option(
+                "Enter a node address",
+                "For a node you run elsewhere, or somebody else's with a token.",
+                self.MANUAL,
+            )
+        )
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QtWidgets.QPushButton("Quit")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+    def _option(self, title: str, detail: str, answer: str, *, primary: bool = False):
+        box = QtWidgets.QGroupBox()
+        row = QtWidgets.QHBoxLayout(box)
+        text = QtWidgets.QVBoxLayout()
+        heading = QtWidgets.QLabel(f"<b>{title}</b>")
+        text.addWidget(heading)
+        body = QtWidgets.QLabel(detail)
+        body.setWordWrap(True)
+        body.setObjectName("hint")
+        text.addWidget(body)
+        row.addLayout(text, 1)
+        button = QtWidgets.QPushButton("Choose")
+        if primary:
+            button.setObjectName("primary")
+            button.setDefault(True)
+        button.clicked.connect(lambda: self._pick(answer))
+        row.addWidget(button)
+        return box
+
+    def _pick(self, answer: str) -> None:
+        self.answer = answer
+        self.accept()
+
+
+def choose_startup_node(
+    parent: QtWidgets.QWidget | None,
+    *,
+    network: str,
+    datadir: Path,
+    settings: ConnectionSettings,
+    reason: str = "",
+    preference: str | None = None,
+    for_mining: bool = False,
+    allow_start: bool = True,
+) -> tuple[ConnectionSettings | None, LocalNode | None]:
+    """Ask which node to use and act on the answer.
+
+    Args:
+        parent: Dialog parent.
+        network: Which network the application is on.
+        datadir: Data directory, used for the chain, the token and the saved
+            answer.
+        settings: What the application would have used, offered as the default in
+            the manual dialog.
+        reason: Why the question is being asked, shown at the top.
+        preference: Skip the question: ``"local"``, ``"public"`` or ``"ask"``.
+        for_mining: Mark public nodes that cannot hand out mining work.
+        allow_start: Whether starting a node here is permitted at all.
+
+    Returns:
+        The chosen connection and, if one was started here, the node — which the
+        caller owns and must stop. ``(None, None)`` if the user gave up.
+    """
+    datadir = Path(datadir)
+    while True:
+        answer = preference
+        if answer not in (StartupDialog.LOCAL, StartupDialog.PUBLIC, StartupDialog.MANUAL):
+            dialog = StartupDialog(parent, network, datadir, reason=reason, for_mining=for_mining)
+            if dialog.exec_() != QtWidgets.QDialog.Accepted or dialog.answer is None:
+                return None, None
+            answer = dialog.answer
+        preference = None  # a second time round asks properly
+
+        if answer == StartupDialog.LOCAL:
+            if not allow_start:
+                show_error(
+                    parent,
+                    "Node",
+                    "Starting a node here was turned off with --no-start-node.",
+                )
+                continue
+            running = ConnectionSettings(local_url(network), read_rpc_token(datadir, network) or "")
+            if running.answers(timeout=4.0):
+                running.save(datadir, network)
+                return running, None
+            options = LocalNodeDialog(parent, network, datadir)
+            if options.exec_() != QtWidgets.QDialog.Accepted:
+                continue
+            node = start_node_with_progress(
+                parent, network=network, datadir=datadir, extra=options.extra_arguments()
+            )
+            if node is None:
+                continue
+            chosen = ConnectionSettings(node.url, node.token)
+            chosen.save(datadir, network)
+            return chosen, node
+
+        if answer == StartupDialog.PUBLIC:
+            picker = PublicNodeDialog(parent, network, datadir, for_mining=for_mining)
+            if picker.exec_() != QtWidgets.QDialog.Accepted or picker.settings is None:
+                continue
+            picker.settings.save(datadir, network)
+            return picker.settings, None
+
+        chosen = ask_for_node(parent, settings, network, datadir, reason=reason)
+        if chosen is None:
+            continue
+        return chosen, None
+
+
+def _why_not(settings: ConnectionSettings, network: str) -> str:
+    """Try the configured node and explain, in a sentence, what went wrong."""
+    try:
+        info = settings.client(timeout=10.0).getinfo()
+    except RpcClientError as exc:
+        if exc.code == 401:
+            return (
+                f"A node is already running at {settings.url} but refused the RPC "
+                "token, so it was probably started by another program. Stop it, or "
+                "enter its token."
+            )
+        return f"No {network} node answered at {settings.url}."
+    if info.get("network") != network:
+        return (
+            f"The node at {settings.url} is on the {info.get('network')} network,"
+            f" but this is a {network} application."
+        )
+    return ""
+
+
+def resolve_startup(
+    args: argparse.Namespace,
+    *,
+    for_mining: bool = False,
+) -> tuple[ConnectionSettings | None, LocalNode | None]:
+    """Settle on a node before the main window opens.
+
+    A node that already answers is used without a word. Otherwise the choice
+    between running one here and using a public one is put to the user, because
+    guessing either way would be wrong: silently downloading a chain surprises
+    somebody who wanted a light wallet, and silently trusting a stranger's node
+    surprises somebody who wanted their own.
+
+    ``--node auto`` restores the older behaviour of starting a local node without
+    asking, for launchers and scripts.
+
+    Returns:
+        The connection to use and, if one was started here, the node the caller
+        must stop on exit. ``(None, None)`` when the user chose to quit.
+    """
+    network = args.network
+    datadir = Path(args.datadir)
+    settings = settings_from_args(args)
+    requested = (getattr(args, "node", None) or "").strip()
+    keyword = requested.lower() if requested.lower() in ("local", "public", "ask", "auto") else ""
+
+    if requested and not keyword:
+        url = directory.normalise_url(requested) or requested
+        settings = ConnectionSettings(url, getattr(args, "rpc_token", None) or "")
+        if settings.url == local_url(network) and not settings.token:
+            settings.token = read_rpc_token(datadir, network) or ""
+
+    forced = keyword if keyword in ("local", "public", "ask") else None
+    reason = "" if forced else _why_not(settings, network)
+    if not forced and not reason:
+        return settings, None
+
+    allow_start = not getattr(args, "no_start_node", False)
+    if keyword == "auto" and allow_start and is_loopback(settings.url):
+        node = start_node_with_progress(None, network=network, datadir=datadir)
+        if node is not None:
+            chosen = ConnectionSettings(node.url, node.token)
+            chosen.save(datadir, network)
+            return chosen, node
+
+    return choose_startup_node(
+        None,
+        network=network,
+        datadir=datadir,
+        settings=settings,
+        reason=reason,
+        preference=None if forced in (None, "ask") else forced,
+        for_mining=for_mining,
+        allow_start=allow_start,
+    )
