@@ -273,14 +273,14 @@ closes.
   installed.
 
 The `Release` workflow builds everything with
-[PyInstaller](https://pyinstaller.org/) when a tag like `v2.1.0` is pushed, and
+[PyInstaller](https://pyinstaller.org/) when a tag like `v2.1.2` is pushed, and
 uploads the archives (plus the installer on Windows) to the release. To build
 locally:
 
 ```sh
 python tools/build_release.py
 # on Windows, compile the installer as well:
-iscc /DMyAppVersion=2.1.0 packaging/windows/scarletcoin.iss
+iscc /DMyAppVersion=2.1.2 packaging/windows/scarletcoin.iss
 ```
 
 ## The three programs

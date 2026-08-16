@@ -2,13 +2,13 @@
 ;
 ; Compile it from the repository root, after running tools/build_release.py:
 ;
-;   iscc /DMyAppVersion=2.1.0 packaging\windows\scarletcoin.iss
+;   iscc /DMyAppVersion=2.1.2 packaging\windows\scarletcoin.iss
 ;
 ; The bundle built by PyInstaller (release\bundle) is packaged as-is, so the
 ; wallet and the miner can still find the node they run in the background.
 
 #ifndef MyAppVersion
-  #error "Define MyAppVersion, e.g. /DMyAppVersion=2.1.0"
+  #error "Define MyAppVersion, e.g. /DMyAppVersion=2.1.2"
 #endif
 
 #define MyAppName "ScarletCoin"
