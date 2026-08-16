@@ -24,6 +24,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
       - name: Build the standalone executables
         run: python tools/build_release.py
 
