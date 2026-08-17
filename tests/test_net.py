@@ -783,6 +783,22 @@ class TestExplorer:
         assert "<script>alert(1)</script>" not in body
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
 
+    def test_favicon_is_served(self, rpc):
+        _, server, _ = rpc
+        status, body = self._get(server.url + "/icon.svg")
+        assert status == 200
+        assert "<svg" in body
+        status, _ = self._get(server.url + "/favicon.ico")
+        assert status == 200
+
+    def test_pages_render_with_a_live_reload_script(self, rpc):
+        node, server, _ = rpc
+        status, body = self._get(server.url + "/")
+        assert status == 200
+        assert 'type="image/svg+xml"' in body  # favicon link
+        if node.config.ws:
+            assert "new WebSocket" in body
+
 
 class TestWrongClock:
     """A node whose clock is behind must not conclude the network is broken.

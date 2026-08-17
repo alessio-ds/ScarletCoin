@@ -750,6 +750,13 @@ class RpcServer:
                     if path == "/api/info":
                         self._json(server.node.info())
                         return
+                    if path in ("/icon.svg", "/favicon.ico"):
+                        self._respond(
+                            HTTPStatus.OK,
+                            explorer.FAVICON_SVG.encode("utf-8"),
+                            "image/svg+xml",
+                        )
+                        return
                     if path == "/metrics":
                         self._respond(
                             HTTPStatus.OK,
