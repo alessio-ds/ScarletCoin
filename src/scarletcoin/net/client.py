@@ -89,7 +89,10 @@ class RpcClient:
             request = urllib.request.Request(
                 f"{self.url}/rpc",
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Connection": "close",
+                },
                 method="POST",
             )
         except (ValueError, http.client.InvalidURL) as exc:

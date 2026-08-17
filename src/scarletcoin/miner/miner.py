@@ -187,7 +187,6 @@ class Miner:
 
     def run(self, max_blocks: int | None = None) -> MinerStats:
         """Mine until stopped (or until ``max_blocks`` blocks have been accepted)."""
-        # Compile the native hashing backend before forking any workers.
         compile_native()
         pool = multiprocessing.Pool(self.workers) if self.workers > 1 else None
         try:
