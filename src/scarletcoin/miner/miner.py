@@ -19,7 +19,7 @@ from scarletcoin.core.block import Block
 from scarletcoin.core.params import get_params
 from scarletcoin.core.template import BlockTemplate
 from scarletcoin.crypto.keys import Address, InvalidKeyError
-from scarletcoin.miner.solver import NONCE_LIMIT, scan_nonces
+from scarletcoin.miner.solver import NONCE_LIMIT, compile_native, scan_nonces
 from scarletcoin.net.client import RpcClient, RpcClientError
 
 __all__ = ["Miner", "MinerStats", "MiningError"]
@@ -187,6 +187,8 @@ class Miner:
 
     def run(self, max_blocks: int | None = None) -> MinerStats:
         """Mine until stopped (or until ``max_blocks`` blocks have been accepted)."""
+        # Compile the native hashing backend before forking any workers.
+        compile_native()
         pool = multiprocessing.Pool(self.workers) if self.workers > 1 else None
         try:
             while not self.stopping:

@@ -22,7 +22,7 @@ from pathlib import Path
 from scarletcoin.core.block import BLOCK_HEADER_SIZE, Block, BlockHeader
 from scarletcoin.core.pow import bits_to_target
 
-__all__ = ["NONCE_LIMIT", "ScanResult", "scan_nonces", "solve_block"]
+__all__ = ["NONCE_LIMIT", "ScanResult", "compile_native", "scan_nonces", "solve_block"]
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +105,19 @@ _native_tried = False
 def _native_scan() -> Callable[[bytes, int, int, int], int] | None:
     """Return the compiled nonce scanner, or ``None`` if it is unavailable.
 
-    The scanner is a small C library compiled on first use and cached in the
-    temporary directory; source installs with a C compiler get it, and every
-    other environment falls back to the pure-Python loop.
+    Only *loads* a previously-compiled library; never compiles on its own, so it
+    is safe to call from worker processes.  The main process should call
+    :func:`compile_native` once before spawning workers.
     """
     global _native_func, _native_tried
     if _native_tried:
         return _native_func
     _native_tried = True
     try:
-        library = _compile_native()
+        library = _cache_path()
+        if not library.exists():
+            _native_func = None
+            return None
         scanner = ctypes.CDLL(str(library)).scarlet_scan_nonces
         scanner.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint]
         scanner.restype = ctypes.c_longlong
@@ -125,34 +128,41 @@ def _native_scan() -> Callable[[bytes, int, int, int], int] | None:
     return _native_func
 
 
-def _compile_native() -> Path:
-    cache_dir = Path(tempfile.gettempdir()) / "scarletcoin-native"
-    cache_dir.mkdir(exist_ok=True)
-    output = cache_dir / "_scan_nonces.so"
-    if not output.exists():
-        source = resources.files("scarletcoin").joinpath(_SOURCE)
-        with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as handle:
-            handle.write(source.read_bytes())
-            temporary_source = Path(handle.name)
-        temporary_output = output.with_suffix(".tmp.so")
-        try:
-            subprocess.run(
-                [
-                    "gcc",
-                    "-O3",
-                    "-fPIC",
-                    "-shared",
-                    "-o",
-                    str(temporary_output),
-                    str(temporary_source),
-                ],
-                check=True,
-                capture_output=True,
-            )
-            temporary_output.replace(output)
-        finally:
-            temporary_source.unlink(missing_ok=True)
-    return output
+def compile_native() -> None:
+    """Build the native nonce scanner if a C compiler is available.
+
+    Must be called in the main process before any worker pool is created.  The
+    compiled library is placed in a directory shared by all workers; subsequent
+    calls to :func:`_native_scan` load it from there.
+    """
+    cache = _cache_path()
+    if cache.exists():
+        return
+    source = resources.files("scarletcoin").joinpath(_SOURCE)
+    temp_src = None
+    temp_out = None
+    try:
+        temp_src = Path(tempfile.mkstemp(suffix=".c", dir=cache.parent)[1])
+        temp_src.write_bytes(source.read_bytes())
+        temp_out = cache.with_suffix(".tmp.so")
+        subprocess.run(
+            ["gcc", "-O3", "-fPIC", "-shared", "-o", str(temp_out), str(temp_src)],
+            check=True,
+            capture_output=True,
+        )
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temp_out.replace(cache)
+    except Exception:
+        logger.debug("native mining backend compilation failed", exc_info=True)
+    finally:
+        if temp_src is not None:
+            temp_src.unlink(missing_ok=True)
+        if temp_out is not None:
+            temp_out.unlink(missing_ok=True)
+
+
+def _cache_path() -> Path:
+    return Path(tempfile.gettempdir()) / "scarletcoin-native" / "_scan_nonces.so"
 
 
 def _make_native_caller(scanner) -> Callable[[bytes, int, int, int], int]:
