@@ -20,4 +20,4 @@ from scarletcoin.core.params import COIN, NETWORKS, get_params
 
 __all__ = ["COIN", "NETWORKS", "__version__", "get_params"]
 
-__version__ = "2.2.3"
+__version__ = "2.2.4"

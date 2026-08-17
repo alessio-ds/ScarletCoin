@@ -351,6 +351,11 @@ def _wallet_address(datadir: Path, network: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``scarlet-miner-gui``."""
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+    multiprocessing.set_start_method("forkserver")
+
     parser = argparse.ArgumentParser(
         prog="scarlet-miner-gui", description="ScarletCoin desktop miner."
     )
