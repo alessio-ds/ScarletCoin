@@ -123,7 +123,7 @@ def build_apps(python: Path) -> None:
         if not console:
             command.append("--noconsole")
         for source, destination in DATA_FILES:
-            command.extend(["--add-data", f"{source}{os.pathsep}{destination}"])
+            command.extend(["--add-data", f"{ROOT / source}{os.pathsep}{destination}"])
         command.append(str(ROOT / entry))
         run(command)
 
