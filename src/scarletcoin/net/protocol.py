@@ -42,6 +42,8 @@ __all__ = [
     "GetAddr",
     "GetBlocks",
     "GetData",
+    "GetHeaders",
+    "Headers",
     "Inv",
     "InvItem",
     "InvType",
@@ -71,6 +73,8 @@ MAX_INV_ITEMS = 5_000
 MAX_ADDR_ITEMS = 1_000
 #: Most block hashes a ``getblocks`` answer may contain.
 MAX_BLOCKS_PER_INV = 500
+#: Most headers a ``headers`` answer may carry.
+MAX_HEADERS_PER_MESSAGE = 2_000
 
 
 class ProtocolError(Exception):
@@ -365,6 +369,67 @@ class GetBlocks(Message):
 
 
 @dataclass(frozen=True)
+class GetHeaders(Message):
+    """Asks for the block *headers* that follow a locator."""
+
+    command: ClassVar[str] = "getheaders"
+
+    locator: tuple[bytes, ...]
+    stop_hash: bytes = b"\x00" * 32
+
+    def encode(self) -> bytes:
+        if not self.locator or len(self.locator) > 64:
+            raise ProtocolError("a locator must contain between 1 and 64 hashes")
+        writer = Writer()
+        writer.varint(len(self.locator))
+        for block_hash in self.locator:
+            writer.hash32(block_hash)
+        writer.hash32(self.stop_hash)
+        return writer.getvalue()
+
+    @classmethod
+    def decode(cls, payload: bytes) -> GetHeaders:
+        reader = Reader(payload)
+        count = reader.varint()
+        if not 1 <= count <= 64:
+            raise ProtocolError("a locator must contain between 1 and 64 hashes")
+        locator = tuple(reader.hash32() for _ in range(count))
+        stop_hash = reader.hash32()
+        reader.expect_end()
+        return cls(locator, stop_hash)
+
+
+@dataclass(frozen=True)
+class Headers(Message):
+    """Carries block headers, each 80 bytes."""
+
+    command: ClassVar[str] = "headers"
+
+    headers: tuple[bytes, ...] = field(default_factory=tuple)
+
+    def encode(self) -> bytes:
+        if len(self.headers) > MAX_HEADERS_PER_MESSAGE:
+            raise ProtocolError("too many headers in one message")
+        writer = Writer()
+        writer.varint(len(self.headers))
+        for header in self.headers:
+            if len(header) != 80:
+                raise ProtocolError("each header must be exactly 80 bytes")
+            writer.raw(header)
+        return writer.getvalue()
+
+    @classmethod
+    def decode(cls, payload: bytes) -> Headers:
+        reader = Reader(payload)
+        count = reader.varint()
+        if count > MAX_HEADERS_PER_MESSAGE:
+            raise ProtocolError("too many headers in one message")
+        headers = tuple(reader.raw(80) for _ in range(count))
+        reader.expect_end()
+        return cls(headers)
+
+
+@dataclass(frozen=True)
 class BlockMessage(Message):
     """Carries a whole block."""
 
@@ -409,6 +474,8 @@ _MESSAGE_TYPES: dict[str, type[Message]] = {
         GetData,
         NotFound,
         GetBlocks,
+        GetHeaders,
+        Headers,
         BlockMessage,
         TxMessage,
         Mempool,

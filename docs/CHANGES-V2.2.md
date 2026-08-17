@@ -1,6 +1,6 @@
-# What changed in version 3
+# What changed in version 2.2
 
-Version 3 is a **consensus-breaking release** on top of the version 2 rewrite.
+Version 2.2 is a **consensus-breaking release** on top of the version 2 rewrite.
 It adds pay-to-script-hash (multisig), replace-by-fee, hierarchical
 deterministic wallets, deterministic signatures, link encryption and a native
 mining backend. Because the transaction serialisation changed, the genesis block
@@ -171,35 +171,38 @@ chain restarts from the new genesis. The reference public node
 * Added `ecdsa` (pure Python elliptic-curve arithmetic, used by BIP-0032 public
   derivation — the `cryptography` API does not expose point addition).
 * Added `hypothesis` to the development group.
-* Version bumped to `3.0.0` in both `pyproject.toml` and
+* Version bumped to `2.2.0` in both `pyproject.toml` and
   `src/scarletcoin/__init__.py`.
 
 ## Compatibility
 
-None. Like version 2 before it, version 3 shares no serialisation or wire format
+None. Like version 2 before it, version 2.2 shares no serialisation or wire format
 with earlier releases, and its chains start from new genesis blocks. Private
 keys remain valid secp256k1 keys, and version 1 wallet files are still readable
 (they upgrade to format 2 on save).
 
+## Headers-first synchronisation (item 7)
+
+Initial block download now happens in two phases. After the handshake a node
+behind its peer sends `getheaders` and receives up to 2000 headers, which are
+checked for proof of work, difficulty and their link to a known parent and
+stored in a new `headers` table (`core/storage.py`, `core/chain.py`). Once the
+header chain is ahead, the missing bodies are requested from any connected peer
+with `getdata`, in parallel, and the process repeats until the chains agree.
+The `getheaders`/`headers` messages live in `net/protocol.py`; `net/node.py`
+drives the download.
+
+## Explorer WebSocket (item 11)
+
+The node runs a WebSocket endpoint (`net/websocket.py`, the `websockets`
+library) that pushes `block`, `reorg` and `tx` events to connected browsers. The
+explorer embeds a small script that reloads the page when a new block arrives.
+The endpoint is enabled by default (`NodeConfig.ws`) and its port is reported in
+`getinfo` under `ws_port`.
+
 ## Still to do
 
-Two planned items from the roadmap are not implemented yet:
-
-### Headers-first synchronisation (item 7)
-
-Initial block download currently fetches full blocks sequentially from one peer.
-Headers-first sync would add `getheaders`/`headers` protocol commands, store
-headers independently of bodies (a new database table or a header-only marker),
-validate the proof-of-work chain from headers alone, and then download the
-bodies in parallel from several peers. This touches `net/protocol.py`,
-`core/storage.py`, `core/chain.py` and `net/node.py`, and carries a real risk of
-regressing the peer-to-peer layer, so it should land with two-node sync tests.
-
-### Explorer WebSocket (item 11)
-
-Live block/transaction push to the browser would let the explorer update without
-polling. It needs either a `websockets` dependency or a hand-rolled RFC 6455
-implementation alongside `net/explorer.py` and `net/rpc.py`.
+One planned item remains blocked:
 
 ### Native secp256k1 for signature verification (item 2, blocked)
 
@@ -207,3 +210,12 @@ implementation alongside `net/explorer.py` and `net/rpc.py`.
 environment (packaging/build failures), so the planned swap from `cryptography`
 to libsecp256k1 for the ~1 300 tx/s ingestion ceiling was left out. `ecdsa` was
 used where the extra curve primitives were actually needed (BIP-0032).
+
+## Sibling projects
+
+The browser wallet (`scarletcoin-web-wallet`) was updated in step: its
+transaction serialisation, signature hash and coinbase building now match the
+new format (sequence numbers, typed outputs, witness stacks, `sighash/2`), and
+its golden fixtures were regenerated so the two implementations still agree
+byte-for-byte. The browser wallet keeps the version-1 (WIF list) wallet file,
+which the desktop wallet still imports as imported keys.

@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from scarletcoin.core.block import Block
+from scarletcoin.core.block import Block, BlockHeader
 from scarletcoin.core.chain import Blockchain, BlockStatus
 from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.params import REGTEST
@@ -97,6 +97,75 @@ class TestCheckpoints:
         assert result.status is BlockStatus.INVALID
         assert "checkpoint" in result.reason
         guarded.storage.close()
+
+
+class TestHeaderSync:
+    def _headers(self, chain, key, count):
+        blocks = []
+        for i in range(count):
+            block = make_block(chain, key, timestamp=REGTEST.genesis_timestamp + i + 1, extra=b"h")
+            chain.add_block(block)
+            blocks.append(block)
+        return [block.header.serialize() for block in blocks]
+
+    def test_headers_are_accepted_and_tracked(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 5)
+        source.storage.close()
+
+        target = make_chain()
+        for raw in raw_headers:
+            assert target.add_header(BlockHeader.deserialize(raw)) is None
+        assert target.header_height() == 5
+        assert len(target.headers_to_download()) == 5
+        assert target.header_tip().height == 5
+        target.storage.close()
+
+    def test_headers_list_the_missing_blocks_in_order(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 5)
+        hashes = [BlockHeader.deserialize(raw).hash() for raw in raw_headers]
+        source.storage.close()
+
+        target = make_chain()
+        for raw in raw_headers:
+            target.add_header(BlockHeader.deserialize(raw))
+        assert target.headers_to_download() == hashes
+        target.storage.close()
+
+    def test_a_bad_header_is_rejected(self, key):
+        from scarletcoin.core.pow import check_proof_of_work
+
+        source = make_chain()
+        raw_headers = self._headers(source, key, 2)
+        source.storage.close()
+
+        target = make_chain()
+        assert target.add_header(BlockHeader.deserialize(raw_headers[0])) is None
+        header = BlockHeader.deserialize(raw_headers[1])
+        nonce = header.nonce
+        while True:  # regtest's target is easy, so find a hash that misses it
+            nonce += 1
+            broken = header.with_nonce(nonce)
+            if not check_proof_of_work(broken.hash(), broken.bits, pow_limit=REGTEST.pow_limit):
+                break
+        assert target.add_header(broken) is not None
+        assert target.header_height() == 1
+        target.storage.close()
+
+    def test_an_orphan_header_is_held_until_its_parent_arrives(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 3)
+        source.storage.close()
+
+        target = make_chain()
+        second = BlockHeader.deserialize(raw_headers[1])
+        assert target.add_header(second) is None  # parent unknown: deferred, not an error
+        assert target.header_height() == 0
+        target.add_header(BlockHeader.deserialize(raw_headers[0]))
+        assert target.add_header(second) is None
+        assert target.header_height() == 2
+        target.storage.close()
 
 
 class TestBlockAcceptance:

@@ -86,6 +86,7 @@ class NotFound(Exception):
 def _page(server: RpcServer, title: str, body: str) -> str:
     node = server.node
     network = escape(node.params.name)
+    live_script = _live_reload_script(node)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -93,6 +94,7 @@ def _page(server: RpcServer, title: str, body: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} - ScarletCoin explorer</title>
 <style>{_STYLE}</style>
+{live_script}
 </head>
 <body>
 <header>
@@ -104,6 +106,7 @@ def _page(server: RpcServer, title: str, body: str) -> str:
     <a href="/mempool">Mempool</a>
     <a href="/peers">Peers</a>
     <a href="/rich">Rich list</a>
+    <a href="https://alessio-ds.github.io/scarletcoin-web-wallet/">Web wallet</a>
   </nav>
   <form action="/search" method="get">
     <input type="text" name="q" placeholder="block height, hash, txid or address" required>
@@ -118,6 +121,27 @@ def _page(server: RpcServer, title: str, body: str) -> str:
 </body>
 </html>
 """
+
+
+def _live_reload_script(node) -> str:
+    """A small script that reloads the page when a new block arrives.
+
+    Returns an empty string when the WebSocket endpoint is not running.
+    """
+    if not node.config.ws or not node.ws_hub.running or not node.ws_hub.port:
+        return ""
+    port = node.ws_hub.port
+    return f"""<script>
+(function () {{
+  if (!window.WebSocket) return;
+  var socket = new WebSocket("ws://" + location.hostname + ":{port}/");
+  socket.onmessage = function (event) {{
+    try {{ if (JSON.parse(event.data).type === "block") location.reload(); }}
+    catch (e) {{ }}
+  }};
+  socket.onclose = function () {{ location.reload(); }};
+}})();
+</script>"""
 
 
 @dataclass(frozen=True, slots=True)

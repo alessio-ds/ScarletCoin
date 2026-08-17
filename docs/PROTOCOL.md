@@ -307,12 +307,14 @@ nodes.
 
 | Command | Payload | Purpose |
 |---|---|---|
-| `version` | `uint32` version, `varstr` user agent, `uint32` height, `uint64` nonce, `uint16` listening port, `uint64` timestamp | opens the handshake |
+| `version` | `uint32` version, `varstr` user agent, `uint32` height, `uint64` nonce, `uint16` listening port, `uint64` timestamp, `varbytes` ephemeral public key | opens the handshake |
 | `verack` | — | accepts a `version` |
 | `ping` / `pong` | `uint64` nonce | liveness and latency |
 | `getaddr` | — | asks for known peers |
 | `addr` | `varint` count, then `varstr` host, `uint16` port, `uint32` last seen | gossips peers |
 | `getblocks` | `varint` count + `hash32` locator hashes, `hash32` stop hash | asks what follows a locator |
+| `getheaders` | same as `getblocks` | asks for the *headers* that follow a locator |
+| `headers` | `varint` count, then `80`-byte block headers | answers `getheaders` |
 | `inv` | `varint` count, then `uint8` type (1 tx, 2 block) + `hash32` | announces objects |
 | `getdata` | same as `inv` | requests objects |
 | `notfound` | same as `inv` | reports objects not held |
@@ -323,14 +325,24 @@ nodes.
 **Handshake.** The connecting side sends `version`; the other answers with its
 own `version`; both then send `verack`. A node that sees its own nonce
 disconnects (it dialled itself). Only `version` and `verack` are accepted before
-the handshake completes.
+the handshake completes. The `version` message carries each side's ephemeral
+public key; once both have been exchanged the link is encrypted (see
+[below](#link-encryption)).
 
-**Synchronising.** After the handshake, a node behind its peer sends `getblocks`
+**Synchronising.** After the handshake, a node behind its peer sends `getheaders`
 with a *locator*: the tip, then progressively sparser ancestors, ending at the
-genesis hash. The peer replies with an `inv` of up to 500 hashes on its active
-chain after the newest locator entry it recognises. Blocks are fetched with
-`getdata`, at most 64 in flight per peer, and the process repeats until the
-chains agree.
+genesis hash. The peer replies with up to 2000 headers after the newest locator
+entry it recognises. Each header is checked for proof of work, difficulty and
+its link to a known parent, and stored even though its body has not arrived yet.
+Once the header chain is downloaded, the node requests the missing blocks with
+`getdata`, at most 64 in flight per peer, from any peer, and the process repeats
+until the chains agree. (`getblocks`/`inv` remain for announcing blocks, but the
+bulk of initial synchronisation uses `getheaders`.)
+
+**Link encryption.** After the version handshake, each side derives a shared
+secret by ECDH over the two ephemeral keys, hashes it with HKDF, and encrypts
+every subsequent message with ChaCha20-Poly1305 using one nonce counter per
+direction. A peer that sends no ephemeral key stays in the clear.
 
 **Relaying.** Newly accepted blocks and mempool transactions are announced with
 `inv` to every peer except the one they came from, skipping peers already known
@@ -419,10 +431,13 @@ Databases written before this existed are migrated on first open (schema version
 → 2 adds `blocks.pruned`); a database from a *newer* build is refused rather than
 guessed at.
 
-The same HTTP server answers `GET /api/info` with the `getinfo` document, and
-serves the HTML explorer at `/`, `/blocks`, `/block/<hash-or-height>`,
-`/tx/<txid>`, `/address/<address>`, `/mempool`, `/peers`, `/rich` and
-`/search?q=…`.
+The same HTTP server answers `GET /api/info` with the `getinfo` document,
+`GET /metrics` with Prometheus-format metrics, and serves the HTML explorer at
+`/`, `/blocks`, `/block/<hash-or-height>`, `/tx/<txid>`, `/address/<address>`,
+`/mempool`, `/peers`, `/rich` and `/search?q=…`. A separate WebSocket endpoint
+(the port reported in `getinfo` as `ws_port`) pushes `{"type": "block", …}`,
+`{"type": "reorg", …}` and `{"type": "tx", …}` events so the explorer can update
+without polling.
 
 A **block template** gives the miner everything except the coinbase:
 

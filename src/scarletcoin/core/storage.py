@@ -33,6 +33,7 @@ from scarletcoin.core.utxo import Coin
 
 __all__ = [
     "BlockIndexEntry",
+    "HeaderEntry",
     "PruneResult",
     "Storage",
     "StorageError",
@@ -87,6 +88,16 @@ CREATE TABLE IF NOT EXISTS undo (
     data       BLOB NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS headers (
+    hash      BLOB PRIMARY KEY,
+    height    INTEGER NOT NULL,
+    prev_hash BLOB NOT NULL,
+    chainwork BLOB NOT NULL,
+    raw       BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS headers_height ON headers (height);
+CREATE INDEX IF NOT EXISTS headers_work ON headers (chainwork DESC);
+
 CREATE TABLE IF NOT EXISTS tx_location (
     txid       BLOB PRIMARY KEY,
     block_hash BLOB NOT NULL,
@@ -139,6 +150,17 @@ class TxLocation:
     block_hash: bytes
     position: int
     height: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderEntry:
+    """A validated block header whose body has not been downloaded yet."""
+
+    hash: bytes
+    height: int
+    prev_hash: bytes
+    chainwork: int
+    header: BlockHeader
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +494,65 @@ class Storage:
         """Total number of stored blocks, including side branches."""
         row = self._one("SELECT COUNT(*) AS n FROM blocks")
         return 0 if row is None else int(row["n"])
+
+    # ------------------------------------------------------------------ headers
+
+    def put_header(self, header: BlockHeader, *, height: int, chainwork: int) -> None:
+        """Store a validated block header (headers-first sync)."""
+        self._execute(
+            "INSERT OR REPLACE INTO headers (hash, height, prev_hash, chainwork, raw)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (header.hash(), height, header.prev_hash, _work_to_blob(chainwork), header.serialize()),
+        )
+
+    def has_header(self, block_hash: bytes) -> bool:
+        """Return ``True`` if the header is stored."""
+        return self._one("SELECT 1 FROM headers WHERE hash = ?", (block_hash,)) is not None
+
+    def header_entry(self, block_hash: bytes) -> HeaderEntry | None:
+        """Return the stored header entry for ``block_hash``."""
+        row = self._one("SELECT * FROM headers WHERE hash = ?", (block_hash,))
+        if row is None:
+            return None
+        return HeaderEntry(
+            hash=bytes(row["hash"]),
+            height=int(row["height"]),
+            prev_hash=bytes(row["prev_hash"]),
+            chainwork=_blob_to_work(bytes(row["chainwork"])),
+            header=BlockHeader.deserialize(bytes(row["raw"])),
+        )
+
+    def best_header(self) -> HeaderEntry | None:
+        """Return the stored header with the most cumulative work."""
+        row = self._one("SELECT * FROM headers ORDER BY chainwork DESC, height DESC LIMIT 1")
+        if row is None:
+            return None
+        return HeaderEntry(
+            hash=bytes(row["hash"]),
+            height=int(row["height"]),
+            prev_hash=bytes(row["prev_hash"]),
+            chainwork=_blob_to_work(bytes(row["chainwork"])),
+            header=BlockHeader.deserialize(bytes(row["raw"])),
+        )
+
+    def header_count(self) -> int:
+        """Number of stored headers."""
+        row = self._one("SELECT COUNT(*) AS n FROM headers")
+        return 0 if row is None else int(row["n"])
+
+    def remove_headers_from(self, block_hash: bytes) -> int:
+        """Drop a header and every header built on top of it; returns how many went."""
+        count = 0
+        pending = [block_hash]
+        while pending:
+            current = pending.pop()
+            if not self.has_header(current):
+                continue
+            self._execute("DELETE FROM headers WHERE hash = ?", (current,))
+            count += 1
+            for row in self._query("SELECT hash FROM headers WHERE prev_hash = ?", (current,)):
+                pending.append(bytes(row["hash"]))
+        return count
 
     # ------------------------------------------------------------------- sizes
 

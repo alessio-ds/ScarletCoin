@@ -4,7 +4,7 @@ A small but complete proof-of-work cryptocurrency, written in Python: a real
 blockchain, peer-to-peer nodes that reach consensus on their own, a wallet with
 proper keys and signatures, a miner, and a block explorer served by every node.
 
-This is version 3 — a consensus-breaking release on top of the version 2
+This is version 2.2 — a consensus-breaking release on top of the version 2
 rewrite. It adds pay-to-script-hash (multisig), replace-by-fee, hierarchical
 deterministic (BIP-0039/0032) wallets, deterministic RFC 6979 signatures, and an
 optional native mining backend. The transaction serialisation changed and the
@@ -51,8 +51,8 @@ See [What changed from v1](docs/CHANGES-V2.md).
   (with an optional compiled SHA-256 backend and a pure-Python fallback),
   submits solved blocks, and collects fees along with the subsidy.
 * **A block explorer** on the node's HTTP port: blocks, transactions,
-  addresses, the mempool, peers and a rich list, plus a Prometheus `/metrics`
-  endpoint.
+  addresses, the mempool, peers and a rich list, live-updating over a WebSocket
+  endpoint, plus a Prometheus `/metrics` endpoint.
 
 ## Install
 
@@ -410,7 +410,7 @@ uv run python tools/mine_genesis.py   # only if the genesis definition changes
 * [docs/PROTOCOL.md](docs/PROTOCOL.md) — consensus rules, serialisation formats,
   the peer-to-peer messages and the RPC methods.
 * [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the rewrite fixed, and why.
-* [docs/CHANGES-V3.md](docs/CHANGES-V3.md) — the version 3 upgrade, and what is
+* [docs/CHANGES-V2.2.md](docs/CHANGES-V2.2.md) — the version 2.2 upgrade, and what is
   still to do.
 
 ## Honest limitations

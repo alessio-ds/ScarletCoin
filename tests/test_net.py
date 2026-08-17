@@ -39,6 +39,8 @@ class TestProtocol:
             protocol.GetData((InvItem(InvType.TX, b"\x02" * 32),)),
             protocol.NotFound((InvItem(InvType.TX, b"\x03" * 32),)),
             protocol.GetBlocks((b"\x04" * 32, b"\x05" * 32)),
+            protocol.GetHeaders((b"\x04" * 32, b"\x05" * 32)),
+            protocol.Headers((b"\x06" * 80, b"\x07" * 80)),
             protocol.BlockMessage(REGTEST.genesis_block),
             protocol.TxMessage(REGTEST.genesis_coinbase),
         ],
@@ -778,8 +780,8 @@ class TestExplorer:
         _, server, _ = rpc
         status, body = self._get(server.url + "/search?q=%3Cscript%3Ealert(1)%3C/script%3E")
         assert status == 404
-        assert "<script>" not in body
-        assert "&lt;script&gt;" in body
+        assert "<script>alert(1)</script>" not in body
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
 
 
 class TestWrongClock:

@@ -29,7 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from scarletcoin.core.block import Block, BlockError
+from scarletcoin.core.block import Block, BlockError, BlockHeader
 from scarletcoin.core.coinbase import coinbase_height
 from scarletcoin.core.params import ChainParams
 from scarletcoin.core.pow import block_work, difficulty, next_bits
@@ -48,6 +48,7 @@ from scarletcoin.core.validation import (
     check_transaction_final,
     check_transaction_inputs,
 )
+from scarletcoin.crypto.hashing import hash256
 from scarletcoin.units import format_bytes
 
 __all__ = [
@@ -61,6 +62,18 @@ __all__ = [
 
 _MAX_CANDIDATES = 64
 _MAX_REMEMBERED_INVALID = 5_000
+
+
+@dataclass(frozen=True, slots=True)
+class _ChainNode:
+    """A block or header on either the block chain or the header chain."""
+
+    hash: bytes
+    height: int
+    prev_hash: bytes
+    chainwork: int
+    bits: int
+    timestamp: int
 
 #: Fewest recent blocks a pruned node keeps.
 #:
@@ -321,6 +334,177 @@ class Blockchain:
             if entry is None:  # pragma: no cover - the active chain has no gaps
                 break
             hashes.append(entry.hash)
+        return hashes
+
+    # ------------------------------------------------------------- header sync
+
+    def _node(self, block_hash: bytes) -> _ChainNode | None:
+        """Return ``(hash, height, prev, chainwork, bits, timestamp)`` for a block or header."""
+        entry = self.storage.get_entry(block_hash)
+        if entry is not None:
+            return _ChainNode(
+                entry.hash, entry.height, entry.prev_hash, entry.chainwork,
+                entry.bits, entry.timestamp,
+            )
+        header = self.storage.header_entry(block_hash)
+        if header is not None:
+            return _ChainNode(
+                header.hash, header.height, header.prev_hash, header.chainwork,
+                header.header.bits, header.header.timestamp,
+            )
+        return None
+
+    def add_header(self, header: BlockHeader) -> str | None:
+        """Validate and store a block header, checking PoW and difficulty.
+
+        The body is not downloaded or validated here; that happens when the block
+        itself arrives. Returns an error string on failure, or ``None`` when the
+        header is stored (or already known, or its parent is unknown so it cannot
+        be judged yet).
+        """
+        with self._lock:
+            block_hash = header.hash()
+            if self.has_block(block_hash) or self.storage.has_header(block_hash):
+                return None
+            if not header.check_proof_of_work(pow_limit=self.params.pow_limit):
+                return "header proof of work is invalid"
+            parent = self._node(header.prev_hash)
+            if parent is None:
+                return None  # orphan header; retried when its parent arrives
+            height = parent.height + 1
+            expected = self._next_bits_for_node(parent, height)
+            if header.bits != expected:
+                return (
+                    f"wrong difficulty: header says {header.bits:#010x},"
+                    f" expected {expected:#010x}"
+                )
+            self.storage.put_header(
+                header, height=height, chainwork=parent.chainwork + block_work(header.bits)
+            )
+            return None
+
+    def _next_bits_for_node(self, parent: _ChainNode, height: int) -> int:
+        """The compact target required for a child of ``parent`` at ``height``."""
+        interval = self.params.retarget_interval
+        if height % interval != 0:
+            return parent.bits
+        first = self._node_at_height(parent.prev_hash, height - interval)
+        if first is None:  # pragma: no cover - the chain always reaches genesis
+            return parent.bits
+        return next_bits(
+            parent.bits,
+            parent.timestamp - first.timestamp,
+            target_timespan=self.params.target_timespan,
+            pow_limit=self.params.pow_limit,
+            max_adjustment_factor=self.params.max_adjustment_factor,
+        )
+
+    def _node_at_height(self, block_hash: bytes, height: int) -> _ChainNode | None:
+        """Walk back from ``block_hash`` (a block or header) to ``height``."""
+        node = self._node(block_hash)
+        while node is not None and node.height > height:
+            node = self._node(node.prev_hash)
+        return node
+
+    def header_tip(self) -> _ChainNode | None:
+        """Return the best known header, block or otherwise, if any.
+
+        The header chain and the block chain are the same chain: the block tip is
+        just the deepest header whose body we already have.  Whichever of the two
+        carries more work is the sync frontier.
+        """
+        best_header = self.storage.best_header()
+        header_node = None if best_header is None else self._node(best_header.hash)
+        block_node = self._node(self._tip.hash)
+        if header_node is None:
+            return block_node
+        if block_node is None:
+            return header_node
+        return header_node if header_node.chainwork > block_node.chainwork else block_node
+
+    def header_height(self) -> int:
+        """Height of the best header chain, or the block height if none are stored."""
+        tip = self.header_tip()
+        return self.height if tip is None else max(self.height, tip.height)
+
+    def headers_to_download(self, limit: int = 2000) -> list[bytes]:
+        """Return header hashes (ascending) whose blocks are still missing.
+
+        Walks back from the best header until a block we already have; the result
+        is the download queue for the header-first block phase.
+        """
+        tip = self.header_tip()
+        if tip is None:
+            return []
+        hashes: list[bytes] = []
+        node = tip
+        while node is not None and not self.has_block(node.hash) and len(hashes) < limit:
+            hashes.append(node.hash)
+            node = self._node(node.prev_hash)
+        hashes.reverse()
+        return hashes
+
+    def find_header_fork_height(self, locator: Iterable[bytes]) -> int:
+        """Return the height of the newest best-chain hash listed in ``locator``."""
+        known = set(locator)
+        node = self.header_tip()
+        while node is not None:
+            if node.hash in known:
+                return node.height
+            node = self._node(node.prev_hash)
+        return 0
+
+    def serialized_headers_after(
+        self, height: int, limit: int, stop_hash: bytes | None = None
+    ) -> list[bytes]:
+        """Return up to ``limit`` 80-byte headers above ``height``, ascending."""
+        tip = self.header_tip()
+        if tip is None:
+            return []
+        headers: list[bytes] = []
+        node = tip
+        while node is not None and node.height > height and len(headers) < limit:
+            header_bytes = self._header_bytes(node.hash)
+            if header_bytes is None:  # pragma: no cover - index and data go together
+                break
+            headers.append(header_bytes)
+            node = self._node(node.prev_hash)
+        headers.reverse()
+        if stop_hash is not None and stop_hash != b"\x00" * 32:
+            for index, raw in enumerate(headers):
+                if hash256(raw) == stop_hash:
+                    return headers[: index + 1]
+        return headers
+
+    def _header_bytes(self, block_hash: bytes) -> bytes | None:
+        entry = self.storage.get_entry(block_hash)
+        if entry is not None:
+            return entry.header.serialize()
+        header = self.storage.header_entry(block_hash)
+        if header is not None:
+            return header.header.serialize()
+        return None
+
+    def header_locator(self) -> list[bytes]:
+        """A locator built from the best header chain, for ``getheaders``."""
+        tip = self.header_tip()
+        if tip is None or tip.height <= self.height:
+            return self.locator()
+        hashes: list[bytes] = []
+        node = tip
+        step = 1
+        distance = 0
+        while node is not None:
+            if distance == 0:
+                hashes.append(node.hash)
+                if len(hashes) >= 10:
+                    step *= 2
+            distance += 1
+            if distance >= step:
+                distance = 0
+            node = self._node(node.prev_hash) if node.prev_hash != b"\x00" * 32 else None
+        if not hashes or hashes[-1] != self.params.genesis_hash:
+            hashes.append(self.params.genesis_hash)
         return hashes
 
     # --------------------------------------------------------- block acceptance

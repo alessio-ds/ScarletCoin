@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from scarletcoin import __version__
-from scarletcoin.core.block import Block
-from scarletcoin.core.chain import AddBlockResult, Blockchain, BlockStatus
+from scarletcoin.core.block import Block, BlockHeader
+from scarletcoin.core.chain import AddBlockResult, Blockchain, BlockStatus, ChainListener
 from scarletcoin.core.mempool import Mempool, MempoolEntry
 from scarletcoin.core.params import ChainParams, get_params
 from scarletcoin.core.storage import Storage
@@ -38,6 +38,7 @@ from scarletcoin.net import cipher, protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
 from scarletcoin.net.peer import Peer, PeerDisconnected, connect_to
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
+from scarletcoin.net.websocket import WebSocketHub
 
 __all__ = ["Node", "NodeConfig"]
 
@@ -94,6 +95,10 @@ class NodeConfig:
     rpc_cors: str | None = None
     """Value of the ``Access-Control-Allow-Origin`` header, or ``None`` for the
     default: ``*`` when the node serves public RPC, disabled otherwise."""
+    ws: bool = True
+    """Serve the live-update WebSocket endpoint for the explorer."""
+    ws_port: int = 0
+    """Port for the WebSocket endpoint; 0 picks a free port."""
     public_peers: tuple[str, ...] = ()
     """Other public nodes to tell clients about, on top of the network's own."""
     prune: int = 0
@@ -182,6 +187,11 @@ class Node:
         self._premature_reason = ""
         self._premature_logged_at = 0.0
 
+        self.ws_hub = WebSocketHub(port=config.ws_port)
+        """Live-update WebSocket endpoint, started only when ``config.ws``."""
+        if config.ws:
+            self.chain.add_listener(self._websocket_listener())
+
         for peer_address in config.connect:
             self._add_address(peer_address, source="config")
 
@@ -265,6 +275,21 @@ class Node:
 
     # ------------------------------------------------------------------ lifecycle
 
+    def _websocket_listener(self) -> ChainListener:
+        """Push block and reorg events to the explorer's WebSocket clients."""
+        node = self
+
+        class _Listener:
+            def block_connected(self, block: Block, height: int) -> None:
+                node.ws_hub.broadcast({"type": "block", "height": height, "hash": block.hash_hex()})
+
+            def block_disconnected(self, block: Block, height: int) -> None:
+                node.ws_hub.broadcast(
+                    {"type": "reorg", "height": height, "hash": block.hash_hex()}
+                )
+
+        return _Listener()
+
     def start(self) -> None:
         """Start the listener and the background threads."""
         logger.info(
@@ -280,6 +305,8 @@ class Node:
             self._spawn("seeds", self._bootstrap_seeds)
         self._spawn("connector", self._connect_loop)
         self._spawn("maintenance", self._maintenance_loop)
+        if self.config.ws:
+            self.ws_hub.start()
 
     def stop(self) -> None:
         """Stop every thread, disconnect peers and close the database."""
@@ -287,6 +314,7 @@ class Node:
             return
         logger.info("shutting down")
         self._stop.set()
+        self.ws_hub.stop()
         if self._listen_socket is not None:
             with contextlib.suppress(OSError):
                 self._listen_socket.close()
@@ -522,6 +550,10 @@ class Node:
                 peer.requested_blocks.discard(item.hash)
         elif isinstance(message, protocol.GetBlocks):
             self._on_getblocks(peer, message)
+        elif isinstance(message, protocol.GetHeaders):
+            self._on_getheaders(peer, message)
+        elif isinstance(message, protocol.Headers):
+            self._on_headers(peer, message)
         elif isinstance(message, protocol.BlockMessage):
             self._on_block(peer, message.block)
         elif isinstance(message, protocol.TxMessage):
@@ -677,6 +709,48 @@ class Node:
         if hashes:
             peer.send(protocol.Inv(tuple(InvItem(InvType.BLOCK, h) for h in hashes)))
 
+    def _on_getheaders(self, peer: Peer, message: protocol.GetHeaders) -> None:
+        """Answer ``getheaders`` with up to 2000 headers from the best chain."""
+        fork_height = self.chain.find_header_fork_height(message.locator)
+        headers = self.chain.serialized_headers_after(
+            fork_height, protocol.MAX_HEADERS_PER_MESSAGE, message.stop_hash
+        )
+        if headers:
+            peer.send(protocol.Headers(tuple(headers)))
+
+    def _on_headers(self, peer: Peer, message: protocol.Headers) -> None:
+        """Store announced headers and queue the blocks they describe."""
+        for raw in message.headers:
+            try:
+                header = BlockHeader.deserialize(raw)
+            except ValueError:
+                continue
+            error = self.chain.add_header(header)
+            if error:
+                logger.debug("%s sent a bad header: %s", peer, error)
+        self._queue_missing_blocks()
+        # Ask for more headers if the peer still looks ahead.
+        if self.chain.header_height() < peer.start_height:
+            self._maybe_sync(peer, force=True)
+
+    def _queue_missing_blocks(self) -> None:
+        """Hand the header chain's missing bodies to the connected peers."""
+        missing = self.chain.headers_to_download(2_000)
+        peers = [p for p in self.peers if p.handshake_done.is_set()]
+        if not missing or not peers:
+            return
+        for index, block_hash in enumerate(missing):
+            peer = peers[index % len(peers)]
+            if (
+                self.chain.has_block(block_hash)
+                or block_hash in peer.pending_blocks
+                or block_hash in peer.requested_blocks
+            ):
+                continue
+            peer.pending_blocks.append(block_hash)
+        for peer in peers:
+            self._request_blocks(peer)
+
     def _on_block(self, peer: Peer, block: Block) -> None:
         block_hash = block.hash()
         peer.requested_blocks.discard(block_hash)
@@ -690,9 +764,11 @@ class Node:
         elif result.status is BlockStatus.ORPHAN:
             self._maybe_sync(peer, force=True)
         if not peer.requested_blocks and not peer.pending_blocks:
+            # Nothing left from this peer: fetch the next headers, then more blocks.
             self._maybe_sync(peer, force=True)
         else:
             self._request_blocks(peer)
+        self._queue_missing_blocks()
 
     def _on_tx(self, peer: Peer, transaction: Transaction) -> None:
         peer.note_inventory(transaction.txid())
@@ -751,14 +827,14 @@ class Node:
                 self._maybe_sync(peer, force=True)
 
     def _maybe_sync(self, peer: Peer, *, force: bool = False) -> None:
-        """Ask ``peer`` for the blocks we are missing, if it looks ahead of us."""
+        """Ask ``peer`` for the headers we are missing, if it looks ahead of us."""
         if peer.closed:
             return
         if not force and peer.start_height <= self.chain.height:
             return
         if peer.requested_blocks or peer.pending_blocks:
             return
-        peer.send(protocol.GetBlocks(tuple(self.chain.locator())))
+        peer.send(protocol.GetHeaders(tuple(self.chain.header_locator())))
 
     # ------------------------------------------------------------- chain updates
 
@@ -801,6 +877,9 @@ class Node:
             entry.txid[::-1].hex(),
             entry.size,
             entry.fee,
+        )
+        self.ws_hub.broadcast(
+            {"type": "tx", "txid": entry.txid[::-1].hex(), "fee": entry.fee}
         )
         self._relay(InvItem(InvType.TX, entry.txid), source=source)
         return entry
@@ -1068,6 +1147,7 @@ class Node:
                 "public": self.config.rpc_public,
                 "public_mining": self.config.rpc_public_mining,
                 "public_url": self.config.rpc_advertise or "",
+                "ws_port": self.ws_hub.port if self.config.ws else 0,
                 "prune_target": self.config.prune,
             }
         )
