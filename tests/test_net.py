@@ -546,6 +546,7 @@ class TestExplorer:
             "/",
             "/blocks",
             "/blocks?from=2",
+            "/hashrate",
             "/mempool",
             "/peers",
             "/rich",
@@ -651,6 +652,38 @@ class TestExplorer:
         status, body = self._get(server.url + "/api/info")
         assert status == 200
         assert json.loads(body)["height"] == 1
+
+    def test_hashrate_page_renders_chart_and_history(self, rpc):
+        node, server, client = rpc
+        client.call("generate", 25)
+        status, body = self._get(server.url + "/hashrate")
+        assert status == 200
+        assert "Hash rate history" in body
+        assert "H/s" in body
+        assert "<svg" in body
+        assert "<polyline" in body
+        assert "Recent samples" in body
+        assert "Difficulty" in body
+
+        history = node.chain.hashrate_history(window=5)
+        assert history
+        heights = [point["height"] for point in history]
+        assert heights == sorted(heights)
+        assert all(point["hash_rate"] > 0 for point in history)
+        assert all(point["difficulty"] > 0 for point in history)
+
+    def test_hashrate_page_honours_window(self, rpc):
+        _, server, client = rpc
+        client.call("generate", 25)
+        status, body = self._get(server.url + "/hashrate?window=5")
+        assert status == 200
+        assert "5 blocks" in body
+
+    def test_hashrate_page_rejects_bad_window(self, rpc):
+        _, server, _ = rpc
+        status, body = self._get(server.url + "/hashrate?window=nonsense")
+        assert status == 404
+        assert "Not found" in body
 
     def test_explorer_escapes_hostile_content(self, rpc):
         _, server, _ = rpc

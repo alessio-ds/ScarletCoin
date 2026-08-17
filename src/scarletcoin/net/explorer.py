@@ -100,6 +100,7 @@ def _page(server: RpcServer, title: str, body: str) -> str:
   <nav>
     <a href="/">Overview</a>
     <a href="/blocks">Blocks</a>
+    <a href="/hashrate">Hash rate</a>
     <a href="/mempool">Mempool</a>
     <a href="/peers">Peers</a>
     <a href="/rich">Rich list</a>
@@ -342,6 +343,119 @@ def _overview(server: RpcServer) -> str:
         ["#Height", "Hash", "Time", "#Txs", "#Reward", "Miner"], blocks
     )
     return _page(server, "Overview", body)
+
+
+def _hashrate_chart(history: list[dict]) -> str:
+    """Render the hashrate history as an inline SVG line chart.
+
+    No external assets, matching the rest of the explorer: the chart is drawn
+    server-side, with the y-axis scaled linearly to the observed peak.
+    """
+    if not history:
+        return '<p class="empty">Not enough history to plot yet.</p>'
+    peak = max(point["hash_rate"] for point in history)
+    if peak <= 0:
+        return '<p class="empty">No measurable hashrate yet.</p>'
+
+    width, height = 1000, 260
+    pad_l, pad_r, pad_t, pad_b = 100, 12, 14, 24
+    inner_w = width - pad_l - pad_r
+    inner_h = height - pad_t - pad_b
+    t0 = history[0]["time"]
+    span = max(1, history[-1]["time"] - t0)
+
+    def x(point: dict) -> float:
+        return pad_l + (point["time"] - t0) / span * inner_w
+
+    def y(point: dict) -> float:
+        return pad_t + inner_h - (point["hash_rate"] / peak) * inner_h
+
+    grid = ""
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        yy = pad_t + inner_h - fraction * inner_h
+        grid += (
+            f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{width - pad_r}" y2="{yy:.1f}" '
+            f'stroke="#2e2825" stroke-width="1"/>'
+            f'<text x="{pad_l - 6}" y="{yy + 4:.1f}" fill="#97877f" font-size="11" '
+            f'text-anchor="end">{_hash_rate(peak * fraction)}</text>'
+        )
+
+    line_points = " ".join(f"{x(p):.1f},{y(p):.1f}" for p in history)
+    area = (
+        f"{x(history[0]):.1f},{pad_t + inner_h:.1f} "
+        f"{line_points} "
+        f"{x(history[-1]):.1f},{pad_t + inner_h:.1f}"
+    )
+    start = time.strftime("%Y-%m-%d", time.gmtime(history[0]["time"]))
+    end = time.strftime("%Y-%m-%d", time.gmtime(history[-1]["time"]))
+
+    return (
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Hash rate history" '
+        f'style="width:100%;height:auto;background:#1b1817;border:1px solid #2e2825;'
+        f'border-radius:8px;">'
+        f"{grid}"
+        f'<polygon points="{area}" fill="#e33a4e" opacity="0.12"/>'
+        f'<polyline points="{line_points}" fill="none" stroke="#e33a4e" stroke-width="2"/>'
+        f'<text x="{pad_l}" y="{height - 6:.1f}" fill="#97877f" font-size="11">{start}</text>'
+        f'<text x="{width - pad_r:.1f}" y="{height - 6:.1f}" fill="#97877f" font-size="11" '
+        f'text-anchor="end">{end}</text>'
+        f"</svg>"
+    )
+
+
+def _hashrate_page(server: RpcServer, query: dict[str, list[str]]) -> str:
+    chain = server.node.chain
+    window: int | None = None
+    points = 240
+    if "window" in query:
+        try:
+            window = int(query["window"][0])
+        except ValueError:
+            raise NotFound("window must be a number of blocks") from None
+    if "points" in query:
+        try:
+            points = max(1, min(int(query["points"][0]), 1000))
+        except ValueError:
+            raise NotFound("points must be a number") from None
+
+    history = chain.hashrate_history(window, points)
+    window = max(2, window or server.node.params.retarget_interval)
+
+    if history:
+        current = history[-1]["hash_rate"]
+        peak = max(point["hash_rate"] for point in history)
+        average = sum(point["hash_rate"] for point in history) / len(history)
+        difficulty_now = history[-1]["difficulty"]
+    else:
+        current = peak = average = 0.0
+        difficulty_now = chain.difficulty()
+
+    body = _cards(
+        [
+            ("Current hash rate", _hash_rate(current)),
+            ("Peak", _hash_rate(peak)),
+            ("Average", _hash_rate(average)),
+            ("Difficulty", f"{difficulty_now:.6g}"),
+            ("Measured over", f"{window} blocks"),
+        ]
+    )
+    body += "<h2>Hash rate history</h2>" + _hashrate_chart(history)
+
+    rows = [
+        [
+            _html(_height_link(point["height"]), numeric=True),
+            _text(_when(point["time"])),
+            _html(_hash_rate(point["hash_rate"]), numeric=True),
+            _text(f"{point['difficulty']:.6g}", numeric=True),
+        ]
+        for point in history[-30:]
+    ]
+    body += "<h2>Recent samples</h2>" + _rows(
+        ["#Height", "Time", "#Hash rate", "#Difficulty"],
+        rows,
+        empty="Not enough history to sample yet.",
+    )
+    return _page(server, "Hash rate", body)
 
 
 def _blocks_page(server: RpcServer, query: dict[str, list[str]]) -> str:
@@ -749,6 +863,8 @@ def render(server: RpcServer, path: str, query: dict[str, list[str]]) -> str:
         return _overview(server)
     if path == "/blocks":
         return _blocks_page(server, query)
+    if path == "/hashrate":
+        return _hashrate_page(server, query)
     if path == "/mempool":
         return _mempool_page(server)
     if path == "/peers":

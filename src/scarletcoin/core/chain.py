@@ -728,6 +728,60 @@ class Blockchain:
             ),
         }
 
+    def hashrate_history(self, window: int | None = None, points: int = 240) -> list[dict]:
+        """Sample the network hashrate across the chain's history.
+
+        The hashrate at each sample height is the work added by the previous
+        ``window`` blocks divided by the time they took — the same measure
+        :meth:`network_stats` reports, but evaluated at regular intervals back
+        through the chain instead of only at the tip.  Each sample also carries
+        the difficulty at that height, so the two can be read together.
+
+        Args:
+            window: How many blocks each sample averages over.  Defaults to one
+                retargeting period.
+            points: Upper bound on the number of samples returned; the chain is
+                sampled at evenly spaced heights, so a short chain simply returns
+                one sample per height.
+
+        Returns:
+            A list of ``{"height", "time", "hash_rate", "difficulty"}`` records,
+            oldest first.  Empty when the chain is shorter than ``window + 1``.
+            The genesis block is never part of a sample: its timestamp is a
+            nominal value, not the moment it was mined, so measuring hashrate
+            across it would be meaningless.
+        """
+        params = self.params
+        window = max(2, window or params.retarget_interval)
+        points = max(1, int(points))
+        tip = self._tip
+        if tip.height < window + 1:
+            return []
+
+        step = max(1, (tip.height - window) // points)
+        history: list[dict] = []
+        height = window + 1
+        while height <= tip.height:
+            entry = self.storage.get_chain_entry(height)
+            first = self.storage.get_chain_entry(height - window)
+            if entry is not None and first is not None and entry.timestamp > first.timestamp:
+                history.append(
+                    {
+                        "height": height,
+                        "time": entry.timestamp,
+                        "hash_rate": round(
+                            (entry.chainwork - first.chainwork)
+                            / (entry.timestamp - first.timestamp),
+                            2,
+                        ),
+                        "difficulty": difficulty(entry.bits, pow_limit=params.pow_limit),
+                    }
+                )
+            if height >= tip.height:
+                break
+            height = min(tip.height, height + step)
+        return history
+
     def stats(self) -> dict:
         """Return a summary of the chain, for RPC and the explorer."""
         utxo_count, supply = self.storage.utxo_stats()
