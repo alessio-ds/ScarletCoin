@@ -702,9 +702,7 @@ class WalletWindow(QtWidgets.QMainWindow):
                 "Write these words down and keep them secret. Anyone who has them "
                 "can spend the coins. They are shown only now:\n\n" + keystore.new_mnemonic,
             )
-        QtWidgets.QMessageBox.information(
-            self, "Wallet restored", f"Wallet created at\n{path}"
-        )
+        QtWidgets.QMessageBox.information(self, "Wallet restored", f"Wallet created at\n{path}")
         self._swap(keystore)
 
     def _swap(self, keystore: Keystore) -> None:
