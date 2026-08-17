@@ -66,7 +66,7 @@ class TestWalletWindow:
         window = WalletWindow(wallet.keystore, client)
         try:
             window.show()
-            window.send_address.setText(str(other_key.address(REGTEST.address_version)))
+            window.send_address.setText(str(other_key.address(REGTEST.stealth_version)))
             window.send_amount.setText("5")
             # Confirm the payment automatically instead of showing a dialog.
             sent: list[str] = []
@@ -443,7 +443,7 @@ class TestChoosingANode:
 class TestMinerWindow:
     def test_it_mines_and_stops(self, qt_app, rpc, key):
         _, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
+        address = str(key.address(REGTEST.stealth_version))
         window = MinerWindow(client, "regtest", address)
         try:
             window.show()

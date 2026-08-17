@@ -215,11 +215,10 @@ class TestPruning:
 
     def test_balances_are_untouched(self, chain, key):
         mine_and_add(chain, key, count=20)
-        pubkey_hash = key.public_key().hash160()
-        before = chain.storage.utxo_stats()
+        before = chain.storage.output_stats()
         chain.prune(2)
-        assert chain.storage.utxo_stats() == before
-        assert len(chain.storage.coins_of(pubkey_hash)) == 20
+        assert chain.storage.output_stats() == before
+        assert len(chain.storage.all_outputs()) == before[0]
 
     def test_a_pruned_chain_still_validates_and_extends(self, chain, key):
         mine_and_add(chain, key, count=20)

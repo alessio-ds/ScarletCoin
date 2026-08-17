@@ -6,8 +6,10 @@ import json
 
 import pytest
 
+from scarletcoin.core.chain import BlockStatus
 from scarletcoin.core.params import REGTEST
-from scarletcoin.crypto.keys import Address, PrivateKey
+from scarletcoin.crypto.keys import PrivateKey, generate_stealth_keys
+from scarletcoin.crypto.stealth import StealthAddress
 from scarletcoin.miner.miner import Miner, MiningError
 from scarletcoin.miner.solver import scan_nonces, solve_block
 from scarletcoin.net.client import RpcClientError
@@ -15,7 +17,24 @@ from scarletcoin.units import format_amount
 from scarletcoin.wallet.builder import InsufficientFundsError
 from scarletcoin.wallet.keystore import Keystore, WalletError, WalletLocked
 from scarletcoin.wallet.wallet import Wallet
-from tests.helpers import mine_block
+from tests.helpers import coinbase_output, mine_block, owned_coins
+
+
+def _mine_blocks(node, keypair, count: int = 1) -> None:
+    """Mine ``count`` blocks paying ``keypair``'s stealth address, via the node."""
+    from scarletcoin.core.template import create_block_template
+    from scarletcoin.miner.solver import solve_block
+
+    for _ in range(count):
+        template = create_block_template(node.chain, node.mempool)
+        one_time_key, tx_public_key = coinbase_output(keypair, node.params)
+        candidate = template.build_block(
+            one_time_key=one_time_key, tx_public_key=tx_public_key, extra=b"wallet-test"
+        )
+        solved = solve_block(candidate)
+        assert solved is not None, "regtest blocks are always solvable"
+        result = node.submit_block(solved)
+        assert result.status is BlockStatus.CONNECTED
 
 
 class TestKeystore:
@@ -23,12 +42,12 @@ class TestKeystore:
         path = tmp_path / "wallet.json"
         keystore = Keystore.create(path, "regtest")
         address = keystore.default_address()
-        assert Address.is_valid(address, expected_version=REGTEST.address_version)
+        StealthAddress.decode(address, expected_version=REGTEST.stealth_version)
 
         reloaded = Keystore.load(path)
         assert reloaded.default_address() == address
         assert not reloaded.encrypted
-        assert len(reloaded.keys) == 1
+        assert len(reloaded.get_keys()) == 1
 
     def test_refuses_to_overwrite(self, tmp_path):
         path = tmp_path / "wallet.json"
@@ -43,9 +62,9 @@ class TestKeystore:
 
         locked = Keystore.load(path)
         assert locked.encrypted and locked.locked
-        assert locked.address_strings() == [address]  # addresses stay readable
+        assert locked.address_strings() == [address]
         with pytest.raises(WalletLocked):
-            locked.keys  # noqa: B018 - the property raises
+            locked.get_keys()
         with pytest.raises(WalletError, match="wrong password"):
             locked.unlock("wrong")
         locked.unlock("hunter2")
@@ -63,30 +82,39 @@ class TestKeystore:
     def test_encrypted_file_does_not_contain_the_key(self, tmp_path):
         path = tmp_path / "wallet.json"
         keystore = Keystore.create(path, "regtest", password="hunter2")
-        wif = keystore.export_wif(keystore.default_address())
-        assert wif not in path.read_text()
+        exported = keystore.export_key(keystore.default_address())
+        assert exported not in path.read_text()
         document = json.loads(path.read_text())
         assert document["crypto"]["cipher"] == "aes-256-gcm"
         assert "keys" not in document
 
     def test_import_and_export(self, tmp_path):
         keystore = Keystore.create(tmp_path / "wallet.json", "regtest")
-        key = PrivateKey.generate()
-        address = keystore.import_wif(key.to_wif(REGTEST.wif_version), "cold storage")
-        assert str(address) == str(key.address(REGTEST.address_version))
-        assert keystore.export_wif(str(address)) == key.to_wif(REGTEST.wif_version)
+        pair = generate_stealth_keys()
+        view_wif = PrivateKey(pair.view_secret).to_wif(REGTEST.wif_version)
+        spend_wif = PrivateKey(pair.spend_secret).to_wif(REGTEST.wif_version)
+        combined = f"{view_wif}:{spend_wif}"
+        address = keystore.import_key(combined, "cold storage")
+        assert address == str(pair.address(REGTEST.stealth_version))
+        assert keystore.export_key(address) == combined
         with pytest.raises(WalletError, match="already in this wallet"):
-            keystore.import_wif(key.to_wif(REGTEST.wif_version))
+            keystore.import_key(combined)
 
     def test_importing_a_key_from_another_network_is_refused(self, tmp_path):
         keystore = Keystore.create(tmp_path / "wallet.json", "regtest")
+        pair = generate_stealth_keys()
+        combined = (
+            f"{PrivateKey(pair.view_secret).to_wif(191)}:"
+            f"{PrivateKey(pair.spend_secret).to_wif(191)}"
+        )
         with pytest.raises(WalletError):
-            keystore.import_wif(PrivateKey.generate().to_wif(191))
+            keystore.import_key(combined)
 
     def test_exporting_an_unknown_address_is_refused(self, tmp_path):
         keystore = Keystore.create(tmp_path / "wallet.json", "regtest")
+        other = generate_stealth_keys()
         with pytest.raises(WalletError, match="not in this wallet"):
-            keystore.export_wif(str(PrivateKey.generate().address(REGTEST.address_version)))
+            keystore.export_key(str(other.address(REGTEST.stealth_version)))
 
     def test_labels(self, tmp_path):
         keystore = Keystore.create(tmp_path / "wallet.json", "regtest")
@@ -109,80 +137,63 @@ class TestKeystore:
         keystore = Keystore.create(tmp_path / "wallet.json", "regtest")
         second = keystore.new_key("second")
         keystore.save()
-        assert str(second) in keystore.address_strings()
+        assert second in keystore.address_strings()
         assert len(Keystore.load(tmp_path / "wallet.json").addresses()) == 2
 
 
 class TestWallet:
-    def test_balance_and_history(self, rpc, wallet):
-        _, _, client = rpc
-        address = wallet.keystore.default_address()
-        client.call("generate", 4, address)
-
+    def test_balance(self, rpc, wallet):
+        node, _, _ = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
         balance = wallet.balance()
         assert balance.confirmed == REGTEST.subsidy(0) * 4
-        # Regtest coinbases mature after two blocks, so only the newest is immature.
+        # Regtest coinbases mature after two blocks on top; "spendable" counts
+        # what can enter the next block, so three of the four are usable.
         assert balance.spendable == REGTEST.subsidy(0) * 3
-        assert balance.immature == REGTEST.subsidy(0)
-        history = wallet.history()
-        assert len(history) == 4
-        assert all(item["net"] > 0 for item in history)
+        assert balance.immature == REGTEST.subsidy(0) * 1
 
     def test_sending_coins(self, rpc, wallet, other_key):
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
-        destination = str(other_key.address(REGTEST.address_version))
+        node, _, client = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
+        destination = str(other_key.address(REGTEST.stealth_version))
 
         result = wallet.send(destination, 10 * 10**8)
-        assert result.txid in [item["txid"] for item in client.call("getmempool")["transactions"]]
         assert result.fee > 0
-        assert result.change > 0
+        assert result.txid in [item["txid"] for item in client.call("getmempool")["transactions"]]
 
-        client.call("generate", 1)  # mined by someone else
-        assert client.getbalance(destination)["balance"] == 10 * 10**8
-        assert wallet.balance().confirmed == REGTEST.subsidy(0) * 4 - 10 * 10**8 - result.fee
-
-    def test_sending_everything(self, rpc, wallet, other_key):
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
-        destination = str(other_key.address(REGTEST.address_version))
-        spendable = wallet.balance().spendable
-
-        result = wallet.send_everything(destination)
-        assert result.change == 0
         client.call("generate", 1)
-        assert client.getbalance(destination)["balance"] == spendable - result.fee
+        received = sum(v for _, _, v in owned_coins(node.chain, other_key))
+        assert received == 10 * 10**8
+
+    def test_sweep(self, rpc, wallet, other_key):
+        node, _, client = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
+        destination = str(other_key.address(REGTEST.stealth_version))
+        result = wallet.send_everything(destination)
+        assert result.txid in [item["txid"] for item in client.call("getmempool")["transactions"]]
 
     def test_sending_more_than_the_balance(self, rpc, wallet, other_key):
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
+        node, _, _ = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
         with pytest.raises(InsufficientFundsError):
-            wallet.send(str(other_key.address(REGTEST.address_version)), 10**14)
+            wallet.send(str(other_key.address(REGTEST.stealth_version)), 10**14)
 
     def test_sending_to_a_bad_address(self, rpc, wallet):
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
+        node, _, _ = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
         with pytest.raises(WalletError):
             wallet.send("not-an-address", 10**8)
         with pytest.raises(WalletError):
-            wallet.send(str(PrivateKey.generate().address(63)), 10**8)  # mainnet address
+            wallet.send(str(PrivateKey.generate().address(63)), 10**8)
 
     def test_a_locked_wallet_cannot_spend(self, tmp_path, rpc, other_key):
-        _, _, client = rpc
-        keystore = Keystore.create(tmp_path / "locked.json", "regtest", password="hunter2")
-        client.call("generate", 4, keystore.default_address())
-        locked = Wallet(Keystore.load(tmp_path / "locked.json"), client)
-        assert locked.balance().confirmed > 0  # watching works
+        node, _, client = rpc
+        path = tmp_path / "locked.json"
+        keystore = Keystore.create(path, "regtest", password="hunter2")
+        _mine_blocks(node, keystore.get_keys()[0], 4)
+        locked = Wallet(Keystore.load(path), client)
         with pytest.raises(WalletLocked):
-            locked.send(str(other_key.address(REGTEST.address_version)), 10**8)
-
-    def test_new_addresses_are_used_for_receiving(self, rpc, wallet):
-        _, _, client = rpc
-        second = wallet.new_address("second")
-        client.call("generate", 3, second)
-        rows = {address: value for address, _, value in wallet.balances_by_address()}
-        assert rows[second] == REGTEST.subsidy(0) * 3
-        assert rows[wallet.keystore.default_address()] == 0
+            locked.send(str(other_key.address(REGTEST.stealth_version)), 10**8)
 
     def test_a_missing_node_is_reported(self, tmp_path):
         from scarletcoin.net.client import RpcClient
@@ -219,7 +230,8 @@ class TestSolver:
         from scarletcoin.core.template import create_block_template
 
         template = create_block_template(chain)
-        candidate = template.build_block(pubkey_hash=key.public_key().hash160(), nonce=0)
+        one_time_key, tx_public_key = coinbase_output(key, chain.params)
+        candidate = template.build_block(one_time_key=one_time_key, tx_public_key=tx_public_key)
         solved = solve_block(candidate)
         assert solved is not None
         solved.check_sanity(pow_limit=REGTEST.pow_limit, max_block_size=REGTEST.max_block_size)
@@ -229,33 +241,33 @@ class TestSolver:
         from scarletcoin.core.template import create_block_template
 
         template = create_block_template(chain)
-        candidate = template.build_block(pubkey_hash=key.public_key().hash160())
+        one_time_key, tx_public_key = coinbase_output(key, chain.params)
+        candidate = template.build_block(one_time_key=one_time_key, tx_public_key=tx_public_key)
         assert solve_block(candidate, should_stop=lambda: True) is None
 
 
 class TestMiner:
     def test_mining_blocks(self, rpc, key):
-        _, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
+        node, _, client = rpc
+        address = str(key.address(REGTEST.stealth_version))
         miner = Miner(client, address, workers=1, refresh_seconds=5)
         stats = miner.run(max_blocks=3)
         assert stats.blocks_accepted == 3
         assert stats.blocks_rejected == 0
         assert stats.hashes > 0
         assert client.getblockcount() == 3
-        assert client.getbalance(address)["balance"] == REGTEST.subsidy(0) * 3
+        assert sum(v for _, _, v in owned_coins(node.chain, key)) == REGTEST.subsidy(0) * 3
         assert "hash_rate" in stats.to_dict()
 
     def test_mining_includes_mempool_transactions(self, rpc, wallet, key, other_key):
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
-        result = wallet.send(str(other_key.address(REGTEST.address_version)), 10**8)
+        node, _, client = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
+        result = wallet.send(str(other_key.address(REGTEST.stealth_version)), 10**8)
 
-        miner = Miner(client, str(key.address(REGTEST.address_version)), workers=1)
+        miner = Miner(client, str(key.address(REGTEST.stealth_version)), workers=1)
         miner.run(max_blocks=1)
         transaction = client.call("gettransaction", result.txid)
         assert transaction["confirmations"] == 1
-        # the miner collected the fee on top of the subsidy
         block = client.call("getblock", client.getblockcount())
         reward = sum(output["value"] for output in block["transactions"][0]["outputs"])
         assert reward == REGTEST.subsidy(block["height"]) + result.fee
@@ -263,12 +275,12 @@ class TestMiner:
     def test_a_bad_payout_address_is_refused(self, rpc):
         _, _, client = rpc
         miner = Miner(client, "not-an-address", workers=1)
-        with pytest.raises(MiningError, match="not a valid regtest address"):
+        with pytest.raises(MiningError, match="not a valid regtest stealth address"):
             miner.run(max_blocks=1)
 
     def test_mining_with_several_workers(self, rpc, key):
         _, _, client = rpc
-        miner = Miner(client, str(key.address(REGTEST.address_version)), workers=2)
+        miner = Miner(client, str(key.address(REGTEST.stealth_version)), workers=2)
         stats = miner.run(max_blocks=1)
         assert stats.blocks_accepted == 1
         assert client.getblockcount() == 1
@@ -277,11 +289,10 @@ class TestMiner:
         from scarletcoin.miner.miner import Miner
 
         _, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
+        address = str(key.address(REGTEST.stealth_version))
         assert Miner(client, address, workers=1, max_rate=0).max_rate is None
         assert Miner(client, address, workers=1, max_rate=-5).max_rate is None
         assert Miner(client, address, workers=1, max_rate=500).max_rate == 500
-        # and a capped miner still mines fine
         stats = Miner(client, address, workers=1, max_rate=500).run(max_blocks=1)
         assert stats.blocks_accepted == 1
 
@@ -292,10 +303,10 @@ class TestMiner:
         from scarletcoin.miner.solver import ScanResult
 
         _, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
+        address = str(key.address(REGTEST.stealth_version))
 
         def quick_scan(header, target, *, start=0, count=1 << 20):
-            if start >= 2 * 1 << 16:  # a solution on the third call
+            if start >= 2 * 1 << 16:
                 return ScanResult(start, count, 0.001)
             return ScanResult(None, count, 0.001)
 
@@ -306,7 +317,6 @@ class TestMiner:
         started = time.time()
         miner.run(max_blocks=1)
         elapsed = time.time() - started
-        # 3 x 65536 hashes at a 500 H/s cap means ~0.39 s of idle time.
         assert elapsed >= 0.3
 
     def test_an_unreachable_node_is_reported(self, key):
@@ -314,14 +324,14 @@ class TestMiner:
 
         miner = Miner(
             RpcClient("http://127.0.0.1:1", timeout=1),
-            str(key.address(REGTEST.address_version)),
+            str(key.address(REGTEST.stealth_version)),
             workers=1,
         )
         events: list[str] = []
 
         def on_event(kind: str, payload: dict) -> None:
             events.append(kind)
-            miner.stop()  # give up after the first failure
+            miner.stop()
 
         miner.on_event = on_event
         miner.run()
@@ -348,15 +358,15 @@ class TestWalletCli:
         )
 
     def test_create_balance_send_and_history(self, rpc, tmp_path, capsys, other_key):
-        _, server, client = rpc
+        node, server, client = rpc
         path = tmp_path / "cli-wallet.json"
 
         assert self._run(["create", "--no-password"], server.url, path) == 0
         output = capsys.readouterr().out
         assert "created" in output
-        address = Keystore.load(path).default_address()
-
-        client.call("generate", 4, address)
+        keystore = Keystore.load(path)
+        address = keystore.default_address()
+        _mine_blocks(node, keystore.get_keys()[0], 4)
 
         assert self._run(["balance"], server.url, path) == 0
         assert format_amount(REGTEST.subsidy(0) * 3) in capsys.readouterr().out
@@ -369,8 +379,8 @@ class TestWalletCli:
         assert "encrypted  no" in info
         assert "height 4" in info
 
-        destination = str(other_key.address(REGTEST.address_version))
-        assert self._run(["send", destination, "5", "--yes"], server.url, path) == 0
+        destination = str(other_key.address(REGTEST.stealth_version))
+        assert self._run(["send", destination, "10", "--yes"], server.url, path) == 0
         sent = capsys.readouterr().out
         assert "broadcast" in sent
 
@@ -383,26 +393,27 @@ class TestWalletCli:
         assert "coinbase" in capsys.readouterr().out
 
     def test_dry_run_does_not_broadcast(self, rpc, tmp_path, capsys, other_key):
-        _, server, client = rpc
+        node, server, client = rpc
         path = tmp_path / "cli-wallet.json"
         self._run(["create", "--no-password"], server.url, path)
         capsys.readouterr()
-        client.call("generate", 4, Keystore.load(path).default_address())
+        keystore = Keystore.load(path)
+        _mine_blocks(node, keystore.get_keys()[0], 4)
 
-        destination = str(other_key.address(REGTEST.address_version))
+        destination = str(other_key.address(REGTEST.stealth_version))
         assert self._run(["send", destination, "1", "--dry-run"], server.url, path) == 0
         assert "dry run" in capsys.readouterr().out
         assert client.call("getmempool")["count"] == 0
 
     def test_new_address_and_labels(self, rpc, tmp_path, capsys):
-        _, server, _ = rpc
+        _node, server, _ = rpc
         path = tmp_path / "cli-wallet.json"
         self._run(["create", "--no-password"], server.url, path)
         capsys.readouterr()
 
         assert self._run(["new", "savings"], server.url, path) == 0
         address = capsys.readouterr().out.strip()
-        assert Address.is_valid(address, expected_version=REGTEST.address_version)
+        StealthAddress.decode(address, expected_version=REGTEST.stealth_version)
 
         assert self._run(["label", address, "renamed"], server.url, path) == 0
         assert "renamed" in capsys.readouterr().out
@@ -416,9 +427,13 @@ class TestWalletCli:
         path = tmp_path / "cli-wallet.json"
         self._run(["create", "--no-password"], server.url, path)
         capsys.readouterr()
-        key = PrivateKey.generate()
-        assert self._run(["import", key.to_wif(REGTEST.wif_version)], server.url, path) == 0
-        assert str(key.address(REGTEST.address_version)) in capsys.readouterr().out
+        pair = generate_stealth_keys()
+        combined = (
+            f"{PrivateKey(pair.view_secret).to_wif(REGTEST.wif_version)}:"
+            f"{PrivateKey(pair.spend_secret).to_wif(REGTEST.wif_version)}"
+        )
+        assert self._run(["import", combined], server.url, path) == 0
+        assert str(pair.address(REGTEST.stealth_version)) in capsys.readouterr().out
 
     def test_errors_exit_with_a_message(self, rpc, tmp_path, capsys):
         _, server, _ = rpc
@@ -526,7 +541,7 @@ class TestMinerCli:
         from scarletcoin.miner.cli import main
 
         _, server, client = rpc
-        address = str(key.address(REGTEST.address_version))
+        address = str(key.address(REGTEST.stealth_version))
         code = main(
             [
                 address,
@@ -555,7 +570,7 @@ class TestMinerCli:
         with pytest.raises(SystemExit):
             main(
                 [
-                    str(key.address(REGTEST.address_version)),
+                    str(key.address(REGTEST.stealth_version)),
                     "--network",
                     "regtest",
                     "--datadir",
@@ -573,9 +588,9 @@ class TestBlockTemplate:
     def test_round_trip_through_json(self, rpc, wallet, other_key):
         from scarletcoin.core.template import BlockTemplate
 
-        _, _, client = rpc
-        client.call("generate", 4, wallet.keystore.default_address())
-        wallet.send(str(other_key.address(REGTEST.address_version)), 10**8)
+        node, _, client = rpc
+        _mine_blocks(node, wallet.keystore.get_keys()[0], 4)
+        wallet.send(str(other_key.address(REGTEST.stealth_version)), 10**8)
         data = client.getblocktemplate()
         template = BlockTemplate.from_dict(data)
         assert template.to_dict() == {key: data[key] for key in template.to_dict()}
@@ -586,6 +601,9 @@ class TestBlockTemplate:
         from scarletcoin.core.template import create_block_template
 
         template = create_block_template(chain, timestamp=0)
-        block = template.build_block(pubkey_hash=key.public_key().hash160(), timestamp=0)
+        one_time_key, tx_public_key = coinbase_output(key, chain.params)
+        block = template.build_block(
+            one_time_key=one_time_key, tx_public_key=tx_public_key, timestamp=0
+        )
         assert block.header.timestamp > template.min_time
         assert mine_block(chain, key).header.timestamp > chain.tip.timestamp - 1

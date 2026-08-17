@@ -1,8 +1,11 @@
-# ScarletCoin protocol and consensus reference
+# ScarletCoin protocol and consensus reference (v3 — Anonymous)
 
-Everything here is normative: two implementations that agree on this document
-will agree on the same chain. Byte order is little-endian unless stated
-otherwise.
+ScarletCoin 3.0 replaces transparent transactions with linkable ring
+signatures and stealth addresses. Every transaction is private by default:
+the sender, the recipient and the link between payments are all hidden.
+Amounts remain visible so the monetary supply stays auditable.
+
+Byte order is little-endian unless stated otherwise.
 
 * [Units](#units)
 * [Hashes](#hashes)
@@ -30,27 +33,53 @@ always integers; no code path uses floating point for money.
 |---|---|---|
 | `sha256` | SHA-256 | building block |
 | `hash256` | `sha256(sha256(x))` | block hashes, transaction ids, Merkle trees, Base58Check checksums |
-| `hash160` | `hash256(x)[:20]` | public-key hashes in outputs and addresses |
 
-`hash160` deliberately does not use RIPEMD-160: it is missing from default
-OpenSSL 3 builds, and truncating a double SHA-256 gives the same 160-bit
-digest length with one primitive instead of two.
-
-Hashes are handled internally in their raw byte order and displayed
-**reversed** (big-endian hex), which is the convention users expect from block
-explorers.
+`hash160` and the transparent-address scheme are retired; all outputs now
+commit to a 33-byte compressed secp256k1 one-time public key.
 
 ## Keys and addresses
 
-* Private key: 32 bytes, interpreted as an integer in `[1, n)` on secp256k1.
-* Public key: always the 33-byte compressed SEC1 encoding (`0x02`/`0x03` prefix).
-* Signature: 64 bytes, `r || s`, both big-endian. Only canonical signatures are
-  valid: `1 ≤ r < n`, `1 ≤ s ≤ n/2`. High-`s` signatures are rejected, which
-  removes signature malleability.
-* Address: `Base58Check(version || hash160(compressed_public_key))`, where
-  `Base58Check(payload) = Base58(payload || hash256(payload)[:4])`.
-* Private key export ("WIF"): `Base58Check(wif_version || secret || 0x01)`.
-  The trailing byte marks the compressed public key, as in Bitcoin.
+ScarletCoin 3.0 uses a dual-key stealth-address scheme derived from
+CryptoNote. Every address is a pair of curve points:
+
+* View key `(a, A)` — `a·G = A`. The view key can *recognise* outputs that
+  belong to the address but cannot spend them.
+* Spend key `(b, B)` — `b·G = B`. The spend key, together with the view
+  key, can spend a recognised output.
+
+A sender picks a random ephemeral scalar `r` and produces a one-time public
+key `P` that only the recipient's wallet can recognise:
+
+```
+R    = r·G
+P    = H_s(r·A)·G  +  B
+```
+
+`H_s` is `hash256` reduced modulo the curve order. The transaction carries
+`R` (33 bytes, `tx_public_key`) once, and each output carries its own `P`.
+
+The recipient, who holds the private view key `a`, scans every transaction:
+
+```
+P' = H_s(a·R)·G  +  B
+```
+
+If `P' == P`, the output is theirs. The private spending key of that
+one-time output is:
+
+```
+x_spend = H_s(a·R)  +  b
+```
+
+**Keys:**
+* Private view key: 32 random bytes, interpreted as a secp256k1 scalar.
+* Private spend key: 32 random bytes, interpreted as a secp256k1 scalar.
+* Public view key `A` and public spend key `B`: compressed 33-byte SEC1
+  encoding (`0x02` / `0x03` prefix).
+
+**Address:** `Base58Check(stealth_version || A || B)` — two 33-byte
+compressed keys, plus a 4-byte checksum. The version byte distinguishes
+networks (see [Network parameters](#network-parameters)).
 
 ## Serialisation primitives
 
@@ -63,49 +92,76 @@ explorers.
 
 ## Transactions
 
-A transaction is serialised as a **body** followed by the **witnesses**:
+Every transaction is version 2. A transaction is serialised as a **body**
+followed by the **witnesses**:
 
 ```
 body:
-    uint32   version
+    uint32   version  (=2)
     varint   input count
       per input:
-        hash32  previous transaction id
-        uint32  previous output index
+        varint   ring size
+          per ring member:
+            [33]    one-time public key
+        [33]    key image
     varint   output count
       per output:
         uint64  value in scar
-        [20]    public-key hash
+        [33]    one-time public key
     uint32   lock_time
+    [33]     tx_public_key (R)        (zero-filled for none)
     varbytes coinbase data           (empty unless this is a coinbase)
 
-witnesses (one pair per input, same order):
-    varbytes public key   (33 bytes, or empty in a coinbase)
-    varbytes signature    (64 bytes, or empty in a coinbase)
+witnesses (one per input, same order):
+    varbytes ring signature           (CLSAG/MLSAG; empty in a coinbase)
 ```
 
 **Transaction id** = `hash256(body)`. Signatures are therefore *not* covered by
 the id: a transaction's identity is fixed the moment its inputs and outputs are
 decided.
 
-**Signature hash** for input `i` spending an output worth `v`:
+**Signature hash** for input `i`:
 
 ```
-hash256( varbytes("ScarletCoin/sighash/1") || body || uint32(i) || uint64(v) )
+hash256( varbytes("ScarletCoin/sighash/2") || body || uint32(i) )
 ```
 
-It commits to every input and output, to which input is being signed, and to the
-value being spent, so a signature cannot be replayed elsewhere.
+It commits to every input (ring members + key images), every output, the
+lock time, the ephemeral key `R` and the extra data, plus which input is
+being signed — so a signature cannot be replayed on another input or
+another transaction.
+
+**Ring signatures** use an LSAG (Linkable Spontaneous Anonymous Group)
+construction on secp256k1. The signature proves that the signer knows the
+discrete log of *one* public key in the ring, without revealing which one.
+The key image `K = x_s · H_p(P_s)` — where `H_p` is hash-to-point — makes
+the signature *linkable*: spending the same output twice produces the same
+key image, which the network rejects.
+
+The serialized signature is:
+
+* `varint` ring size `n`
+* `c_0`              — 32 bytes
+* `r_0 … r_{n-1}`    — n × 32 bytes
+* `K`                — 33 bytes (compressed key image)
+
+Ring size must be between 2 and 32 inclusive, with a target of 16 for
+adequate privacy. Decoy outputs are sampled with a recency-weighted gamma
+distribution over outputs of the same value, falling back to uniform
+random when not enough candidates exist.
 
 **Coinbase.** The first transaction of a block has exactly one input whose
-previous outpoint is `(0x00…00, 0xffffffff)` and whose witness is empty. Its
-`coinbase data` starts with the block height as a `uint32`, followed by up to 96
-free bytes (extra nonce, messages). Committing to the height makes every
-coinbase unique, so no two blocks can share a transaction id.
+ring is empty and whose key image is zeroed. Its `coinbase data` starts
+with the block height as a `uint32`, followed by up to 96 free bytes
+(extra nonce, messages). Committing to the height makes every coinbase
+unique.
+
+**Transaction version 1** (transparent pay-to-pubkey-hash) is retired.
+Any block containing a version-1 transaction is rejected by this build.
 
 ## Blocks
 
-The header is exactly 80 bytes:
+The header is exactly 80 bytes (unchanged from v2):
 
 ```
 uint32  version
@@ -121,37 +177,16 @@ uint32  nonce
 A block is the header followed by a `varint` transaction count and the
 transactions.
 
-**Merkle root.** Leaves are transaction ids in block order. At each level, if the
-number of nodes is odd the last one is duplicated, then adjacent pairs are
-combined with `hash256(left || right)`. Blocks containing duplicate transaction
-ids are invalid, which removes the ambiguity this duplication would otherwise
-allow.
+**Merkle root.** Leaves are transaction ids in block order. Duplicate
+transaction ids are invalid and remove the ambiguity of the odd-level
+duplication rule.
 
 ## Proof of work
 
-`bits` is Bitcoin's compact encoding: the top byte is an exponent, the low three
-bytes a mantissa, and
-
-```
-target = mantissa · 256^(exponent − 3)
-```
-
-A block is valid when the block hash, read as a **little-endian** integer, is
-less than or equal to `target`, and `target` is not easier than the network's
-`pow_limit`. A block's work is `2^256 / (target + 1)`; a chain's work is the sum
-over its blocks.
-
-**Retargeting.** At every height that is a multiple of `retarget_interval`:
-
-```
-first    = ancestor at (height − retarget_interval)
-observed = parent.timestamp − first.timestamp        clamped to
-           [target_timespan / 4, target_timespan · 4]
-target   = min(parent_target · observed / target_timespan, pow_limit)
-```
-
-where `target_timespan = target_spacing · retarget_interval`. At every other
-height the target is the parent's.
+Unchanged from v2. `bits` is Bitcoin's compact encoding, and a block is
+valid when the block hash, as a little-endian integer, is ≤ `target`.
+Retargeting adjusts difficulty every `retarget_interval` blocks towards
+the target spacing.
 
 ## Money supply
 
@@ -160,70 +195,72 @@ subsidy(height) = 50 · COIN >> (height / halving_interval)      (0 after 64 hal
 ```
 
 With `halving_interval = 210 000` the total ever created is just under
-21 000 000 SCT. A coinbase may pay *at most* `subsidy(height)` plus the fees of
-the other transactions in the block; paying less is allowed and destroys the
+21 000 000 SCT. A coinbase may pay *at most* `subsidy(height)` plus the
+fees of the other transactions in the block; paying less destroys the
 difference.
 
 ## Validation rules
 
-Validation happens in three stages, so that a block can be checked as far as
-possible before it is stored.
+Validation happens in three stages:
 
 **1. Sanity** (no context needed)
 
-* at least one transaction, and the first one is a coinbase;
-* exactly one coinbase;
-* serialised size at most `max_block_size` (1 MB);
-* the header hash meets the header's own target, which is not easier than `pow_limit`;
-* no duplicate transaction ids;
-* the Merkle root matches the transactions;
-* every transaction is well formed: at least one input and one output, no output
-  negative or above the money supply, no output value sum above it, no duplicate
-  inputs, no null outpoint outside a coinbase, coinbase data only in a coinbase,
-  witnesses exactly 33 and 64 bytes long.
+* At least one transaction, and the first one is a coinbase;
+* Exactly one coinbase;
+* Serialised size at most `max_block_size` (1 MB);
+* The header hash meets the header's own target, which is not easier than
+  `pow_limit`;
+* No duplicate transaction ids;
+* The Merkle root matches the transactions;
+* Every transaction is well formed: at least one input and one output, no
+  output negative or above `MAX_MONEY`, no output value sum above
+  `MAX_MONEY`, no duplicate ring members, ring size in `[2, 32]`,
+  coinbase data only in a coinbase, coinbase input has an empty ring and
+  no pre-computed signature.
 
 **2. Context** (needs the parent block only)
 
 * `bits` equals the value the retargeting rule requires;
 * `timestamp` is strictly greater than the median of the last 11 blocks;
 * `timestamp` is at most two hours ahead of the validating node's clock;
-* the height in the coinbase data equals the parent's height plus one.
+* The height in the coinbase data equals the parent's height plus one.
 
-**3. Connection** (needs the UTXO set at the parent)
+**3. Connection** (needs the output set at the parent)
 
-* every input spends an output that exists and is unspent, including outputs
-  created earlier *in the same block*;
-* a coinbase output may only be spent once `coinbase_maturity` blocks have been
-  built on top of the block that created it;
-* the revealed public key hashes to the output's `hash160`;
-* the signature is valid and canonical;
+* **Every ring member must exist** in the output set;
+* **All ring members of a given input must have the same value** — this
+  makes the input's value unambiguous without RingCT;
+* Every ring member must satisfy the coinbase-maturity rule (the validator
+  cannot tell which member is real, so every member is checked);
+* The key image must not already exist in the key-image set;
+* The ring signature must verify against the transaction's signature hash;
 * input value sum ≥ output value sum; the difference is the fee;
-* every transaction is final: `lock_time == 0` or `lock_time ≤ height`;
-* the coinbase pays at most subsidy plus fees.
+* Every transaction is final: `lock_time == 0` or `lock_time ≤ height`;
+* The coinbase pays at most subsidy plus fees.
 
-A node that already knows a block returns "duplicate"; a block whose parent is
-unknown is an "orphan", kept aside for a while and retried when its parent
-arrives.
+**Equal-value rule.** Because the validator does not know which ring member
+is being spent, the input value must be derivable without ambiguity: all
+ring members must reference outputs of identical value. The input value is
+that common value. This is the honest cost of leaving amounts visible; it
+is why Monero moved to RingCT.
 
 ## Chain selection
 
-The active chain is the stored branch with the greatest cumulative work. When a
-side branch overtakes the tip, the node walks back to the fork point,
-disconnects the blocks it is abandoning (restoring the coins they spent from
-per-block undo data), then connects the new branch block by block. The whole
-switch happens inside one database transaction: if a block on the new branch
-turns out to be invalid, everything is rolled back, the offending block and its
-descendants are marked unusable, and the previous chain stays active.
-Transactions from disconnected blocks go back to the mempool; those that are no
-longer valid are dropped.
+The active chain is the stored branch with the greatest cumulative work.
+Reorganisations are atomic database transactions: if a block on the new
+branch is invalid, everything rolls back.
+
+**Undo data.** Outputs are never removed from the output set when spent
+(the validator cannot determine which ring member was real). Only key
+images are stored. Disconnecting a block removes the outputs it created
+(by iterating its transactions) and the key images it recorded.
 
 ## Network parameters
 
 | | mainnet | testnet | regtest |
 |---|---|---|---|
 | Magic | `SCRL` | `SCRT` | `SCRR` |
-| Address version | 63 (`S…`) | 127 (`t…`) | 127 (`t…`) |
-| WIF version | 191 | 239 | 239 |
+| Stealth address version | 83 | 128 | 128 |
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | `target_spacing` | 60 s | 60 s | 10 s |
 | `retarget_interval` | 60 | 60 | 20 |
@@ -232,7 +269,8 @@ longer valid are dropped.
 | `halving_interval` | 210 000 | 210 000 | 210 000 |
 | `max_block_size` | 1 000 000 | 1 000 000 | 1 000 000 |
 | `min_relay_fee_per_kb` | 1 000 scar | 1 000 scar | 1 000 scar |
-| Genesis hash | `00000ca129aa591dffe251f7815ed4a2ae87db9005945842bd7297a869c9ba1f` | `00000761a924bc06afd611e52b7d4414e780f1a1bd0d9c1203992186a7cd41a5` | `3094ff7a10619c989c07fd4807368bf0b638ea0a62f5f8eb763c5485aa4a3d50` |
+| Ring size target | 16 | 16 | 16 |
+| Genesis hash | `00000dbfd8f9ec1b6eb641fc62b1a72f365fb78a66215ce3cde4dfc9a12f200b` | `00000e92a8619b3be43c2f0fe5b9114c9c30085d22e0e53a4c9ba030f6513515` | `405434a980b6e2cc564d14dd9af542b7cb466a57b2db5f20bc9674d8b74cec49` |
 
 ## Peer-to-peer protocol
 
@@ -243,11 +281,8 @@ Every message is framed the same way:
 [12]  command        ASCII, zero padded
 [4]   payload length uint32, at most 2 MiB
 [4]   checksum       hash256(payload)[:4]
-[…]   payload
+[...] payload
 ```
-
-Unknown commands are ignored, so the protocol can grow without breaking older
-nodes.
 
 | Command | Payload | Purpose |
 |---|---|---|
@@ -264,133 +299,45 @@ nodes.
 | `tx` | a serialised transaction | delivers a transaction |
 | `mempool` | — | asks for an announcement of the pool |
 
-**Handshake.** The connecting side sends `version`; the other answers with its
-own `version`; both then send `verack`. A node that sees its own nonce
-disconnects (it dialled itself). Only `version` and `verack` are accepted before
-the handshake completes.
+Unchanged from v2. Unknown commands are ignored, so the protocol can
+grow without breaking older nodes.
 
-**Synchronising.** After the handshake, a node behind its peer sends `getblocks`
-with a *locator*: the tip, then progressively sparser ancestors, ending at the
-genesis hash. The peer replies with an `inv` of up to 500 hashes on its active
-chain after the newest locator entry it recognises. Blocks are fetched with
-`getdata`, at most 64 in flight per peer, and the process repeats until the
-chains agree.
-
-**Relaying.** Newly accepted blocks and mempool transactions are announced with
-`inv` to every peer except the one they came from, skipping peers already known
-to have them.
-
-**Misbehaviour.** Invalid blocks cost a peer 50 points and protocol violations
-100; at 100 points the peer is disconnected and its address is banned for an
-hour. Peers silent for 60 seconds get a `ping`; silent for 180 seconds they are
-dropped.
+**Dandelion stem relay.** A transaction that originates at this node
+(via RPC, not from a peer) is announced to a single random outbound peer
+instead of being broadcast. That peer cannot distinguish the origin from
+an ordinary forwarder. After the next mempool re-announcement the
+transaction is broadcast normally. This is a simplified single-hop Dandelion
+stem phase that hides the origin of a transaction.
 
 ## JSON-RPC interface
 
-`POST /` or `POST /rpc`, JSON-RPC 2.0, single requests or batches. When a token
-is configured, requests must carry `Authorization: Bearer <token>`.
+`POST /` or `POST /rpc`, JSON-RPC 2.0. When a token is configured, requests
+must carry `Authorization: Bearer <token>`.
 
-| Method | Parameters | Returns |
-|---|---|---|
-| `getinfo` | — | node, chain and network status |
-| `getblockcount` | — | active chain height |
-| `getbestblockhash` | — | tip hash |
-| `getdifficulty` | — | current difficulty |
-| `getsupply` | — | circulating supply and UTXO count |
-| `getchainsize` | — | how many bytes the chain occupies, and per-block average |
-| `getnetworkstats` | `window` | block rate, hash rate, difficulty, retarget estimate |
-| `getpublicnodes` | — | base URLs of public nodes this one knows |
-| `getblockhash` | `height` | block hash |
-| `getblock` | `hash_or_height`, `verbose=true` | block with transactions |
-| `getblockheader` | `hash_or_height` | header fields |
-| `getrawblock` | `hash_or_height` | hex-encoded block |
-| `gettransaction` | `txid` | decoded transaction with confirmations |
-| `getrawtransaction` | `txid` | hex-encoded transaction |
-| `sendrawtransaction` | `hex` | txid, after validation and relay |
-| `getmempool` | — | pool contents with fees |
-| `validateaddress` | `address` | validity and public-key hash |
-| `getbalance` | `address` | confirmed, spendable and immature balance |
-| `getutxos` | `address` | unspent outputs |
-| `getaddresshistory` | `address`, `limit=100` | transactions touching the address |
-| `getrichlist` | `limit=10` | largest balances |
-| `getblocktemplate` | — | work for a miner |
-| `submitblock` | `hex` | acceptance status and height |
-| `getpeers` | — | connected peers |
-| `addpeer` | `host`, `port` | connect to a peer |
-| `getaddresses` | — | the address book |
-| `prune` | `keep=<--prune>`, `vacuum=false` | drop old block bodies; irreversible |
-| `stop` | — | shut the node down |
-| `generate` | `count=1`, `address=None` | mine blocks immediately (**regtest only**) |
+Public methods (answered without a token on a `--rpc-public` node):
+`getinfo`, `getblockcount`, `getbestblockhash`, `getdifficulty`,
+`getsupply`, `getchainsize`, `getnetworkstats`, `getpublicnodes`,
+`getblockhash`, `getblock`, `getblockheader`, `getrawblock`,
+`gettransaction`, `getrawtransaction`, `sendrawtransaction`,
+`getmempool`, `getoutputs`, `getkeyimages`.
 
-Everything down to and including `sendrawtransaction`, plus `getchainsize` and
-`getpublicnodes`, is in `PUBLIC_METHODS`: a node started with `--rpc-public`
-answers those without a token. `getblocktemplate` and `submitblock` join them only
-with `--rpc-public-mining`. `getpeers`, `addpeer`, `getaddresses`, `prune` and
-`stop` always need the token.
+Mining methods (`--rpc-public-mining`): `getblocktemplate`, `submitblock`.
 
-### How big the chain is
+Transparent-address methods (`getbalance`, `getutxos`,
+`getaddresshistory`, `getrichlist`, `validateaddress`) are retired.
 
-`getchainsize` and the size fields in `getinfo` distinguish three numbers:
-
-| Field | Meaning |
-|---|---|
-| `chain_bytes` | serialised blocks of the **active chain** — what every node carries |
-| `block_bytes` | the same, plus stored side branches |
-| `disk_bytes` | the node's database: blocks, undo data, indexes, UTXO set, SQLite overhead, and the write-ahead log |
-
-`chain_size`, `block_size` and `disk_size` are the same values pre-formatted
-(`"6.71 MB"`), so every front end spells a size the same way. On a pruned node
-`chain_bytes` counts what is actually stored, and `pruned_blocks` with
-`prune_height` says how much was dropped; `average_block_bytes` is measured only
-over blocks whose bodies are still there.
-
-### Pruning
-
-`prune` replaces the body of every block at or below `height - keep` with its
-80-byte header, and deletes that block's undo data and index entries. Genesis is
-never pruned. `keep` is raised to at least 2880 blocks (2 × `coinbase_maturity` on
-regtest). The header chain, the UTXO set and every balance are unaffected, so a
-pruned node validates and relays new blocks normally, but:
-
-* `getblock`, `getrawblock` and `gettransaction` fail for pruned data, and a
-  `getdata` from a peer is answered with `notfound`, so a pruned node cannot serve
-  a node syncing from scratch;
-* a reorganisation deeper than the horizon is impossible, because the undo data it
-  would need is gone.
-
-Databases written before this existed are migrated on first open (schema version 1
-→ 2 adds `blocks.pruned`); a database from a *newer* build is refused rather than
-guessed at.
-
-The same HTTP server answers `GET /api/info` with the `getinfo` document, and
-serves the HTML explorer at `/`, `/blocks`, `/block/<hash-or-height>`,
-`/tx/<txid>`, `/address/<address>`, `/mempool`, `/peers`, `/rich` and
-`/search?q=…`.
-
-A **block template** gives the miner everything except the coinbase:
-
-```json
-{
-  "height": 12, "previous_block": "…", "bits": "0x207fffff", "target": "…",
-  "min_time": 1700000011, "current_time": 1700000042,
-  "coinbase_value": 5000000475, "version": 1,
-  "transactions": ["<hex>", "…"]
-}
-```
-
-The miner builds its own coinbase paying `coinbase_value` to its address,
-computes the Merkle root over `[coinbase] + transactions`, and searches for a
-nonce. That way the node never handles the miner's keys and the miner can roll
-its extra nonce without asking for new work.
+The block explorer is served at `/`, `/blocks`, `/block/<hash-or-height>`,
+`/tx/<txid>`, `/mempool` and `/peers`. Address pages and the rich list are
+removed: balances can only be shown by a wallet that holds the view key.
 
 ## Wallet file format
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "network": "mainnet",
   "encrypted": true,
-  "addresses": [{"address": "S…", "label": "main", "created": 1700000000}],
+  "addresses": [{"address": "stealth:...", "label": "main", "created": 1700000000}],
   "crypto": {
     "kdf": "scrypt",
     "kdf_params": {"n": 65536, "r": 8, "p": 1, "salt": "<hex>"},
@@ -401,8 +348,6 @@ its extra nonce without asking for new work.
 }
 ```
 
-The plaintext inside `crypto` is a JSON list of `{"wif", "label", "created"}`.
-The additional authenticated data is `scarletcoin-wallet-v1:<network>`, so a
-wallet file cannot be replayed onto another network. Unencrypted wallets carry
-the same list in a top-level `keys` field instead. Addresses stay readable
-either way, which lets the wallet show balances while locked.
+The plaintext inside `crypto` is a JSON list of `{"view_wif", "spend_wif",
+"label", "created"}`. Each entry is a dual-key pair (view key + spend key).
+The associated data tag is `scarletcoin-wallet-v2:<network>`.

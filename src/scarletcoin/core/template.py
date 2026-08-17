@@ -1,10 +1,8 @@
-"""Block templates.
+"""Block templates (v2).
 
-A node hands a miner everything needed to build the next block *except* the
-coinbase: the miner supplies its own payout address and extra nonce, assembles
-the coinbase locally and computes the Merkle root itself.  That way the node
-never has to know the miner's keys and the miner is free to roll the extra nonce
-without asking for a new template.
+A node hands a miner everything needed to build the next block except the
+coinbase, which the miner assembles locally paying itself a one-time key
+derived from its own stealth address.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from scarletcoin.core.transaction import Transaction
 
 __all__ = ["BlockTemplate", "create_block_template"]
 
-#: Bytes reserved in every block for the coinbase transaction.
 COINBASE_RESERVE = 1_000
 
 
@@ -33,31 +30,30 @@ class BlockTemplate:
     prev_hash: bytes
     bits: int
     min_time: int
-    """The block timestamp must be strictly greater than this."""
     current_time: int
     coinbase_value: int
-    """Subsidy plus the fees of the included transactions."""
     transactions: tuple[Transaction, ...] = field(default_factory=tuple)
     version: int = 1
 
     @property
     def target(self) -> int:
-        """The target the block hash must not exceed."""
         return bits_to_target(self.bits)
 
     def build_block(
         self,
         *,
-        pubkey_hash: bytes,
+        one_time_key: bytes,
+        tx_public_key: bytes,
         extra: bytes = b"",
         timestamp: int | None = None,
         nonce: int = 0,
     ) -> Block:
-        """Assemble a candidate block paying the reward to ``pubkey_hash``."""
+        """Assemble a candidate block paying the reward to ``one_time_key``."""
         coinbase = build_coinbase(
             height=self.height,
             reward=self.coinbase_value,
-            pubkey_hash=pubkey_hash,
+            one_time_key=one_time_key,
+            tx_public_key=tx_public_key,
             extra=extra,
         )
         chosen = self.current_time if timestamp is None else timestamp
@@ -71,7 +67,6 @@ class BlockTemplate:
         )
 
     def to_dict(self) -> dict:
-        """Return a JSON-friendly representation (used by the RPC interface)."""
         return {
             "height": self.height,
             "previous_block": self.prev_hash[::-1].hex(),
@@ -86,7 +81,6 @@ class BlockTemplate:
 
     @classmethod
     def from_dict(cls, data: dict) -> BlockTemplate:
-        """Rebuild a template from its JSON representation."""
         return cls(
             height=int(data["height"]),
             prev_hash=bytes.fromhex(data["previous_block"])[::-1],

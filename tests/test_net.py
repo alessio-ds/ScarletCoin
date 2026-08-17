@@ -14,6 +14,7 @@ import pytest
 from scarletcoin import __version__
 from scarletcoin.core.chain import BlockStatus
 from scarletcoin.core.params import REGTEST
+from scarletcoin.crypto.hash_to_point import hash_to_point_bytes
 from scarletcoin.net import protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
 from scarletcoin.net.client import RpcClient, RpcClientError
@@ -21,7 +22,13 @@ from scarletcoin.net.node import Node, NodeConfig
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
 from scarletcoin.net.rpc import RpcServer
 from tests.conftest import wait_until
-from tests.helpers import mine_block, spend
+from tests.helpers import mine_block, spend, stealth_address
+
+
+def _mine_to(node, keypair, count: int = 1) -> None:
+    """Mine ``count`` blocks paying ``keypair``, by submitting solved blocks."""
+    for _ in range(count):
+        node.submit_block(mine_block(node.chain, keypair))
 
 
 class TestProtocol:
@@ -185,41 +192,31 @@ class TestRpc:
 
     def test_address_and_transaction_queries(self, rpc, key):
         _, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
-        client.call("generate", 3, address)
-
-        balance = client.getbalance(address)
-        assert balance["balance"] == REGTEST.subsidy(0) * 3
-        assert balance["immature"] > 0
-        utxos = client.getutxos(address)
-        assert len(utxos["utxos"]) == 3
-        assert utxos["utxos"][0]["coinbase"] is True
+        client.call("generate", 3)
 
         coinbase_txid = client.call("getblock", 1)["transactions"][0]["txid"]
         transaction = client.call("gettransaction", coinbase_txid)
         assert transaction["coinbase"] is True
         assert transaction["confirmations"] == 3
-        assert transaction["outputs"][0]["address"] == address
         assert bytes.fromhex(client.call("getrawtransaction", coinbase_txid))
 
-        history = client.getaddresshistory(address)
-        assert len(history["transactions"]) == 3
-        rich = client.call("getrichlist", 5)
-        assert rich[0]["address"] == address
+        outputs = client.call("getoutputs")
+        assert len(outputs) >= 3
+        images = client.call("getkeyimages")
+        assert isinstance(images, list)
 
     def test_validateaddress(self, rpc, key):
-        _, _, client = rpc
-        good = str(key.address(REGTEST.address_version))
-        assert client.call("validateaddress", good)["valid"] is True
-        assert client.call("validateaddress", "nonsense")["valid"] is False
-        mainnet = str(key.address(63))
-        assert client.call("validateaddress", mainnet)["valid"] is False
+        pytest.skip("validateaddress RPC method was retired for the anonymous v2 chain")
 
     def test_sending_a_raw_transaction(self, rpc, key, other_key):
         node, _, client = rpc
-        address = str(key.address(REGTEST.address_version))
-        client.call("generate", 4, address)
-        transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+        _mine_to(node, key, 4)
+        transaction = spend(
+            node.chain,
+            key,
+            stealth_address(other_key, node.chain.params),
+            10**8,
+        )
         txid = client.sendrawtransaction(transaction.serialize().hex())
         assert txid == transaction.txid_hex()
         pool = client.call("getmempool")
@@ -236,7 +233,11 @@ class TestRpc:
 
         template = BlockTemplate.from_dict(client.getblocktemplate())
         assert template.height == 1
-        candidate = template.build_block(pubkey_hash=key.public_key().hash160())
+        one_time_key = hash_to_point_bytes(b"regtest/template-test/otk")
+        tx_public_key = hash_to_point_bytes(b"regtest/template-test/epk")
+        candidate = template.build_block(
+            one_time_key=one_time_key, tx_public_key=tx_public_key
+        )
         solved = solve_block(candidate)
         result = client.submitblock(solved.serialize().hex())
         assert result["status"] == "connected"
@@ -306,7 +307,7 @@ class TestRpc:
 
     def test_named_parameters(self, rpc, key):
         _, _, client = rpc
-        client.call("generate", count=2, address=str(key.address(REGTEST.address_version)))
+        client.call("generate", count=2)
         assert client.getblockcount() == 2
 
     def test_generate_is_only_available_on_regtest(self, tmp_path):
@@ -324,13 +325,13 @@ class TestRpcClientRetry:
     """Transient connection drops are retried; real errors are not."""
 
     def _stub(self, monkeypatch, responses):
-        """Replace urlopen with a callable returning or raising from a queue."""
+        """Replace the opener's ``open`` with a callable returning or raising from a queue."""
         import contextlib
         from types import SimpleNamespace
 
         calls = []
 
-        def fake_open(request, timeout=None, context=None):
+        def fake_open(self, request, timeout=None):
             calls.append(1)
             outcome = responses.pop(0)
             if isinstance(outcome, Exception):
@@ -339,7 +340,7 @@ class TestRpcClientRetry:
             response = SimpleNamespace(read=lambda: payload)
             return contextlib.nullcontext(response)
 
-        monkeypatch.setattr("urllib.request.urlopen", fake_open)
+        monkeypatch.setattr("urllib.request.OpenerDirector.open", fake_open)
         return calls
 
     def test_retries_a_truncated_response(self, monkeypatch):
@@ -423,7 +424,7 @@ class TestPublicRpc:
         server = self._server(node, public=True)
         try:
             owner = RpcClient(server.url, token="secret", timeout=10)
-            owner.call("generate", 3, str(key.address(REGTEST.address_version)))
+            owner.call("generate", 3)
 
             anonymous = RpcClient(server.url, timeout=10)
             assert anonymous.getblockcount() == 3
@@ -432,9 +433,10 @@ class TestPublicRpc:
             assert stats["height"] == 3
             assert stats["difficulty"] > 0
             assert stats["blocks_last_day"] >= 3
-            assert anonymous.getbalance(str(key.address(REGTEST.address_version)))["balance"] > 0
             assert anonymous.call("getblock", 1)["height"] == 1
             assert anonymous.call("getmempool")["count"] == 0
+            outputs = anonymous.call("getoutputs")
+            assert isinstance(outputs, list)
         finally:
             server.stop()
             node.stop()
@@ -473,10 +475,13 @@ class TestPublicRpc:
         node.start()
         server = self._server(node, public=True)
         try:
-            RpcClient(server.url, token="secret", timeout=10).call(
-                "generate", 4, str(key.address(REGTEST.address_version))
+            _mine_to(node, key, 4)
+            transaction = spend(
+                node.chain,
+                key,
+                stealth_address(other_key, node.chain.params),
+                10**8,
             )
-            transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
             anonymous = RpcClient(server.url, timeout=10)
             assert (
                 anonymous.sendrawtransaction(transaction.serialize().hex())
@@ -517,13 +522,11 @@ class TestPublicRpc:
             "getinfo",
             "getblockcount",
             "getnetworkstats",
-            "getbalance",
-            "getutxos",
-            "getaddresshistory",
+            "getoutputs",
+            "getkeyimages",
             "sendrawtransaction",
         }
         assert needed <= PUBLIC_METHODS
-        # and nothing that controls the node
         assert not PUBLIC_METHODS & {"stop", "generate", "addpeer", "submitblock"}
 
 
@@ -537,9 +540,13 @@ class TestExplorer:
 
     def test_pages_render(self, rpc, key, other_key):
         node, server, client = rpc
-        address = str(key.address(REGTEST.address_version))
-        client.call("generate", 4, address)
-        transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+        _mine_to(node, key, 4)
+        transaction = spend(
+            node.chain,
+            key,
+            stealth_address(other_key, node.chain.params),
+            10**8,
+        )
         client.sendrawtransaction(transaction.serialize().hex())
 
         for path in (
@@ -548,12 +555,9 @@ class TestExplorer:
             "/blocks?from=2",
             "/mempool",
             "/peers",
-            "/rich",
             "/block/1",
             f"/block/{client.call('getblockhash', 1)}",
             f"/tx/{transaction.txid_hex()}",
-            f"/address/{address}",
-            f"/search?q={address}",
             "/search?q=1",
             f"/search?q={transaction.txid_hex()}",
         ):
@@ -588,7 +592,7 @@ class TestExplorer:
 
     def test_a_pruned_block_says_so_instead_of_looking_missing(self, rpc, key):
         node, server, client = rpc
-        client.call("generate", 20, str(key.address(REGTEST.address_version)))
+        client.call("generate", 20)
         node.chain.prune(2)
 
         status, body = self._get(server.url + "/block/1")
@@ -604,7 +608,7 @@ class TestExplorer:
 
     def test_missing_pages_answer_404(self, rpc):
         _, server, _ = rpc
-        for path in ("/nowhere", "/block/999", "/tx/" + "00" * 32, "/address/nonsense"):
+        for path in ("/nowhere", "/block/999", "/tx/" + "00" * 32, "/rich", "/address/nonsense"):
             status, body = self._get(server.url + path)
             assert status == 404, path
             assert "Not found" in body
@@ -612,19 +616,21 @@ class TestExplorer:
     def test_table_cells_render_as_markup_not_as_source(self, rpc, key, other_key):
         """Amounts and links inside tables must not arrive HTML-escaped."""
         node, server, client = rpc
-        address = str(key.address(REGTEST.address_version))
-        client.call("generate", 4, address)
-        transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+        _mine_to(node, key, 4)
+        transaction = spend(
+            node.chain,
+            key,
+            stealth_address(other_key, node.chain.params),
+            10**8,
+        )
         client.sendrawtransaction(transaction.serialize().hex())
-        client.call("generate", 1, address)
+        client.call("generate", 1)
 
         with_amounts = (
             "/",
             "/blocks",
-            "/rich",
             "/block/5",
             f"/tx/{transaction.txid_hex()}",
-            f"/address/{address}",
         )
         for path in (*with_amounts, "/peers"):
             status, body = self._get(server.url + path)
@@ -637,8 +643,13 @@ class TestExplorer:
 
     def test_mempool_page_shows_amounts_as_markup(self, rpc, key, other_key):
         node, server, client = rpc
-        client.call("generate", 4, str(key.address(REGTEST.address_version)))
-        transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+        _mine_to(node, key, 4)
+        transaction = spend(
+            node.chain,
+            key,
+            stealth_address(other_key, node.chain.params),
+            10**8,
+        )
         client.sendrawtransaction(transaction.serialize().hex())
         status, body = self._get(server.url + "/mempool")
         assert status == 200

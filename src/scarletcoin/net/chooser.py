@@ -18,9 +18,11 @@ from pathlib import Path
 
 from scarletcoin.cli_common import (
     NodeConnection,
+    die,
     forget_connection,
     load_connection,
     local_url,
+    parse_proxy,
     read_rpc_token,
     save_connection,
 )
@@ -387,4 +389,10 @@ def _remember(args: argparse.Namespace, connection: NodeConnection) -> NodeConne
 def resolve_client(args: argparse.Namespace, *, for_mining: bool = False) -> RpcClient:
     """Return a client for whichever node :func:`resolve_connection` settles on."""
     connection = resolve_connection(args, for_mining=for_mining)
+    try:
+        parsed = parse_proxy(getattr(args, "proxy", None))
+    except ValueError as exc:
+        die(str(exc))
+    if parsed is not None:
+        connection.proxy_host, connection.proxy_port = parsed
     return connection.client(timeout=getattr(args, "timeout", 30.0))

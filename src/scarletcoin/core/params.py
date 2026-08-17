@@ -23,14 +23,17 @@ from scarletcoin.core.block import Block
 from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.pow import bits_to_target
 from scarletcoin.core.transaction import MAX_MONEY, Transaction
+from scarletcoin.crypto.hash_to_point import hash_to_point_bytes
 
 __all__ = ["COIN", "MAX_MONEY", "NETWORKS", "ChainParams", "get_params", "network_names"]
 
 #: Smallest indivisible units in one ScarletCoin.  The unit is called a "scar".
 COIN: Final[int] = 100_000_000
 
-#: Genesis outputs pay this (provably unspendable) hash: nobody owns the genesis coins.
-_UNSPENDABLE_HASH: Final[bytes] = b"\x00" * 20
+#: Genesis outputs pay this one-time key; nobody owns it.
+_UNSPENDABLE_KEY: Final[bytes] = hash_to_point_bytes(b"ScarletCoin/genesis/unspendable")
+#: The genesis coinbase's ephemeral key; nobody scans the genesis block.
+_GENESIS_EPHEMERAL: Final[bytes] = hash_to_point_bytes(b"ScarletCoin/genesis/ephemeral")
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class ChainParams:
     magic: bytes
     address_version: int
     wif_version: int
+    stealth_version: int
     default_p2p_port: int
     default_rpc_port: int
 
@@ -123,7 +127,8 @@ class ChainParams:
         return build_coinbase(
             height=0,
             reward=self.subsidy(0),
-            pubkey_hash=_UNSPENDABLE_HASH,
+            one_time_key=_UNSPENDABLE_KEY,
+            tx_public_key=_GENESIS_EPHEMERAL,
             extra=self.genesis_message,
         )
 
@@ -154,8 +159,9 @@ _GENESIS_MESSAGE: Final[bytes] = b"ScarletCoin: a small chain, honestly built"
 MAINNET = ChainParams(
     name="mainnet",
     magic=b"SCRL",
-    address_version=63,  # addresses start with "S"
+    address_version=63,  # legacy transparent addresses start with "S" (retired)
     wif_version=191,
+    stealth_version=83,  # dual-key stealth addresses
     default_p2p_port=20333,
     default_rpc_port=20332,
     target_spacing=60,
@@ -163,26 +169,18 @@ MAINNET = ChainParams(
     pow_limit_bits=0x1E0FFFFF,
     genesis_timestamp=1_700_000_000,
     genesis_bits=0x1E0FFFFF,
-    genesis_nonce=366_905,
+    genesis_nonce=853944,
     genesis_message=_GENESIS_MESSAGE,
-    # Long-lived host names of the network's public nodes. A name may hold
-    # several A/AAAA records; a starting node tries all of them and then learns
-    # the rest of the network by gossip. Port 20333 is assumed when omitted.
-    # The literal address is a fallback for when DNS is broken, filtered, or
-    # answered by a proxy that cannot carry the peer-to-peer protocol.
     seeds=("scarletcoin.remotewire.net", "45.126.126.139"),
-    # Nodes that serve the public RPC methods over HTTPS, so a wallet or a miner
-    # can be useful before it has a chain of its own. Whichever of these answers
-    # first is asked for the others, so this list only has to get a client
-    # started, not stay complete.
     public_nodes=("https://scarletcoin.remotewire.net",),
 )
 
 TESTNET = ChainParams(
     name="testnet",
     magic=b"SCRT",
-    address_version=127,  # addresses start with "t"
+    address_version=127,
     wif_version=239,
+    stealth_version=128,
     default_p2p_port=30333,
     default_rpc_port=30332,
     target_spacing=60,
@@ -191,7 +189,7 @@ TESTNET = ChainParams(
     coinbase_maturity=20,
     genesis_timestamp=1_700_000_001,
     genesis_bits=0x1E0FFFFF,
-    genesis_nonce=3_460_012,
+    genesis_nonce=1872671,
     genesis_message=_GENESIS_MESSAGE + b" (testnet)",
     seeds=(),
 )
@@ -201,6 +199,7 @@ REGTEST = ChainParams(
     magic=b"SCRR",
     address_version=127,
     wif_version=239,
+    stealth_version=128,
     default_p2p_port=40333,
     default_rpc_port=40332,
     target_spacing=10,

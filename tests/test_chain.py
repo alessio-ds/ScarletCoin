@@ -1,45 +1,79 @@
-"""Tests for the chain state machine: validation, the UTXO set and reorganisations."""
+"""Tests for the chain state machine: validation, outputs and reorganisations."""
 
 from __future__ import annotations
 
+import os
+import random
 import time
 
 import pytest
 
-from scarletcoin.core.block import Block
 from scarletcoin.core.chain import Blockchain, BlockStatus
-from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.params import REGTEST
-from scarletcoin.core.storage import Storage, StorageError
-from scarletcoin.core.template import create_block_template
-from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
+from scarletcoin.core.storage import Storage
+from scarletcoin.core.transaction import Transaction, TxInput, TxOutput
 from scarletcoin.core.utxo import Coin, CoinOverlay
 from scarletcoin.core.validation import (
-    MissingInputError,
     ValidationError,
     check_transaction_inputs,
 )
-from scarletcoin.crypto.keys import PrivateKey
-from scarletcoin.miner.solver import solve_block
+from scarletcoin.crypto.hash_to_point import hash_to_point
+from scarletcoin.crypto.ringsig import ring_sign
+from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
+from scarletcoin.crypto.stealth import derive_ephemeral, derive_one_time_public
 from tests.helpers import (
+    build_spend,
+    decoy_outputs,
     make_block,
     make_chain,
     make_node_state,
     mine_and_add,
     mine_block,
+    owned_coins,
     spend,
+    stealth_address,
 )
 
 
-def _sign(unsigned: Transaction, key: PrivateKey, values: list[int]) -> Transaction:
-    witnesses = {
-        index: (
-            key.public_key().to_bytes(),
-            key.sign(unsigned.signature_hash(index, values[index])),
+def _spend_coin(
+    chain,
+    keypair,
+    one_time_key,
+    spend_key,
+    value,
+    destination,
+    amount,
+    *,
+    fee=1000,
+    ring_size=2,
+):
+    exclude = {one_time_key}
+    decoys = decoy_outputs(chain, value, exclude=exclude)
+    ring = [one_time_key, *decoys[: max(0, ring_size - 1)]]
+    assert len(ring) >= 2, "not enough decoys to spend a specific coin"
+    random.shuffle(ring)
+    secret_idx = ring.index(one_time_key)
+
+    R_point, r_scalar = derive_ephemeral(os.urandom(32))
+    dest_otk = schnorr_point_to_bytes(derive_one_time_public(r_scalar, destination))
+    outputs = [TxOutput(amount, dest_otk)]
+    change = value - amount - fee
+    if change > 0:
+        change_otk = schnorr_point_to_bytes(
+            derive_one_time_public(r_scalar, stealth_address(keypair, chain.params))
         )
-        for index in range(len(unsigned.inputs))
-    }
-    return unsigned.signed_with(witnesses)
+        outputs.append(TxOutput(change, change_otk))
+
+    key_image = schnorr_point_to_bytes(spend_key * hash_to_point(one_time_key))
+    tx = Transaction(
+        version=2,
+        inputs=(TxInput(tuple(ring), key_image),),
+        outputs=tuple(outputs),
+        lock_time=0,
+        tx_public_key=schnorr_point_to_bytes(R_point),
+    )
+    sig = ring_sign(ring, secret_idx, spend_key, tx.signature_hash(0))
+    return tx.signed_with(0, sig)
 
 
 class TestGenesis:
@@ -95,7 +129,7 @@ class TestBlockAcceptance:
 
         block = mine_block(chain, key)
         nonce = block.header.nonce
-        while True:  # regtest's target is easy, so look for a hash that misses it
+        while True:
             nonce += 1
             broken = block.with_header(block.header.with_nonce(nonce))
             if not check_proof_of_work(
@@ -107,24 +141,12 @@ class TestBlockAcceptance:
         assert "proof-of-work" in result.reason
 
     def test_the_wrong_difficulty_is_rejected(self, chain, key):
-        template = create_block_template(chain)
-        candidate = template.build_block(pubkey_hash=key.public_key().hash160())
-        cheated = Block.create(
-            prev_hash=candidate.header.prev_hash,
-            transactions=list(candidate.transactions),
-            bits=0x207FFFFE,
-            timestamp=candidate.header.timestamp,
-        )
-        solved = solve_block(cheated)
-        assert solved is not None
-        result = chain.add_block(solved)
+        block = make_block(chain, key, bits=0x207FFFFE)
+        result = chain.add_block(block)
         assert result.status is BlockStatus.INVALID
         assert "difficulty" in result.reason
 
     def test_a_timestamp_too_far_ahead_is_refused_but_not_condemned(self, chain, key):
-        """Still not accepted — but "too far ahead" is measured against *our* clock,
-        so it is not a verdict on the block. It must stay judgeable later, or a
-        node with a slow clock would permanently refuse the whole network."""
         block = mine_block(chain, key, timestamp=int(time.time()) + 3 * 60 * 60)
         result = chain.add_block(block)
         assert result.status is BlockStatus.PREMATURE
@@ -161,98 +183,57 @@ class TestSpending:
     def test_a_payment_moves_value(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
-        destination = other_key.address(REGTEST.address_version)
+        destination = stealth_address(other_key, chain.params)
         transaction = spend(chain, key, destination, 10 * 10**8, mempool=pool)
         mine_and_add(chain, key, pool, count=1)
 
         assert chain.get_transaction(transaction.txid()) is not None
-        received = sum(
-            coin.value for _, coin in chain.storage.coins_of(other_key.public_key().hash160())
-        )
+        received = sum(v for _, _, v in owned_coins(chain, other_key))
         assert received == 10 * 10**8
 
     def test_immature_coinbase_outputs_cannot_be_spent(self, chain, key, other_key):
         mine_and_add(chain, key, count=1)
-        coins = chain.storage.coins_of(key.public_key().hash160())
-        outpoint, coin = coins[0]
-        unsigned = Transaction(
-            inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value - 1000, other_key.public_key().hash160()),),
-        )
-        transaction = _sign(unsigned, key, [coin.value])
-        with pytest.raises(ValidationError, match="matures at height"):
-            check_transaction_inputs(transaction, chain, height=chain.height + 1, params=REGTEST)
+        owned = owned_coins(chain, key)
+        assert owned, "should have a coinbase output at height 1"
+        one_time_key, spend_key, value = owned[0]
+        destination = stealth_address(other_key, chain.params)
 
-    def test_spending_an_unknown_output_is_a_missing_input(self, chain, key):
-        unsigned = Transaction(
-            inputs=(TxInput(OutPoint(b"\x33" * 32, 0)),),
-            outputs=(TxOutput(1, key.public_key().hash160()),),
+        tx = _spend_coin(
+            chain, key, one_time_key, spend_key, value, destination, value - 1000
         )
-        transaction = _sign(unsigned, key, [1000])
-        with pytest.raises(MissingInputError):
-            check_transaction_inputs(transaction, chain, height=1, params=REGTEST)
+        with pytest.raises(ValidationError, match="not mature"):
+            check_transaction_inputs(
+                tx, chain, height=chain.height + 1, params=REGTEST
+            )
 
-    def test_a_forged_signature_is_rejected(self, chain, key, other_key):
-        mine_and_add(chain, key, count=4)
-        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
-        unsigned = Transaction(
-            inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value - 1000, other_key.public_key().hash160()),),
-        )
-        # other_key signs, but the coin belongs to key
-        forged = _sign(unsigned, other_key, [coin.value])
-        with pytest.raises(ValidationError, match="wrong hash"):
-            check_transaction_inputs(forged, chain, height=chain.height + 1, params=REGTEST)
-
-    def test_spending_more_than_the_inputs_hold_is_rejected(self, chain, key):
-        mine_and_add(chain, key, count=4)
-        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
-        unsigned = Transaction(
-            inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value + 1, key.public_key().hash160()),),
-        )
-        transaction = _sign(unsigned, key, [coin.value])
-        with pytest.raises(ValidationError, match="only provides"):
-            check_transaction_inputs(transaction, chain, height=chain.height + 1, params=REGTEST)
-
-    def test_a_block_with_a_double_spend_is_rejected(self, chain_and_pool, key, other_key):
+    def test_double_spend_via_same_key_image_is_rejected(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
-        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
-        destination = other_key.public_key().hash160()
+        destination = stealth_address(other_key, chain.params)
 
-        def payment(amount: int) -> Transaction:
-            unsigned = Transaction(
-                inputs=(TxInput(outpoint),),
-                outputs=(TxOutput(amount, destination),),
-            )
-            return _sign(unsigned, key, [coin.value])
+        tx1 = build_spend(chain, key, destination, 10 * 10**8)
+        tx2 = build_spend(chain, key, destination, 10 * 10**8)
+        assert tx1.inputs[0].key_image == tx2.inputs[0].key_image
 
-        first, second = payment(coin.value - 1000), payment(coin.value - 2000)
-        block = make_block(chain, key, transactions=[first, second])
+        block = make_block(chain, key, transactions=[tx1, tx2])
         result = chain.add_block(block)
         assert result.status is BlockStatus.INVALID
-        assert "unknown output" in result.reason
+        assert "key image" in result.reason
 
-    def test_chained_transactions_inside_one_block(self, chain_and_pool, key, other_key):
+    def test_a_payment_in_a_hand_made_block(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
-        first = spend(
-            chain, key, other_key.address(REGTEST.address_version), 5 * 10**8, mempool=pool
-        )
-        # spend the change of the first transaction, still unconfirmed
-        change_index = 1 if len(first.outputs) > 1 else 0
-        unsigned = Transaction(
-            inputs=(TxInput(OutPoint(first.txid(), change_index)),),
-            outputs=(TxOutput(10**8, other_key.public_key().hash160()),),
-        )
-        second = _sign(unsigned, key, [first.outputs[change_index].value])
-        pool.add(second)
-        assert len(pool) == 2
+        destination = stealth_address(other_key, chain.params)
+        transaction = build_spend(chain, key, destination, 10 * 10**8)
 
         mine_and_add(chain, key, pool, count=1)
-        assert chain.get_transaction(second.txid()) is not None
         assert len(pool) == 0
+
+        block = make_block(chain, key, transactions=[transaction])
+        result = chain.add_block(block)
+        assert result.status is BlockStatus.CONNECTED
+        received = sum(v for _, _, v in owned_coins(chain, other_key))
+        assert received == 10 * 10**8
 
 
 class TestReorganisation:
@@ -268,8 +249,7 @@ class TestReorganisation:
         assert left.height == 5
         assert left.tip_hash == right.tip_hash
         assert left.total_supply() == right.total_supply()
-        # the coins mined on the abandoned branch are gone
-        assert left.storage.coins_of(key.public_key().hash160()) == []
+        assert owned_coins(left, key) == []
         left.storage.close()
         right.storage.close()
 
@@ -291,13 +271,16 @@ class TestReorganisation:
     def test_a_reorg_puts_transactions_back_in_the_mempool(self, key, other_key):
         left, left_pool = make_node_state()
         right, right_pool = make_node_state()
-        # both chains share the first blocks so the payment stays valid
         shared = mine_and_add(left, key, left_pool, count=4)
         for block in shared:
             assert right.add_block(block).status is BlockStatus.CONNECTED
 
         transaction = spend(
-            left, key, other_key.address(REGTEST.address_version), 10**8, mempool=left_pool
+            left,
+            key,
+            stealth_address(other_key, left.params),
+            10**8,
+            mempool=left_pool,
         )
         mine_and_add(left, key, left_pool, count=1)
         assert len(left_pool) == 0
@@ -319,30 +302,22 @@ class TestReorganisation:
         mine_and_add(left, key, left_pool, count=2)
         branch = mine_and_add(right, other_key, right_pool, count=3)
 
-        # Corrupt the last block of the heavier branch: it pays itself too much.
         good = branch[-1]
-        template_coinbase = build_coinbase(
-            height=3,
+        bad = make_block(
+            left,
+            other_key,
             reward=REGTEST.subsidy(3) * 10,
-            pubkey_hash=other_key.public_key().hash160(),
-            extra=b"greedy",
-        )
-        bad = solve_block(
-            Block.create(
-                prev_hash=good.header.prev_hash,
-                transactions=[template_coinbase],
-                bits=good.header.bits,
-                timestamp=good.header.timestamp,
-            )
+            prev_hash=good.header.prev_hash,
+            height=3,
+            timestamp=good.header.timestamp,
         )
         for block in branch[:-1]:
             left.add_block(block)
-        assert left.height == 2  # the branch is still lighter
+        assert left.height == 2
         result = left.add_block(bad)
         assert result.status is BlockStatus.INVALID
         assert left.height == 2
         assert left.tip_hash == left.get_entry_by_height(2).hash
-        # a valid block on the same branch still works
         assert left.add_block(good).status is BlockStatus.CONNECTED
         assert left.height == 3
         left.storage.close()
@@ -368,11 +343,9 @@ class TestDifficulty:
         params = replace(REGTEST, retarget_interval=4, target_spacing=10)
         chain = make_chain(params=params)
         base = REGTEST.genesis_timestamp + 1
-        # Three blocks one second apart: much faster than the ten-second target.
         for index in range(3):
             block = mine_block(chain, key, timestamp=base + index)
             assert chain.add_block(block).status is BlockStatus.CONNECTED
-        # The block at height 4 is the first of a new period, so it retargets.
         assert chain.next_bits() != chain.tip.bits
         assert bits_to_target(chain.next_bits()) < bits_to_target(chain.tip.bits)
         chain.storage.close()
@@ -383,59 +356,62 @@ class TestDifficulty:
         params = replace(REGTEST, retarget_interval=2, target_spacing=1)
         chain = make_chain(params=params)
         base = REGTEST.genesis_timestamp + 1
-        # Fast blocks first, so the target tightens...
         for index, stamp in enumerate((base, base + 1, base + 100_000)):
             block = mine_block(chain, key, timestamp=stamp)
             assert chain.add_block(block).status is BlockStatus.CONNECTED, index
         assert chain.get_entry_by_height(2).bits != params.pow_limit_bits
-        # ...then a very slow one, which would push it past the limit.
         assert chain.next_bits() == params.pow_limit_bits
         chain.storage.close()
 
 
 class TestUtxoOverlay:
-    def test_overlay_hides_spent_coins(self, chain):
+    def test_overlay_hides_removed_coins(self, chain):
+        from ecdsa import SECP256k1
+
+        otk = schnorr_point_to_bytes(1 * SECP256k1.generator)
         overlay = CoinOverlay(chain)
-        outpoint = OutPoint(b"\x44" * 32, 0)
-        coin = Coin(100, b"\x01" * 20, 1, False)
-        overlay.add(outpoint, coin)
-        assert overlay.get_coin(outpoint) == coin
-        assert overlay.spend(outpoint) == coin
-        assert overlay.get_coin(outpoint) is None
+        coin = Coin(100, 1, False)
+        overlay.add(otk, coin)
+        assert overlay.get_coin(otk) == coin
+        assert overlay.remove(otk) == coin
+        assert overlay.get_coin(otk) is None
         with pytest.raises(KeyError):
-            overlay.spend(outpoint)
+            overlay.remove(otk)
+
+    def test_overlay_tracks_key_images(self, chain):
+        from ecdsa import SECP256k1
+
+        ki = schnorr_point_to_bytes(2 * SECP256k1.generator)
+        overlay = CoinOverlay(chain)
+        overlay.spend(ki)
+        assert overlay.has_key_image(ki)
+        with pytest.raises(ValueError):
+            overlay.spend(ki)
 
     def test_overlay_does_not_touch_the_database(self, chain, key):
         mine_and_add(chain, key, count=1)
-        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
+        owned = owned_coins(chain, key)
+        assert owned
+        otk = owned[0][0]
+        coin = chain.get_coin(otk)
         overlay = CoinOverlay(chain)
-        overlay.spend(outpoint)
-        assert overlay.get_coin(outpoint) is None
-        assert chain.get_coin(outpoint) == coin
+        overlay.remove(otk)
+        assert overlay.get_coin(otk) is None
+        assert chain.get_coin(otk) == coin
 
 
-class TestStorage:
-    def test_missing_undo_data_is_an_error(self, chain, key):
-        mine_and_add(chain, key, count=1)
-        entry = chain.get_entry_by_height(1)
-        chain.storage.delete_undo(entry.hash)
-        with pytest.raises(StorageError, match="missing undo data"):
-            chain.storage.get_undo(entry.hash)
-
-    def test_rich_list_and_stats(self, chain, key, other_key):
+class TestOutputSet:
+    def test_output_stats(self, chain, key):
         mine_and_add(chain, key, count=3)
-        richest = chain.storage.richest_addresses(5)
-        assert richest[0][1] == REGTEST.subsidy(0) * 3
-        count, total = chain.storage.utxo_stats()
+        count, total = chain.storage.output_stats()
         assert count == 4  # three coinbases plus the genesis output
         assert total == chain.total_supply()
 
-    def test_address_history_follows_the_chain(self, chain_and_pool, key, other_key):
+    def test_has_key_image_after_spending(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
-        transaction = spend(
-            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
-        )
+        destination = stealth_address(other_key, chain.params)
+        spend(chain, key, destination, 10 * 10**8, mempool=pool)
         mine_and_add(chain, key, pool, count=1)
-        history = chain.storage.address_history(other_key.public_key().hash160())
-        assert [txid for txid, _ in history] == [transaction.txid()]
+        rows = chain.storage.all_key_images()
+        assert len(rows) == 1

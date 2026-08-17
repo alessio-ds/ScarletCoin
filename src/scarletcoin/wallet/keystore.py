@@ -1,18 +1,23 @@
-"""The wallet file: a set of private keys, optionally encrypted.
+"""The wallet file: a set of dual-key stealth keys, optionally encrypted.
 
 The file is JSON so it can be inspected and backed up with ordinary tools::
 
     {
-      "version": 1,
+      "version": 2,
       "network": "mainnet",
       "encrypted": true,
-      "addresses": [{"address": "S...", "label": "main", "created": 1700000000}],
+      "addresses": [{"address": "Sc...", "label": "main", "created": 1700000000}],
       "crypto": { ...AES-256-GCM envelope holding the private keys... }
     }
 
-Addresses stay in the clear even when the wallet is encrypted, so balances and
-history can be shown while the wallet is locked; only spending needs the
-password.
+Each key is a :class:`StealthKeyPair`: a 32-byte *view* secret and a 32-byte
+*spend* secret. The view secret recognizes owned outputs, the spend secret is
+needed (together with the view secret) to sign a spend. The wallet's public
+address is a :class:`StealthAddress` -- ``Base58Check(version || A || B)``.
+
+Addresses stay in the clear even when the wallet is encrypted, so the address
+book can be shown while the wallet is locked; only scanning and spending need
+the password.
 """
 
 from __future__ import annotations
@@ -26,11 +31,16 @@ from pathlib import Path
 
 from scarletcoin.core.params import ChainParams, get_params
 from scarletcoin.crypto.encryption import DecryptionError, decrypt_blob, encrypt_blob
-from scarletcoin.crypto.keys import Address, InvalidKeyError, PrivateKey
+from scarletcoin.crypto.keys import (
+    InvalidKeyError,
+    PrivateKey,
+    StealthKeyPair,
+    generate_stealth_keys,
+)
 
 __all__ = ["KeyRecord", "Keystore", "WalletError", "WalletLocked"]
 
-WALLET_VERSION = 1
+WALLET_VERSION = 2
 
 
 class WalletError(Exception):
@@ -43,19 +53,23 @@ class WalletLocked(WalletError):
 
 @dataclass(frozen=True, slots=True)
 class KeyRecord:
-    """One key in the wallet."""
+    """One dual-key pair in the wallet."""
 
-    private_key: PrivateKey
+    pair: StealthKeyPair
     label: str
     created: int
 
-    def address(self, params: ChainParams) -> Address:
-        """Return this key's address on ``params``' network."""
-        return self.private_key.address(params.address_version)
+    def address(self, params: ChainParams) -> str:
+        """Return this key's stealth address on ``params``' network."""
+        return str(self.pair.address(params.stealth_version))
 
-    def pubkey_hash(self) -> bytes:
-        """Return the public-key hash this key controls."""
-        return self.private_key.public_key().hash160()
+    def view_wif(self, params: ChainParams) -> str:
+        """Return the view secret in wallet-import format."""
+        return PrivateKey(self.pair.view_secret).to_wif(params.wif_version)
+
+    def spend_wif(self, params: ChainParams) -> str:
+        """Return the spend secret in wallet-import format."""
+        return PrivateKey(self.pair.spend_secret).to_wif(params.wif_version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +129,6 @@ class Keystore:
 
         Raises:
             WalletError: if the file is missing or malformed.
-            WalletLocked: never here — a wrong password raises :class:`WalletError`.
         """
         path = Path(path)
         try:
@@ -205,18 +218,24 @@ class Keystore:
     def _associated_data(self) -> bytes:
         return f"scarletcoin-wallet-v{WALLET_VERSION}:{self.params.name}".encode()
 
+    @staticmethod
+    def _decode_pair(item: object, params: ChainParams) -> StealthKeyPair:
+        try:
+            view = PrivateKey.from_wif(str(item["view_wif"]), expected_version=params.wif_version)
+            spend = PrivateKey.from_wif(str(item["spend_wif"]), expected_version=params.wif_version)
+            return StealthKeyPair(view.secret, spend.secret)
+        except (KeyError, TypeError, InvalidKeyError) as exc:
+            raise WalletError(f"the wallet contains an unusable key: {exc}") from exc
+
     def _decode_keys(self, payload: object) -> list[KeyRecord]:
         if not isinstance(payload, list):
             raise WalletError("the wallet's key list is malformed")
         records: list[KeyRecord] = []
         for item in payload:
-            try:
-                key = PrivateKey.from_wif(
-                    str(item["wif"]), expected_version=self.params.wif_version
-                )
-            except (KeyError, TypeError, InvalidKeyError) as exc:
-                raise WalletError(f"the wallet contains an unusable key: {exc}") from exc
-            records.append(KeyRecord(key, str(item.get("label", "")), int(item.get("created", 0))))
+            pair = self._decode_pair(item, self.params)
+            records.append(
+                KeyRecord(pair, str(item.get("label", "")), int(item.get("created", 0)))
+            )
         return records
 
     # -------------------------------------------------------------------- storage
@@ -234,7 +253,7 @@ class Keystore:
             "encrypted": bool(self._password),
             "addresses": [
                 {
-                    "address": str(record.address(self.params)),
+                    "address": record.address(self.params),
                     "label": record.label,
                     "created": record.created,
                 }
@@ -243,7 +262,8 @@ class Keystore:
         }
         payload = [
             {
-                "wif": record.private_key.to_wif(self.params.wif_version),
+                "view_wif": record.view_wif(self.params),
+                "spend_wif": record.spend_wif(self.params),
                 "label": record.label,
                 "created": record.created,
             }
@@ -273,33 +293,38 @@ class Keystore:
 
     # ----------------------------------------------------------------------- keys
 
-    def new_key(self, label: str = "") -> Address:
-        """Generate a new key and return its address."""
+    def new_key(self, label: str = "") -> str:
+        """Generate a new dual-key pair and return its stealth address."""
         self._require_keys()
-        record = KeyRecord(PrivateKey.generate(), label, int(time.time()))
+        record = KeyRecord(generate_stealth_keys(), label, int(time.time()))
         self._keys.append(record)
         return record.address(self.params)
 
-    def import_wif(self, wif: str, label: str = "imported") -> Address:
-        """Import a private key in wallet-import format.
+    def import_key(self, combined: str, label: str = "imported") -> str:
+        """Import a dual-key pair from a ``"view_wif:spend_wif"`` string.
 
         Raises:
-            WalletError: if the key is malformed, from another network, or already
-                present.
+            WalletError: if the string is malformed, from another network, or the
+                key is already present.
         """
         self._require_keys()
+        parts = str(combined).strip().split(":")
+        if len(parts) != 2:
+            raise WalletError("a stealth key is 'view_wif:spend_wif'")
         try:
-            key = PrivateKey.from_wif(wif, expected_version=self.params.wif_version)
+            view = PrivateKey.from_wif(parts[0], expected_version=self.params.wif_version)
+            spend = PrivateKey.from_wif(parts[1], expected_version=self.params.wif_version)
+            pair = StealthKeyPair(view.secret, spend.secret)
         except InvalidKeyError as exc:
             raise WalletError(str(exc)) from exc
-        if any(record.private_key == key for record in self._keys):
+        if any(record.pair == pair for record in self._keys):
             raise WalletError("that key is already in this wallet")
-        record = KeyRecord(key, label, int(time.time()))
+        record = KeyRecord(pair, label, int(time.time()))
         self._keys.append(record)
         return record.address(self.params)
 
-    def export_wif(self, address: str) -> str:
-        """Return the private key of ``address`` in wallet-import format.
+    def export_key(self, address: str) -> str:
+        """Return the ``"view_wif:spend_wif"`` string for ``address``.
 
         Raises:
             WalletError: if the address is not in this wallet.
@@ -307,30 +332,25 @@ class Keystore:
         """
         self._require_keys()
         for record in self._keys:
-            if str(record.address(self.params)) == address:
-                return record.private_key.to_wif(self.params.wif_version)
+            if record.address(self.params) == address:
+                return f"{record.view_wif(self.params)}:{record.spend_wif(self.params)}"
         raise WalletError(f"{address} is not in this wallet")
 
-    @property
-    def keys(self) -> list[KeyRecord]:
-        """The wallet's keys.
+    def get_keys(self) -> list[StealthKeyPair]:
+        """Return every dual-key pair.
 
         Raises:
             WalletLocked: if the wallet is locked.
         """
         self._require_keys()
-        return list(self._keys)
-
-    def keys_by_hash(self) -> dict[bytes, PrivateKey]:
-        """Return every private key indexed by its public-key hash."""
-        return {record.pubkey_hash(): record.private_key for record in self.keys}
+        return [record.pair for record in self._keys]
 
     def addresses(self) -> list[AddressRecord]:
         """Return the wallet's addresses; available even when locked."""
         if self.locked:
             return list(self._addresses)
         return [
-            AddressRecord(str(record.address(self.params)), record.label, record.created)
+            AddressRecord(record.address(self.params), record.label, record.created)
             for record in self._keys
         ]
 
@@ -357,7 +377,7 @@ class Keystore:
         """
         self._require_keys()
         for index, record in enumerate(self._keys):
-            if str(record.address(self.params)) == address:
-                self._keys[index] = KeyRecord(record.private_key, label, record.created)
+            if record.address(self.params) == address:
+                self._keys[index] = KeyRecord(record.pair, label, record.created)
                 return
         raise WalletError(f"{address} is not in this wallet")

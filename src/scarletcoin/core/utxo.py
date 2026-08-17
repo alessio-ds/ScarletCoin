@@ -1,17 +1,13 @@
-"""The set of unspent transaction outputs.
+"""The output set and the key-image double-spend index.
 
-A :class:`Coin` is one unspent output plus the context needed to validate a
-spend of it (the height it was created at and whether it came from a coinbase,
-which is subject to a maturity delay).
+Every output is keyed by its *one-time public key* (33 bytes), not by an
+outpoint. When an output is spent, its key image is recorded; the node cannot
+tell *which* one-time key was spent, only that a particular key image has been
+seen before.
 
-Two views over the coin set are defined:
-
-:class:`CoinView`
-    The read-only interface validation code needs.
-:class:`CoinOverlay`
-    A scratch layer on top of another view.  Blocks and mempool transactions are
-    validated against an overlay, so nothing touches the database until the
-    whole block (or transaction) has been accepted.
+:class:`Coin` — one unspent output.
+:class:`CoinView` — read-only access to outputs.
+:class:`CoinOverlay` — a scratch layer that also tracks key images.
 """
 
 from __future__ import annotations
@@ -20,25 +16,22 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from scarletcoin.core.serialize import Reader, Writer
-from scarletcoin.core.transaction import OutPoint, Transaction
 
 __all__ = ["Coin", "CoinOverlay", "CoinView"]
 
 
 @dataclass(frozen=True, slots=True)
 class Coin:
-    """An unspent transaction output."""
+    """An output on the anonymous chain."""
 
     value: int
-    pubkey_hash: bytes
     height: int
     is_coinbase: bool
 
     def serialize(self) -> bytes:
-        """Encode the coin (used for block undo data)."""
+        """Encode the coin (for block undo data)."""
         writer = Writer()
         writer.uint64(self.value)
-        writer.raw(self.pubkey_hash)
         writer.uint32(self.height)
         writer.uint8(1 if self.is_coinbase else 0)
         return writer.getvalue()
@@ -48,7 +41,6 @@ class Coin:
         """Decode a coin from ``reader``."""
         return cls(
             value=reader.uint64(),
-            pubkey_hash=reader.raw(20),
             height=reader.uint32(),
             is_coinbase=bool(reader.uint8()),
         )
@@ -61,66 +53,91 @@ class Coin:
 
 
 class CoinView(Protocol):
-    """Read-only access to unspent outputs."""
+    """Read-only access to outputs and key images."""
 
-    def get_coin(self, outpoint: OutPoint) -> Coin | None:
-        """Return the unspent coin at ``outpoint``, or ``None`` if it does not exist."""
+    def get_coin(self, one_time_key: bytes) -> Coin | None:
+        """Return the output at ``one_time_key``, or ``None`` if it is unknown."""
+        ...
+
+    def has_key_image(self, key_image: bytes) -> bool:
+        """Return ``True`` if ``key_image`` has already been spent."""
         ...
 
 
 class CoinOverlay:
-    """A pending set of additions and spends layered over another :class:`CoinView`."""
+    """A pending set of outputs and key images layered over a :class:`CoinView`."""
 
-    __slots__ = ("_added", "_base", "_spent")
+    __slots__ = ("_added", "_base", "_key_images", "_removed")
 
     def __init__(self, base: CoinView) -> None:
         self._base = base
-        self._added: dict[OutPoint, Coin] = {}
-        self._spent: set[OutPoint] = set()
+        self._added: dict[bytes, Coin] = {}
+        self._removed: set[bytes] = set()
+        self._key_images: set[bytes] = set()
 
-    def get_coin(self, outpoint: OutPoint) -> Coin | None:
-        """Return the coin at ``outpoint`` as seen through this overlay."""
-        if outpoint in self._spent:
+    def get_coin(self, one_time_key: bytes) -> Coin | None:
+        """Return the output at ``one_time_key`` as seen through this overlay."""
+        if one_time_key in self._removed:
             return None
-        coin = self._added.get(outpoint)
+        coin = self._added.get(bytes(one_time_key))
         if coin is not None:
             return coin
-        return self._base.get_coin(outpoint)
+        return self._base.get_coin(one_time_key)
 
-    def spend(self, outpoint: OutPoint) -> Coin:
-        """Mark ``outpoint`` as spent and return the coin it held.
+    def has_key_image(self, key_image: bytes) -> bool:
+        """Return ``True`` if ``key_image`` is spent."""
+        if bytes(key_image) in self._key_images:
+            return True
+        return self._base.has_key_image(key_image)
+
+    def add(self, one_time_key: bytes, coin: Coin) -> None:
+        """Record a new output."""
+        key = bytes(one_time_key)
+        self._removed.discard(key)
+        self._added[key] = coin
+
+    def remove(self, one_time_key: bytes) -> Coin:
+        """Mark ``one_time_key`` as removed and return its coin.
 
         Raises:
-            KeyError: if the outpoint is unknown or already spent.
+            KeyError: if the output is unknown.
         """
-        coin = self.get_coin(outpoint)
+        key = bytes(one_time_key)
+        coin = self.get_coin(key)
         if coin is None:
-            raise KeyError(f"no unspent output at {outpoint}")
-        self._added.pop(outpoint, None)
-        self._spent.add(outpoint)
+            raise KeyError(f"no output at {key.hex()}")
+        self._added.pop(key, None)
+        self._removed.add(key)
         return coin
 
-    def add(self, outpoint: OutPoint, coin: Coin) -> None:
-        """Record a new unspent output."""
-        self._spent.discard(outpoint)
-        self._added[outpoint] = coin
+    def spend(self, key_image: bytes) -> None:
+        """Record a key image as spent.
 
-    def add_transaction(self, transaction: Transaction, height: int) -> None:
+        Raises:
+            ValueError: if the key image is already spent.
+        """
+        ki = bytes(key_image)
+        if self.has_key_image(ki):
+            raise ValueError(f"key image {ki.hex()} is already spent")
+        self._key_images.add(ki)
+
+    def add_transaction(self, transaction, height: int) -> None:
         """Record every output created by ``transaction``."""
-        txid = transaction.txid()
         is_coinbase = transaction.is_coinbase
-        for index, output in enumerate(transaction.outputs):
-            self.add(
-                OutPoint(txid, index),
-                Coin(output.value, output.pubkey_hash, height, is_coinbase),
-            )
+        for txout in transaction.outputs:
+            self.add(txout.one_time_key, Coin(txout.value, height, is_coinbase))
 
     @property
-    def added(self) -> dict[OutPoint, Coin]:
-        """Coins created by this overlay and not spent again inside it."""
+    def added(self) -> dict[bytes, Coin]:
+        """Outputs created by this overlay."""
         return dict(self._added)
 
     @property
-    def spent(self) -> set[OutPoint]:
-        """Outpoints this overlay consumed from the underlying view."""
-        return set(self._spent)
+    def removed(self) -> set[bytes]:
+        """One-time keys this overlay removed."""
+        return set(self._removed)
+
+    @property
+    def key_images(self) -> set[bytes]:
+        """Key images spent in this overlay."""
+        return set(self._key_images)

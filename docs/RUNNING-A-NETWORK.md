@@ -811,7 +811,7 @@ getinfo  getblockcount  getbestblockhash  getdifficulty  getsupply  getchainsize
 getnetworkstats  getpublicnodes
 getblockhash  getblock  getblockheader  getrawblock
 gettransaction  getrawtransaction  getmempool
-validateaddress  getbalance  getutxos  getaddresshistory  getrichlist
+getoutputs  getkeyimages
 sendrawtransaction
 ```
 

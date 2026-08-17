@@ -1,47 +1,62 @@
-"""Coin selection and transaction building.
+"""Coin selection and anonymous transaction building (v2).
 
-This is the only place in the code base that creates spending transactions, so
-fee estimation, change handling and signing all live together and cannot drift
-apart.
+Every outgoing transaction uses linkable ring signatures. The builder
+selects coins, picks decoy outputs from the chain, assigns one-time
+public keys to every destination, signs the ring for each input, and
+optionally splits change into standard denominations.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import os
+import random
 from dataclasses import dataclass
 
 from scarletcoin.core.params import ChainParams
-from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
+from scarletcoin.core.transaction import MAX_MONEY, Transaction, TxInput, TxOutput
 from scarletcoin.core.utxo import Coin
-from scarletcoin.crypto.keys import Address, PrivateKey
+from scarletcoin.crypto.hash_to_point import hash_to_point
+from scarletcoin.crypto.ringsig import ring_sign
+from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
+from scarletcoin.crypto.stealth import (
+    StealthAddress,
+    StealthError,
+    derive_ephemeral,
+    derive_one_time_public,
+)
+from scarletcoin.net.client import RpcClient
 
 __all__ = [
-    "PER_INPUT_BYTES",
-    "PER_OUTPUT_BYTES",
+    "DEFAULT_RING_SIZE",
     "BuiltTransaction",
     "InsufficientFundsError",
-    "build_transaction",
-    "dust_threshold",
-    "estimate_size",
-    "select_coins",
+    "build_anonymous_transaction",
+    "estimate_size_v2",
+    "fee_for_size",
+    "select_decoy_outputs",
 ]
 
-#: Serialised cost of one input: 36-byte outpoint + 34-byte public key + 65-byte signature.
-PER_INPUT_BYTES = 135
-#: Serialised cost of one output: 8-byte amount + 20-byte public-key hash.
-PER_OUTPUT_BYTES = 28
-#: Version, input and output counts, lock time and the empty coinbase-data field.
-#: Exact while a transaction has fewer than 253 inputs and outputs.
-BASE_BYTES = 11
+DEFAULT_RING_SIZE = 16
+
+# Per-input body: varint ring size + `ring_size` members + key image
+# Per-input witness: varbytes header + LSAG sig
+#   sig = varint n + c0 + n·r + K  ⇒  1 + 32 + n·32 + 33 = 66 + 32·n
+#   witness total = 1 (varbytes) + 66 + 32·n = 67 + 32·n
+# Body per input = 1 (varint) + n·33 + 33 (key image) = 34 + 33·n
+# Total per input  = 34 + 33·n + 67 + 32·n = 101 + 65·n
+#
+# Base: version (4) + input-count varint (1) + output-count varint (1)
+#       + lock-time (4) + tx_public_key (33) + extra varint-0 (1) = 44
+# Per output: value uint64 (8) + one_time_key (33) = 41
+
+BASE_BYTES_V2 = 44
 
 
-class InsufficientFundsError(ValueError):
-    """Raised when the selected coins cannot cover the payment and its fee."""
-
-
-def estimate_size(input_count: int, output_count: int) -> int:
-    """Return the expected serialised size of a signed transaction."""
-    return BASE_BYTES + input_count * PER_INPUT_BYTES + output_count * PER_OUTPUT_BYTES
+def estimate_size_v2(
+    input_count: int, output_count: int, ring_size: int = DEFAULT_RING_SIZE
+) -> int:
+    """Return the expected serialised size of a signed v2 transaction."""
+    return BASE_BYTES_V2 + input_count * (65 * ring_size + 101) + output_count * 41
 
 
 def fee_for_size(size: int, fee_per_kb: int) -> int:
@@ -49,9 +64,8 @@ def fee_for_size(size: int, fee_per_kb: int) -> int:
     return max(1, (size * fee_per_kb + 999) // 1000) if fee_per_kb > 0 else 0
 
 
-def dust_threshold(fee_per_kb: int) -> int:
-    """Return the value below which an output costs more to spend than it holds."""
-    return fee_for_size(PER_INPUT_BYTES, fee_per_kb) * 3
+class InsufficientFundsError(ValueError):
+    """Raised when the selected coins cannot cover the payment and its fee."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +76,6 @@ class BuiltTransaction:
     fee: int
     change: int
     total_input: int
-    coins: tuple[tuple[OutPoint, Coin], ...]
 
     @property
     def size(self) -> int:
@@ -75,180 +88,266 @@ class BuiltTransaction:
         return self.fee * 1000 / self.size if self.size else 0.0
 
 
-def select_coins(
-    coins: Sequence[tuple[OutPoint, Coin]],
-    amount: int,
-    *,
-    fee_per_kb: int,
-    output_count: int,
-) -> tuple[list[tuple[OutPoint, Coin]], int]:
-    """Choose coins covering ``amount`` plus the resulting fee.
+# ------------------------------------------------------------------- decoys
 
-    A single coin that covers the payment on its own is preferred (it keeps the
-    transaction small); otherwise the largest coins are accumulated first, which
-    minimises the number of inputs and therefore the fee.
 
-    Returns:
-        The chosen coins and the fee for the resulting transaction, assuming one
-        change output.
+def select_decoy_outputs(
+    client: RpcClient, value: int, count: int, *, params: ChainParams | None = None
+) -> list[bytes]:
+    """Return ``count`` one-time-key bytes for outputs worth ``value``.
 
-    Raises:
-        InsufficientFundsError: if the coins are not enough.
+    Candidates are fetched from the node and sampled with a preference for
+    recent blocks so the ring looks plausible to an outside observer. Immature
+    coinbase outputs are skipped: a ring member that has not matured would make
+    the node reject the whole transaction.
     """
-    if amount < 0:
-        raise ValueError("amount must not be negative")
+    if count <= 0:
+        return []
+    maturity = params.coinbase_maturity if params is not None else 0
+    height = client.getblockcount() if params is not None else None
+    rows = []
+    for item in client.getoutputs():
+        if int(item["value"]) != value:
+            continue
+        item_height = int(item.get("height", 0))
+        if (
+            maturity
+            and bool(item.get("coinbase", False))
+            and item_height + maturity > height
+        ):
+            continue
+        rows.append((bytes.fromhex(item["one_time_key"]), item_height))
+    if not rows:
+        return []
 
-    def required(count: int) -> int:
-        return amount + fee_for_size(estimate_size(count, output_count + 1), fee_per_kb)
+    rows.sort(key=lambda r: r[1], reverse=True)
+    if len(rows) <= count:
+        return [key for key, _ in rows]
 
-    usable = sorted(coins, key=lambda item: item[1].value, reverse=True)
-    exact = [item for item in usable if item[1].value >= required(1)]
-    if exact:
-        chosen = [min(exact, key=lambda item: item[1].value)]
-        return chosen, fee_for_size(estimate_size(1, output_count + 1), fee_per_kb)
+    pool = list(rows)
+    chosen: list[bytes] = []
 
-    chosen: list[tuple[OutPoint, Coin]] = []
-    total = 0
-    for item in usable:
-        chosen.append(item)
-        total += item[1].value
-        if total >= required(len(chosen)):
-            return chosen, fee_for_size(estimate_size(len(chosen), output_count + 1), fee_per_kb)
-    raise InsufficientFundsError(
-        f"need {required(max(len(chosen), 1))} scar (payment plus fee)"
-        f" but only {total} scar is available"
-    )
+    def _weight(i: int) -> float:
+        return 1.0 / (i + 1)
+
+    for _ in range(count):
+        if not pool:
+            break
+        weights = [_weight(i) for i in range(len(pool))]
+        idx = random.choices(range(len(pool)), weights=weights, k=1)[0]
+        chosen.append(pool.pop(idx)[0])
+    return chosen
 
 
-def _resolve(destination: Address | bytes, params: ChainParams) -> bytes:
-    if isinstance(destination, Address):
-        if destination.version != params.address_version:
-            raise ValueError(f"address {destination} does not belong to the {params.name} network")
-        return destination.hash
-    if len(destination) != 20:
-        raise ValueError("a destination must be an Address or a 20-byte public-key hash")
-    return bytes(destination)
+# -------------------------------------------------------------- denominations
 
 
-def build_sweep_transaction(
-    *,
-    spendable_coins: Sequence[tuple[OutPoint, Coin]],
-    keys: Mapping[bytes, PrivateKey],
-    destination: Address | bytes,
-    fee_per_kb: int,
+def split_denominations(amount: int) -> list[int]:
+    """Break ``amount`` scar into powers-of-ten denominations.
+
+    1234 → ``[1000, 100, 100, 10, 10, 10, 1, 1, 1, 1]``
+    """
+    parts: list[int] = []
+    power = 1
+    while power * 10 <= amount:
+        power *= 10
+    remaining = amount
+    while power >= 1:
+        q, remaining = divmod(remaining, power)
+        parts.extend([power] * q)
+        power //= 10
+    return parts
+
+
+# --------------------------------------------------------------- ring helper
+
+
+def _build_ring(
+    real_key: bytes,
+    value: int,
+    ring_size: int,
+    client: RpcClient,
     params: ChainParams,
-    lock_time: int = 0,
-) -> BuiltTransaction:
-    """Spend *every* given coin to one destination, with no change output.
-
-    Raises:
-        InsufficientFundsError: if there are no coins, or they do not cover the fee.
-        ValueError: if the destination is invalid or a key is missing.
-    """
-    if not spendable_coins:
-        raise InsufficientFundsError("there are no coins to spend")
-    pubkey_hash = _resolve(destination, params)
-    total = sum(coin.value for _, coin in spendable_coins)
-    fee = fee_for_size(estimate_size(len(spendable_coins), 1), fee_per_kb)
-    amount = total - fee
-    if amount <= 0:
+) -> tuple[list[bytes], int]:
+    """Return a ring of one-time keys and the index of *real_key* inside it."""
+    decoys = select_decoy_outputs(client, value, ring_size - 1, params=params)
+    members: list[bytes] = [real_key]
+    for d in decoys:
+        if d != real_key and d not in members:
+            members.append(d)
+    if len(members) < 2:
         raise InsufficientFundsError(
-            f"the {total} scar available does not cover the {fee} scar fee"
+            f"not enough outputs worth {value} scar to form a ring"
         )
-    unsigned = Transaction(
-        version=1,
-        inputs=tuple(TxInput(outpoint) for outpoint, _ in spendable_coins),
-        outputs=(TxOutput(amount, pubkey_hash),),
-        lock_time=lock_time,
-    )
-    return BuiltTransaction(
-        transaction=_sign_inputs(unsigned, spendable_coins, keys),
-        fee=fee,
-        change=0,
-        total_input=total,
-        coins=tuple(spendable_coins),
-    )
+    random.shuffle(members)
+    return members, members.index(real_key)
 
 
-def _sign_inputs(
-    unsigned: Transaction,
-    coins: Sequence[tuple[OutPoint, Coin]],
-    keys: Mapping[bytes, PrivateKey],
-) -> Transaction:
-    """Sign every input of ``unsigned`` with the key owning the matching coin."""
-    witnesses: dict[int, tuple[bytes, bytes]] = {}
-    for index, (outpoint, coin) in enumerate(coins):
-        key = keys.get(coin.pubkey_hash)
-        if key is None:
-            raise ValueError(f"no private key for coin {outpoint}")
-        digest = unsigned.signature_hash(index, coin.value)
-        witnesses[index] = (key.public_key().to_bytes(), key.sign(digest))
-    return unsigned.signed_with(witnesses)
+# ------------------------------------------------------------ address helpers
 
 
-def build_transaction(
-    *,
-    spendable_coins: Sequence[tuple[OutPoint, Coin]],
-    keys: Mapping[bytes, PrivateKey],
-    outputs: Sequence[tuple[Address | bytes, int]],
-    change_hash: bytes,
+def _resolve_stealth(address: StealthAddress | str, params: ChainParams) -> StealthAddress:
+    if isinstance(address, StealthAddress):
+        if address.version != params.stealth_version:
+            raise ValueError(
+                f"address {address} does not belong to the {params.name} network"
+            )
+        return address
+    if isinstance(address, str):
+        try:
+            addr = StealthAddress.decode(address, expected_version=params.stealth_version)
+        except StealthError as exc:
+            raise ValueError(str(exc)) from exc
+        return addr
+    raise ValueError("a destination must be a StealthAddress or a stealth address string")
+
+
+def _derive_outputs(
+    r: int,
+    targets: list[tuple[StealthAddress, int]],
+    change_addr: StealthAddress,
+    change_outs: list[int],
+) -> list[TxOutput]:
+    outputs: list[TxOutput] = []
+    for addr, amount in targets:
+        p = derive_one_time_public(r, addr)
+        outputs.append(TxOutput(amount, schnorr_point_to_bytes(p)))
+    for value in change_outs:
+        p = derive_one_time_public(r, change_addr)
+        outputs.append(TxOutput(value, schnorr_point_to_bytes(p)))
+    return outputs
+
+
+# ------------------------------------------------------------- assembly core
+
+
+def _try_build(
+    selected: list[tuple[bytes, Coin, int]],
+    total_input: int,
+    targets: list[tuple[StealthAddress, int]],
+    change_addr: StealthAddress,
     fee_per_kb: int,
     params: ChainParams,
-    lock_time: int = 0,
+    ring_size: int,
+    client: RpcClient,
+) -> BuiltTransaction | None:
+    total_amount = sum(amount for _, amount in targets)
+    fee = 0
+    change = 0
+    change_outs: list[int] = []
+
+    for _ in range(64):
+        change = total_input - total_amount - fee
+        if change < 0:
+            return None
+        fresh = split_denominations(change)
+        output_count = len(targets) + len(fresh)
+        new_fee = fee_for_size(
+            estimate_size_v2(len(selected), output_count, ring_size), fee_per_kb
+        )
+        if new_fee == fee and change_outs == fresh:
+            # Converged.
+            r_seed = os.urandom(32)
+            R_point, r_scalar = derive_ephemeral(r_seed)
+            tx_public_key = schnorr_point_to_bytes(R_point)
+
+            tx_outputs = _derive_outputs(r_scalar, targets, change_addr, change_outs)
+
+            tx_inputs: list[TxInput] = []
+            ring_indices: list[int] = []
+            for one_time_key, coin, _spend_key in selected:
+                ring_members, secret_idx = _build_ring(
+                    one_time_key, coin.value, ring_size, client, params
+                )
+                key_image = schnorr_point_to_bytes(
+                    _spend_key * hash_to_point(one_time_key)
+                )
+                tx_inputs.append(TxInput(tuple(ring_members), key_image))
+                ring_indices.append(secret_idx)
+
+            tx = Transaction(
+                version=2,
+                inputs=tuple(tx_inputs),
+                outputs=tuple(tx_outputs),
+                lock_time=0,
+                tx_public_key=tx_public_key,
+            )
+
+            for idx, (_otk, _coin, spk) in enumerate(selected):
+                ring_members = list(tx.inputs[idx].ring)
+                sighash = tx.signature_hash(idx)
+                sig = ring_sign(ring_members, ring_indices[idx], spk, sighash)
+                tx = tx.signed_with(idx, sig)
+
+            return BuiltTransaction(tx, new_fee, sum(change_outs), total_input)
+
+        fee = new_fee
+        change_outs = fresh
+
+    return None
+
+
+# --------------------------------------------------------------- public API
+
+
+def build_anonymous_transaction(
+    wallet,  # Wallet (duck-typed: .coins() -> [(bytes, Coin, int)], .client -> RpcClient)
+    outputs: list[tuple[StealthAddress | str, int]],
+    change_addr: StealthAddress | str,
+    fee_per_kb: int,
+    params: ChainParams,
 ) -> BuiltTransaction:
-    """Select coins, build and sign a transaction.
+    """Build and sign an anonymous v2 transaction.
 
     Args:
-        spendable_coins: Coins that may be spent, as ``(outpoint, coin)`` pairs.
-        keys: Private keys by public-key hash; every selected coin needs one.
-        outputs: ``(destination, amount)`` pairs to pay.
-        change_hash: Where to send the change.
+        wallet: Provides ``.coins()`` and ``.client``.
+        outputs: ``(stealth_address, scar_amount)`` pairs.
+        change_addr: Where change, if any, is returned.
         fee_per_kb: Fee rate in scar per kilobyte.
-        params: Chain parameters, used to validate addresses.
-        lock_time: Optional height before which the transaction is invalid.
+        params: Chain parameters for network validation.
 
     Returns:
-        The signed transaction and its fee, change and inputs.
+        The signed transaction, its fee, the change amount and total input.
 
     Raises:
         InsufficientFundsError: if the coins cannot cover payment plus fee.
-        ValueError: if an output is invalid or a key is missing.
+        ValueError: if an output is invalid.
     """
     if not outputs:
         raise ValueError("a transaction must pay at least one output")
-    targets = [(_resolve(destination, params), amount) for destination, amount in outputs]
-    for _, amount in targets:
+
+    targets: list[tuple[StealthAddress, int]] = []
+    for address, amount in outputs:
+        addr = _resolve_stealth(address, params)
         if amount <= 0:
             raise ValueError("output amounts must be positive")
-    amount = sum(value for _, value in targets)
+        if amount > MAX_MONEY:
+            raise ValueError("output amount exceeds the maximum money supply")
+        targets.append((addr, amount))
 
-    chosen, fee = select_coins(
-        spendable_coins, amount, fee_per_kb=fee_per_kb, output_count=len(targets)
-    )
-    total_input = sum(coin.value for _, coin in chosen)
-    change = total_input - amount - fee
-    if change < 0:  # pragma: no cover - select_coins guarantees this
-        raise InsufficientFundsError("selected coins do not cover the fee")
+    change = _resolve_stealth(change_addr, params)
+    spendable = wallet.coins()
 
-    tx_outputs = [TxOutput(value, pubkey_hash) for pubkey_hash, value in targets]
-    if change > dust_threshold(fee_per_kb):
-        tx_outputs.append(TxOutput(change, bytes(change_hash)))
-    else:
-        # Too small to be worth its own output: leave it to the miner as extra fee.
-        fee += change
-        change = 0
+    usable = sorted(spendable, key=lambda item: item[1].value, reverse=True)
 
-    unsigned = Transaction(
-        version=1,
-        inputs=tuple(TxInput(outpoint) for outpoint, _ in chosen),
-        outputs=tuple(tx_outputs),
-        lock_time=lock_time,
-    )
+    selected: list[tuple[bytes, Coin, int]] = []
+    total_input = 0
+    for item in usable:
+        selected.append(item)
+        total_input += item[1].value
+        result = _try_build(
+            selected,
+            total_input,
+            targets,
+            change,
+            fee_per_kb,
+            params,
+            DEFAULT_RING_SIZE,
+            wallet.client,
+        )
+        if result is not None:
+            return result
 
-    return BuiltTransaction(
-        transaction=_sign_inputs(unsigned, chosen, keys),
-        fee=fee,
-        change=change,
-        total_input=total_input,
-        coins=tuple(chosen),
+    raise InsufficientFundsError(
+        f"need more than {total_input} scar to cover the payment and its fee"
     )

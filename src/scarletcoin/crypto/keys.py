@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from scarletcoin.crypto.base58 import Base58Error, b58check_decode, b58check_encode
 from scarletcoin.crypto.hashing import PUBKEY_HASH_LENGTH, hash160
+from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
 
 __all__ = [
     "SIGNATURE_LENGTH",
@@ -33,6 +34,8 @@ __all__ = [
     "InvalidSignatureError",
     "PrivateKey",
     "PublicKey",
+    "StealthKeyPair",
+    "generate_stealth_keys",
 ]
 
 #: Order of the secp256k1 group.
@@ -248,3 +251,89 @@ class PrivateKey:
 
     def __repr__(self) -> str:  # pragma: no cover - never leak secrets in logs
         return "PrivateKey(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True)
+class StealthKeyPair:
+    """A dual-key pair for anonymous transactions.
+
+    ``view_secret`` (``a``) can recognize owned outputs but cannot spend them.
+    ``spend_secret`` (``b``) is needed together with ``a`` to sign spends.
+    The wallet derives the address ``(A = a·G, B = b·G)``.
+    """
+
+    view_secret: bytes
+    spend_secret: bytes
+
+    def __post_init__(self) -> None:
+        if len(self.view_secret) != PRIVATE_KEY_LENGTH:
+            raise InvalidKeyError(
+                f"view key must be {PRIVATE_KEY_LENGTH} bytes, got {len(self.view_secret)}"
+            )
+        if len(self.spend_secret) != PRIVATE_KEY_LENGTH:
+            raise InvalidKeyError(
+                f"spend key must be {PRIVATE_KEY_LENGTH} bytes, got {len(self.spend_secret)}"
+            )
+        from ecdsa import SECP256k1
+
+        n = SECP256k1.order
+        if not 1 <= int.from_bytes(self.view_secret, "big") < n:
+            raise InvalidKeyError("view key is out of the valid secp256k1 range")
+        if not 1 <= int.from_bytes(self.spend_secret, "big") < n:
+            raise InvalidKeyError("spend key is out of the valid secp256k1 range")
+
+    def view_public_bytes(self) -> bytes:
+        return schnorr_point_to_bytes(self.view_public_point())
+
+    def spend_public_bytes(self) -> bytes:
+        return schnorr_point_to_bytes(self.spend_public_point())
+
+    def view_public_point(self):
+        from ecdsa import SECP256k1
+
+        from scarletcoin.crypto.stealth import a_scalar
+
+        return a_scalar(self.view_secret) * SECP256k1.generator
+
+    def spend_public_point(self):
+        from ecdsa import SECP256k1
+
+        from scarletcoin.crypto.stealth import b_scalar
+
+        return b_scalar(self.spend_secret) * SECP256k1.generator
+
+    def address(self, version: int):
+        from scarletcoin.crypto.stealth import StealthAddress
+
+        return StealthAddress(version, self.view_public_point(), self.spend_public_point())
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StealthKeyPair):
+            return NotImplemented
+        return hmac.compare_digest(self.view_secret, other.view_secret) and hmac.compare_digest(
+            self.spend_secret, other.spend_secret
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.view_secret) ^ hash(self.spend_secret)
+
+    def __repr__(self) -> str:
+        return "StealthKeyPair(<redacted>)"
+
+
+def generate_stealth_keys() -> StealthKeyPair:
+    """Create a fresh dual-key pair from the operating system's CSPRNG."""
+    import os
+
+    from ecdsa import SECP256k1
+
+    n = SECP256k1.order
+
+    def _gen() -> bytes:
+        while True:
+            candidate = os.urandom(PRIVATE_KEY_LENGTH)
+            value = int.from_bytes(candidate, "big")
+            if 1 <= value < n:
+                return candidate
+
+    return StealthKeyPair(_gen(), _gen())

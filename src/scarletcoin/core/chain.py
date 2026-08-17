@@ -40,7 +40,7 @@ from scarletcoin.core.storage import (
     TxLocation,
     database_size,
 )
-from scarletcoin.core.transaction import OutPoint, Transaction, TransactionError
+from scarletcoin.core.transaction import Transaction, TransactionError
 from scarletcoin.core.utxo import Coin, CoinOverlay
 from scarletcoin.core.validation import (
     PrematureBlockError,
@@ -164,8 +164,7 @@ class Blockchain:
             entry = self.storage.put_block(
                 genesis, height=0, chainwork=block_work(genesis.header.bits), in_chain=True
             )
-            self._apply_block_state(genesis, height=0, spent={})
-            self.storage.put_undo(genesis.hash(), [])
+            self._apply_block_state(genesis, height=0)
             self.storage.set_tip(genesis.hash())
         return entry
 
@@ -192,9 +191,13 @@ class Blockchain:
 
     # ------------------------------------------------------------ coin lookups
 
-    def get_coin(self, outpoint: OutPoint) -> Coin | None:
-        """Return the unspent coin at ``outpoint`` (implements ``CoinView``)."""
-        return self.storage.get_coin(outpoint)
+    def get_coin(self, one_time_key: bytes) -> Coin | None:
+        """Return the output at ``one_time_key`` (implements ``CoinView``)."""
+        return self.storage.get_coin(one_time_key)
+
+    def has_key_image(self, key_image: bytes) -> bool:
+        """Return ``True`` if ``key_image`` has been spent (implements ``CoinView``)."""
+        return self.storage.has_key_image(key_image)
 
     # ------------------------------------------------------------- block reads
 
@@ -511,9 +514,6 @@ class Blockchain:
         """
         height = entry.height
         overlay = CoinOverlay(self.storage)
-        spent: dict[OutPoint, Coin] = {}
-        undo: list[tuple[OutPoint, Coin]] = []
-        created: set[OutPoint] = set()
         fees = 0
 
         for transaction in block.transactions:
@@ -533,12 +533,7 @@ class Blockchain:
                         entry.hash, f"transaction {transaction.txid_hex()}: {exc}"
                     ) from exc
                 for txin in transaction.inputs:
-                    coin = overlay.spend(txin.prevout)
-                    spent[txin.prevout] = coin
-                    if txin.prevout not in created:
-                        undo.append((txin.prevout, coin))
-            txid = transaction.txid()
-            created.update(OutPoint(txid, index) for index in range(len(transaction.outputs)))
+                    overlay.spend(txin.key_image)
             overlay.add_transaction(transaction, height)
 
         subsidy = self.params.subsidy(height)
@@ -550,54 +545,45 @@ class Blockchain:
                 f" (subsidy {subsidy} + fees {fees})",
             )
 
-        for outpoint in overlay.spent:
-            self.storage.remove_coin(outpoint)
-        for outpoint, coin in overlay.added.items():
-            self.storage.add_coin(outpoint, coin)
-        self.storage.put_undo(entry.hash, undo)
-        self._index_block(block, height=height, spent=spent)
+        for one_time_key in overlay.removed:
+            self.storage.remove_coin(one_time_key)
+        for one_time_key, coin in overlay.added.items():
+            self.storage.add_coin(one_time_key, coin)
+        for key_image in overlay.key_images:
+            self.storage.spend_key_image(key_image, height)
+        self._index_block(block, height=height)
         self.storage.set_in_chain(entry.hash, True)
 
-    def _apply_block_state(self, block: Block, *, height: int, spent: dict[OutPoint, Coin]) -> None:
-        """Add every output of ``block`` to the UTXO set and index it (genesis path)."""
+    def _apply_block_state(self, block: Block, *, height: int) -> None:
+        """Add every output of ``block`` to the output set and index it (genesis path)."""
         for transaction in block.transactions:
-            txid = transaction.txid()
-            for index, output in enumerate(transaction.outputs):
+            for txout in transaction.outputs:
                 self.storage.add_coin(
-                    OutPoint(txid, index),
-                    Coin(output.value, output.pubkey_hash, height, transaction.is_coinbase),
+                    txout.one_time_key,
+                    Coin(txout.value, height, transaction.is_coinbase),
                 )
-        self._index_block(block, height=height, spent=spent)
+        self._index_block(block, height=height)
 
-    def _index_block(self, block: Block, *, height: int, spent: dict[OutPoint, Coin]) -> None:
-        """Update the transaction and address indexes for a connected block."""
+    def _index_block(self, block: Block, *, height: int) -> None:
+        """Update the transaction lookup index for a connected block."""
         block_hash = block.hash()
         for position, transaction in enumerate(block.transactions):
-            touched = {output.pubkey_hash for output in transaction.outputs}
-            for txin in transaction.inputs:
-                coin = spent.get(txin.prevout)
-                if coin is not None:
-                    touched.add(coin.pubkey_hash)
             self.storage.index_transaction(
-                transaction,
-                block_hash=block_hash,
-                position=position,
-                height=height,
-                pubkey_hashes=touched,
+                transaction, block_hash=block_hash, position=position, height=height
             )
 
     def _disconnect_block(self, entry: BlockIndexEntry) -> Block:
-        """Remove ``entry`` from the active chain and restore the coins it spent."""
+        """Remove ``entry`` from the active chain and undo its outputs."""
         block = self.storage.get_block(entry.hash)
         if block is None:  # pragma: no cover - index and blocks are written together
             raise _ConnectError(entry.hash, "cannot disconnect a block whose data is missing")
         for transaction in block.transactions:
-            txid = transaction.txid()
-            for index in range(len(transaction.outputs)):
-                self.storage.remove_coin(OutPoint(txid, index))
-            self.storage.unindex_transaction(txid)
-        for outpoint, coin in self.storage.get_undo(entry.hash):
-            self.storage.add_coin(outpoint, coin)
+            for txout in transaction.outputs:
+                self.storage.remove_coin(txout.one_time_key)
+            for txin in transaction.inputs:
+                if not txin.is_coinbase_input:
+                    self.storage.unspend_key_image(txin.key_image)
+            self.storage.unindex_transaction(transaction.txid())
         self.storage.set_in_chain(entry.hash, False)
         return block
 
@@ -613,7 +599,7 @@ class Blockchain:
 
     def total_supply(self) -> int:
         """Total value of all unspent outputs, in scar."""
-        return self.storage.utxo_stats()[1]
+        return self.storage.output_stats()[1]
 
     # ------------------------------------------------------------------ pruning
 
@@ -730,7 +716,7 @@ class Blockchain:
 
     def stats(self) -> dict:
         """Return a summary of the chain, for RPC and the explorer."""
-        utxo_count, supply = self.storage.utxo_stats()
+        utxo_count, supply = self.storage.output_stats()
         sizes = self.storage.size_stats()
         return {
             "network": self.params.name,

@@ -13,7 +13,6 @@ from html import escape
 from typing import TYPE_CHECKING
 
 from scarletcoin.core.transaction import Transaction
-from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.units import format_amount, format_bytes
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type checking
@@ -102,10 +101,9 @@ def _page(server: RpcServer, title: str, body: str) -> str:
     <a href="/blocks">Blocks</a>
     <a href="/mempool">Mempool</a>
     <a href="/peers">Peers</a>
-    <a href="/rich">Rich list</a>
   </nav>
   <form action="/search" method="get">
-    <input type="text" name="q" placeholder="block height, hash, txid or address" required>
+    <input type="text" name="q" placeholder="block height, hash or txid" required>
     <button type="submit">Search</button>
   </form>
 </header>
@@ -193,11 +191,6 @@ def _tx_link(txid: str, *, short: bool = True) -> str:
     return f'<a class="hash" href="/tx/{escape(txid)}">{escape(label)}</a>'
 
 
-def _address_link(address: str, *, short: bool = False) -> str:
-    label = _short(address, 12) if short else address
-    return f'<a class="hash" href="/address/{escape(address)}">{escape(label)}</a>'
-
-
 def _when(timestamp: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamp)) + " UTC"
 
@@ -282,7 +275,7 @@ def _overview(server: RpcServer) -> str:
         if block is None:  # pragma: no cover
             continue
         reward = block.coinbase.total_output()
-        miner = str(block.coinbase.outputs[0].address(node.params.address_version))
+        miner = block.coinbase.outputs[0].one_time_key.hex()
         blocks.append(
             [
                 _html(_height_link(height), numeric=True),
@@ -290,7 +283,7 @@ def _overview(server: RpcServer) -> str:
                 _text(_when(entry.timestamp)),
                 _text(len(block.transactions), numeric=True),
                 _html(_amount(reward), numeric=True),
-                _html(_address_link(miner, short=True)),
+                _html(_hash_span(_short(miner))),
             ]
         )
     stats = chain.network_stats()
@@ -339,7 +332,7 @@ def _overview(server: RpcServer) -> str:
         f" ({_duration(stats['window_seconds'])}).</p>"
     )
     body += "<h2>Latest blocks</h2>" + _rows(
-        ["#Height", "Hash", "Time", "#Txs", "#Reward", "Miner"], blocks
+        ["#Height", "Hash", "Time", "#Txs", "#Reward", "One-time key"], blocks
     )
     return _page(server, "Overview", body)
 
@@ -395,45 +388,35 @@ def _blocks_page(server: RpcServer, query: dict[str, list[str]]) -> str:
 
 
 def _transaction_rows(server: RpcServer, transaction: Transaction) -> str:
-    node = server.node
-    version = node.params.address_version
     inputs: list[list[Cell]] = []
     for txin in transaction.inputs:
-        if txin.prevout.is_null:
-            inputs.append([_html(_tag("coinbase", "warn")), _text(""), _text("")])
+        if txin.is_coinbase_input:
+            inputs.append([_html(_tag("coinbase", "warn")), _text(""), _text(""), _text("")])
             continue
-        parent = node.chain.get_transaction(txin.prevout.txid)
-        if parent is None:
-            inputs.append(
-                [
-                    _html(_tx_link(txin.prevout.txid[::-1].hex())),
-                    _text(txin.prevout.index, numeric=True),
-                    _text("unknown"),
-                ]
-            )
-            continue
-        output = parent[0].outputs[txin.prevout.index]
-        source = _address_link(str(output.address(version))) + " &nbsp; " + _amount(output.value)
+        ring = " &middot; ".join(_short(member.hex(), 8) for member in txin.ring[:4])
+        if len(txin.ring) > 4:
+            ring += f" &middot; +{len(txin.ring) - 4} more"
         inputs.append(
             [
-                _html(_tx_link(txin.prevout.txid[::-1].hex())),
-                _text(txin.prevout.index, numeric=True),
-                _html(source),
+                _text(len(txin.ring), numeric=True),
+                _html(_hash_span(_short(txin.key_image.hex(), 8))),
+                _html(ring),
+                _text("" if txin.signature else "not signed"),
             ]
         )
     outputs = [
         [
             _text(index, numeric=True),
-            _html(_address_link(str(output.address(version)))),
             _html(_amount(output.value), numeric=True),
+            _html(_hash_span(_short(output.one_time_key.hex(), 8))),
         ]
         for index, output in enumerate(transaction.outputs)
     ]
     return (
         "<h2>Inputs</h2>"
-        + _rows(["Previous transaction", "#Index", "Source"], inputs)
+        + _rows(["#Ring", "Key image", "Ring members", "Signature"], inputs)
         + "<h2>Outputs</h2>"
-        + _rows(["#Index", "Address", "#Amount"], outputs)
+        + _rows(["#Index", "#Amount", "One-time key"], outputs)
     )
 
 
@@ -582,69 +565,6 @@ def _tx_page(server: RpcServer, txid_hex: str) -> str:
     return _page(server, "Transaction", body)
 
 
-def _address_page(server: RpcServer, text: str) -> str:
-    node = server.node
-    try:
-        address = Address.decode(text, expected_version=node.params.address_version)
-    except InvalidKeyError as exc:
-        raise NotFound(str(exc)) from exc
-
-    coins = node.storage.coins_of(address.hash)
-    balance = sum(coin.value for _, coin in coins)
-    history = node.storage.address_history(address.hash, 100)
-    body = _cards(
-        [
-            ("Address", _hash_span(str(address))),
-            ("Balance", _amount(balance)),
-            ("Unspent outputs", str(len(coins))),
-            ("Transactions", str(len(history))),
-        ]
-    )
-    rows = []
-    for txid, height in history:
-        found = node.chain.get_transaction(txid)
-        if found is None:  # pragma: no cover
-            continue
-        transaction, _ = found
-        received = sum(o.value for o in transaction.outputs if o.pubkey_hash == address.hash)
-        sent = 0
-        for txin in transaction.inputs:
-            if txin.prevout.is_null:
-                continue
-            parent = node.chain.get_transaction(txin.prevout.txid)
-            if parent is None:  # pragma: no cover
-                continue
-            output = parent[0].outputs[txin.prevout.index]
-            if output.pubkey_hash == address.hash:
-                sent += output.value
-        rows.append(
-            [
-                _html(_height_link(height), numeric=True),
-                _html(_tx_link(transaction.txid_hex())),
-                _html(_amount(received - sent), numeric=True),
-                _text(node.chain.confirmations(height), numeric=True),
-            ]
-        )
-    body += "<h2>History</h2>" + _rows(
-        ["#Height", "Transaction", "#Net amount", "#Confirmations"],
-        rows,
-        empty="This address has never been used.",
-    )
-    unspent = [
-        [
-            _html(_tx_link(outpoint.txid[::-1].hex())),
-            _text(outpoint.index, numeric=True),
-            _html(_amount(coin.value), numeric=True),
-            _html(_tag("coinbase", "warn") if coin.is_coinbase else ""),
-        ]
-        for outpoint, coin in coins
-    ]
-    body += "<h2>Unspent outputs</h2>" + _rows(
-        ["Transaction", "#Index", "#Amount", "Type"], unspent, empty="No unspent outputs."
-    )
-    return _page(server, "Address", body)
-
-
 def _mempool_page(server: RpcServer) -> str:
     entries = server.node.mempool.entries()
     rows = [
@@ -700,24 +620,6 @@ def _peers_page(server: RpcServer) -> str:
     return _page(server, "Peers", body)
 
 
-def _rich_page(server: RpcServer) -> str:
-    node = server.node
-    supply = max(1, node.chain.total_supply())
-    rows = [
-        [
-            _text(rank, numeric=True),
-            _html(_address_link(str(Address(node.params.address_version, pubkey_hash)))),
-            _html(_amount(total), numeric=True),
-            _text(f"{total * 100 / supply:.2f}%", numeric=True),
-        ]
-        for rank, (pubkey_hash, total) in enumerate(node.storage.richest_addresses(25), start=1)
-    ]
-    body = "<h2>Largest balances</h2>" + _rows(
-        ["#Rank", "Address", "#Balance", "#Share"], rows, empty="No coins have been mined yet."
-    )
-    return _page(server, "Rich list", body)
-
-
 def _search(server: RpcServer, query: dict[str, list[str]]) -> str:
     term = (query.get("q") or [""])[0].strip()
     if not term:
@@ -734,8 +636,6 @@ def _search(server: RpcServer, query: dict[str, list[str]]) -> str:
             return _block_page(server, term)
         if node.chain.get_transaction(raw) is not None or node.mempool.get(raw) is not None:
             return _tx_page(server, term)
-    if Address.is_valid(term, expected_version=node.params.address_version):
-        return _address_page(server, term)
     raise NotFound(f"could not find anything matching {term!r}")
 
 
@@ -753,14 +653,11 @@ def render(server: RpcServer, path: str, query: dict[str, list[str]]) -> str:
         return _mempool_page(server)
     if path == "/peers":
         return _peers_page(server)
-    if path == "/rich":
-        return _rich_page(server)
     if path == "/search":
         return _search(server, query)
     for prefix, handler in (
         ("/block/", _block_page),
         ("/tx/", _tx_page),
-        ("/address/", _address_page),
     ):
         if path.startswith(prefix):
             return handler(server, path[len(prefix) :])

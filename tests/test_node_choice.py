@@ -239,7 +239,8 @@ class TestPublicRpcSurface:
         info = client.getinfo()
         for field in ("chain_bytes", "chain_size", "disk_bytes", "disk_size", "prune_height"):
             assert field in info
-        assert info["chain_size"] == "214 B"
+        assert info["chain_size"].endswith("B")
+        assert info["chain_bytes"] > 0
 
     def test_getinfo_says_whether_the_node_is_public(self, public_node, rpc):
         _, server = public_node

@@ -333,9 +333,9 @@ class WalletWindow(QtWidgets.QMainWindow):
                     f"{format_amount(coin.value)} SCT",
                     str(max(0, info["height"] - coin.height + 1)),
                     "coinbase" if coin.is_coinbase else "payment",
-                    f"{outpoint.txid[::-1].hex()}:{outpoint.index}",
+                    _otk[:16].hex(),
                 ]
-                for outpoint, coin in snapshot["coins"]
+                for _otk, coin, _spend in snapshot["coins"]
             ],
             mono_columns={3},
         )
@@ -491,13 +491,13 @@ class WalletWindow(QtWidgets.QMainWindow):
     def _import_key(self) -> None:
         if not self._unlock_if_needed():
             return
-        wif, accepted = QtWidgets.QInputDialog.getText(
-            self, "Import private key", "Private key (WIF):"
+        key, accepted = QtWidgets.QInputDialog.getText(
+            self, "Import key", "Private key (view:spend, space separated):"
         )
-        if not accepted or not wif.strip():
+        if not accepted or not key.strip():
             return
         try:
-            address = self.keystore.import_wif(wif.strip())
+            address = self.keystore.import_key(key.strip())
             self.keystore.save()
         except WalletError as exc:
             show_error(self, "Could not import that key", str(exc))
@@ -510,7 +510,7 @@ class WalletWindow(QtWidgets.QMainWindow):
             return
         address = self._selected(self.address_table, 0) or self.keystore.default_address()
         try:
-            wif = self.keystore.export_wif(address)
+            key = self.keystore.export_key(address)
         except WalletError as exc:
             show_error(self, "Could not export that key", str(exc))
             return
@@ -518,14 +518,14 @@ class WalletWindow(QtWidgets.QMainWindow):
         dialog.setWindowTitle("Private key")
         dialog.setIcon(QtWidgets.QMessageBox.Warning)
         dialog.setText(
-            f"Private key for {address}:\n\n{wif}\n\n"
+            f"Private key for {address}:\n\n{key}\n\n"
             "Anyone who has this string can spend the coins on that address."
         )
         copy_button = dialog.addButton("Copy", QtWidgets.QMessageBox.ActionRole)
         dialog.addButton(QtWidgets.QMessageBox.Close)
         dialog.exec_()
         if dialog.clickedButton() is copy_button:
-            QtWidgets.QApplication.clipboard().setText(wif)
+            QtWidgets.QApplication.clipboard().setText(key)
 
     def _change_password(self) -> None:
         if not self._unlock_if_needed():

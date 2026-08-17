@@ -4,21 +4,23 @@ A small but complete proof-of-work cryptocurrency, written in Python: a real
 blockchain, peer-to-peer nodes that reach consensus on their own, a wallet with
 proper keys and signatures, a miner, and a block explorer served by every node.
 
-This is version 2 — a full rewrite. The original ScarletCoin (2022) was a
-central Flask server that kept balances in text files; there was no chain, no
-signatures, and the "private key" was a password stored in the clear on the
-server. None of that is left. See [What changed from v1](docs/CHANGES-V2.md).
+Version 3 makes every transaction **anonymous by default**. It uses stealth
+addresses and linkable ring signatures, so the sender, the recipient and the
+link between payments are all hidden — there is no transparent mode. Amounts
+stay visible to keep the money supply auditable. See
+[What changed in v3](docs/CHANGES-V3.md), and
+[What changed from v1 to v2](docs/CHANGES-V2.md).
 
 ```
 ┌────────────────┐   getblocktemplate / submitblock   ┌───────────────┐
 │  scarlet-miner │◄─────────── JSON-RPC ─────────────►│               │
 └────────────────┘                                    │               │        ┌───────────────┐
                                                       │  scarlet-node │◄─ P2P ►│  other nodes  │
-┌────────────────┐   balances, history, broadcast     │               │        └───────────────┘
+┌────────────────┐   scan, balances, broadcast        │               │        └───────────────┘
 │ scarlet-wallet │◄─────────── JSON-RPC ─────────────►│               │
 └────────────────┘   (keys never leave the wallet)    └───────┬───────┘
-                                                              │ HTTP
-                                                     browser ─┘ block explorer
+                                                               │ HTTP
+                                                      browser ─┘ block explorer
 ```
 
 ## What it does
@@ -27,22 +29,29 @@ server. None of that is left. See [What changed from v1](docs/CHANGES-V2.md).
   timestamp, compact difficulty target, nonce) and transactions. The chain with
   the most cumulative proof of work wins; nodes reorganise when a heavier branch
   appears.
-* **UTXO transactions.** Coins are unspent outputs, each locked to a public-key
-  hash. Spending one means revealing the public key and signing the transaction
-  with secp256k1 (ECDSA, canonical low-`s`, deterministic transaction ids).
+* **Anonymous transactions.** Every transaction uses a linkable ring signature
+  (LSAG on secp256k1). An input proves that the spender owns *one* output of a
+  ring, without revealing which, and a key image prevents double-spending. Coins
+  are paid to one-time stealth keys, so no recipient can be linked on-chain.
 * **Real money rules.** 50 SCT per block, halving every 210 000 blocks, 21 000 000
   SCT maximum. Difficulty retargets every 60 blocks towards one block per minute.
   Mined coins mature for 100 blocks before they can be spent.
 * **A peer-to-peer network.** Nodes hand-shake, gossip addresses, announce blocks
   and transactions, serve initial block download, expire orphans, ping idle
-  peers, and ban peers that send invalid blocks. No node is special.
-* **A wallet that owns its keys.** Keys live in a JSON file encrypted with
-  AES-256-GCM behind an scrypt-derived key. Signing happens locally; the node
-  only ever sees finished transactions.
+  peers, and ban peers that send invalid blocks. A Dandelion stem phase hides the
+  origin of a locally-created transaction. No node is special.
+* **A wallet that owns its keys.** Dual-key (view + spend) keys live in a JSON
+  file encrypted with AES-256-GCM behind an scrypt-derived key. The wallet scans
+  the chain for outputs it owns, and signing happens locally; the node only ever
+  sees finished transactions.
 * **A miner.** Asks a node for work, searches the nonce space across CPU cores,
-  submits solved blocks, and collects fees along with the subsidy.
-* **A block explorer** on the node's HTTP port: blocks, transactions,
-  addresses, the mempool, peers and a rich list.
+  submits solved blocks, and collects fees along with the subsidy. Mining
+  rewards go to the miner's stealth address.
+* **A block explorer** on the node's HTTP port: blocks, transactions, the
+  mempool and peers. Balances cannot be shown by the node — only a wallet that
+  holds the view key can see its own.
+* **Tor support.** The wallet, miner and node can route RPC and P2P traffic
+  through a SOCKS5 proxy such as Tor.
 
 ## Install
 
@@ -79,12 +88,12 @@ uv run scarlet-node --network regtest
 uv run scarlet-wallet --network regtest create
 uv run scarlet-wallet --network regtest addresses
 
-# 3. mine to the address you just created
-uv run scarlet-miner --network regtest tXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+# 3. mine to the address you just created (a long stealth address)
+uv run scarlet-miner --network regtest <stealth-address>
 
 # 4. spend some coins
 uv run scarlet-wallet --network regtest balance
-uv run scarlet-wallet --network regtest send tYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY 12.5
+uv run scarlet-wallet --network regtest send <stealth-address> 12.5
 uv run scarlet-wallet --network regtest history
 ```
 
@@ -320,7 +329,7 @@ scarlet-wallet create [--no-password]   # new wallet file, encrypted by default
 scarlet-wallet info | balance | addresses | unspent | history
 scarlet-wallet new [LABEL]              # a fresh receiving address
 scarlet-wallet send ADDRESS AMOUNT|all [--fee-rate N] [--dry-run] [--yes]
-scarlet-wallet export [ADDRESS] | import [WIF] | label ADDRESS LABEL
+scarlet-wallet export [ADDRESS] | import [KEY] | label ADDRESS LABEL
 scarlet-wallet password [--remove]
 
 # which node to talk to (asked once, then remembered)
@@ -349,7 +358,7 @@ and says which it is, rather than looping on a rejected `getblocktemplate`.
 
 | | mainnet | testnet | regtest |
 |---|---|---|---|
-| Address prefix | `S` | `t` | `t` |
+| Stealth address version | 83 | 128 | 128 |
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | Target spacing | 60 s | 60 s | 10 s |
 | Retarget every | 60 blocks | 60 blocks | 20 blocks |
@@ -367,15 +376,16 @@ seeds: point nodes at each other with `--seed` or `--addnode`, or add your own t
 
 ```
 src/scarletcoin/
-  crypto/    hashes, Base58Check, secp256k1 keys and signatures, wallet encryption
+  crypto/    hashes, Base58Check, Schnorr, hash-to-point, stealth addresses,
+             linkable ring signatures, secp256k1 keys, wallet encryption
   core/      consensus: serialisation, transactions, blocks, proof of work,
-             the UTXO set, storage, the chain, the mempool, block templates
-  net/       wire protocol, peers, address book, the node, JSON-RPC, explorer,
-             the public-node directory and the local-or-public chooser
-  wallet/    key store, coin selection, transaction building, CLI
+             the output set, storage, the chain, the mempool, block templates
+  net/       wire protocol, SOCKS5 proxy, peers, address book, the node,
+             JSON-RPC, explorer, the public-node directory and the chooser
+  wallet/    dual-key store, chain scanning, decoy selection, building, CLI
   miner/     the nonce search loop and the solo miner
   gui/       optional PyQt5 wallet and miner
-tests/       437 tests, including two-node networking, reorganisations and pruning
+tests/       421 tests, including two-node networking, reorganisations and pruning
 docs/        protocol and consensus reference, and what changed since v1
 ```
 
@@ -395,7 +405,10 @@ uv run python tools/mine_genesis.py   # only if the genesis definition changes
   the same chain.
 * [docs/PROTOCOL.md](docs/PROTOCOL.md) — consensus rules, serialisation formats,
   the peer-to-peer messages and the RPC methods.
-* [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the rewrite fixed, and why.
+* [docs/CHANGES-V3.md](docs/CHANGES-V3.md) — how version 3 made every transaction
+  anonymous, and the trade-offs that went with it.
+* [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the version 2 rewrite fixed,
+  and why.
 
 ## Honest limitations
 
@@ -403,8 +416,8 @@ It is a hobby chain, and it says so:
 
 * proof of work is pure Python, so the hash rate is tiny; a real network would
   be trivial to out-mine;
-* there is no script language — outputs pay a public-key hash and nothing else,
-  so no multisig, no time locks beyond a block-height `lock_time`, no contracts;
+* there is no script language — there are no multisig, no time locks beyond a
+  block-height `lock_time`, and no contracts;
 * no replace-by-fee, no compact block relay, no headers-first sync, no SPV proofs,
   and no encryption or authentication on the peer-to-peer link;
 * pruning drops old block bodies but there is no way back: a pruned node cannot

@@ -14,6 +14,7 @@ from typing import Any
 import certifi
 
 from scarletcoin.core.params import get_params
+from scarletcoin.net.proxy import SocksHTTPConnection, SocksHTTPSConnection
 
 __all__ = ["RpcClient", "RpcClientError", "default_url"]
 
@@ -59,15 +60,57 @@ def default_url(network: str = "mainnet", host: str = "127.0.0.1") -> str:
 class RpcClient:
     """Calls JSON-RPC methods on a node over HTTP."""
 
-    def __init__(self, url: str, *, token: str | None = None, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        token: str | None = None,
+        timeout: float = 30.0,
+        proxy_host: str | None = None,
+        proxy_port: int = 9050,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
-        self._context = (
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+
+        context = (
             ssl.create_default_context(cafile=certifi.where())
             if self.url.startswith("https://")
             else None
         )
+
+        if proxy_host:
+            handlers: list[urllib.request.BaseHandler] = []
+            from urllib.request import HTTPHandler, HTTPSHandler
+
+            class _ProxyHTTP(HTTPHandler):
+                def http_open(self, req):
+                    def _conn(h, p, **kw):
+                        return SocksHTTPConnection(
+                            proxy_host, proxy_port, h, p, timeout=timeout, **kw
+                        )
+                    return self.do_open(_conn, req)
+
+            handlers.append(_ProxyHTTP())
+            if context:
+                class _ProxyHTTPS(HTTPSHandler):
+                    def https_open(self, req):
+                        def _conn(h, p, **kw):
+                            return SocksHTTPSConnection(
+                                proxy_host, proxy_port, h, p,
+                                timeout=timeout, context=context, **kw,
+                            )
+                        return self.do_open(_conn, req)
+                handlers.append(_ProxyHTTPS())
+
+            self._opener = urllib.request.build_opener(*handlers)
+        else:
+            self._opener = urllib.request.build_opener()
+            if context:
+                https_handler = urllib.request.HTTPSHandler(context=context)
+                self._opener = urllib.request.build_opener(https_handler)
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke ``method`` and return its result.
@@ -98,8 +141,8 @@ class RpcClient:
             request.add_header("Authorization", f"Bearer {self.token}")
         for attempt in range(MAX_ATTEMPTS):
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout, context=self._context
+                with self._opener.open(
+                    request, timeout=self.timeout
                 ) as response:
                     body = response.read()
                 break
@@ -145,17 +188,9 @@ class RpcClient:
         """Return the height of the node's best chain."""
         return self.call("getblockcount")
 
-    def getbalance(self, address: str) -> dict:
-        """Return the balance of an address."""
-        return self.call("getbalance", address)
-
-    def getutxos(self, address: str) -> dict:
-        """Return the unspent outputs of an address."""
-        return self.call("getutxos", address)
-
-    def getaddresshistory(self, address: str, limit: int = 100) -> dict:
-        """Return the transactions that touched an address."""
-        return self.call("getaddresshistory", address, limit)
+    def getblock(self, height: int, verbose: bool = True) -> dict:
+        """Return a block, either its transaction list or just its txids."""
+        return self.call("getblock", height, verbose)
 
     def gettransaction(self, txid: str) -> dict:
         """Return a decoded transaction."""
@@ -172,3 +207,11 @@ class RpcClient:
     def submitblock(self, raw_hex: str) -> dict:
         """Submit a solved block."""
         return self.call("submitblock", raw_hex)
+
+    def getoutputs(self) -> list:
+        """Return all outputs for decoy selection (one_time_key, value, height)."""
+        return self.call("getoutputs")
+
+    def getkeyimages(self) -> list:
+        """Return all spent key images."""
+        return self.call("getkeyimages")

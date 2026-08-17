@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+from ecdsa import SECP256k1
+from ecdsa.ellipticcurve import INFINITY
 
 from scarletcoin.crypto.base58 import (
     Base58Error,
@@ -12,6 +16,7 @@ from scarletcoin.crypto.base58 import (
     b58encode,
 )
 from scarletcoin.crypto.encryption import DecryptionError, decrypt_blob, encrypt_blob
+from scarletcoin.crypto.hash_to_point import hash_to_point, hash_to_point_bytes
 from scarletcoin.crypto.hashing import hash160, hash256, sha256
 from scarletcoin.crypto.keys import (
     CURVE_ORDER,
@@ -20,7 +25,46 @@ from scarletcoin.crypto.keys import (
     InvalidSignatureError,
     PrivateKey,
     PublicKey,
+    generate_stealth_keys,
 )
+from scarletcoin.crypto.ringsig import (
+    extract_key_image,
+    ring_sign,
+    ring_verify,
+)
+from scarletcoin.crypto.schnorr import (
+    point_from_bytes,
+    schnorr_point_to_bytes,
+    schnorr_sign,
+    schnorr_verify,
+)
+from scarletcoin.crypto.stealth import (
+    StealthAddress,
+    StealthError,
+    derive_ephemeral,
+    derive_one_time_public,
+    recognize_output,
+    spend_key_for_output,
+)
+
+_G = SECP256k1.generator
+_N = SECP256k1.order
+
+
+def _secret() -> int:
+    """Return a valid non-zero secp256k1 private scalar."""
+    return int.from_bytes(os.urandom(32), "big") % _N or 1
+
+
+def _point() -> bytes:
+    """Return a random 33-byte compressed curve point."""
+    return schnorr_point_to_bytes(_secret() * _G)
+
+
+def _ring(size: int) -> tuple[list[bytes], list[int]]:
+    """Return a ring of ``size`` random one-time keys and their secret scalars."""
+    secrets = [_secret() for _ in range(size)]
+    return [schnorr_point_to_bytes(secret * _G) for secret in secrets], secrets
 
 
 class TestHashing:
@@ -234,3 +278,142 @@ class TestEncryption:
         envelope["cipher"] = "rot13"
         with pytest.raises(DecryptionError, match="unsupported"):
             decrypt_blob("hunter2", envelope)
+
+
+class TestSchnorr:
+    def test_sign_and_verify_round_trip(self):
+        secret = _secret()
+        pubkey = schnorr_point_to_bytes(secret * _G)
+        message = os.urandom(32)
+        sig = schnorr_sign(secret.to_bytes(32, "big"), message)
+        assert len(sig) == 65
+        assert schnorr_verify(pubkey, message, sig)
+
+    def test_rejects_wrong_message(self):
+        secret = _secret()
+        pubkey = schnorr_point_to_bytes(secret * _G)
+        sig = schnorr_sign(secret.to_bytes(32, "big"), os.urandom(32))
+        assert not schnorr_verify(pubkey, os.urandom(32), sig)
+
+    def test_rejects_wrong_pubkey(self):
+        secret = _secret()
+        other_secret = _secret()
+        other_pubkey = schnorr_point_to_bytes(other_secret * _G)
+        sig = schnorr_sign(secret.to_bytes(32, "big"), os.urandom(32))
+        assert not schnorr_verify(other_pubkey, os.urandom(32), sig)
+
+    def test_rejects_tampered_signature(self):
+        secret = _secret()
+        pubkey = schnorr_point_to_bytes(secret * _G)
+        message = os.urandom(32)
+        sig = bytearray(schnorr_sign(secret.to_bytes(32, "big"), message))
+        sig[10] ^= 0x01
+        assert not schnorr_verify(pubkey, message, bytes(sig))
+
+    def test_rejects_zero_signature(self):
+        secret = _secret()
+        pubkey = schnorr_point_to_bytes(secret * _G)
+        assert not schnorr_verify(pubkey, os.urandom(32), b"\x00" * 65)
+
+    def test_point_serialization_round_trip(self):
+        secret = _secret()
+        P = secret * _G
+        encoded = schnorr_point_to_bytes(P)
+        assert len(encoded) == 33
+        assert encoded[0] in (0x02, 0x03)
+        assert point_from_bytes(encoded) == P
+
+
+class TestHashToPoint:
+    def test_returns_valid_non_infinity_point(self):
+        P = hash_to_point(b"test data")
+        assert P != INFINITY
+        assert P * _N == INFINITY
+
+    def test_is_deterministic(self):
+        data = os.urandom(32)
+        assert hash_to_point(data) == hash_to_point(data)
+
+    def test_hash_to_point_bytes_is_33_bytes_starting_with_02(self):
+        result = hash_to_point_bytes(b"some data")
+        assert len(result) == 33
+        assert result[0] == 0x02
+
+
+class TestStealthAddress:
+    def test_encode_decode_round_trip(self):
+        keypair = generate_stealth_keys()
+        addr = keypair.address(83)
+        text = str(addr)
+        assert StealthAddress.decode(text) == addr
+
+    def test_wrong_network_version_rejected(self):
+        keypair = generate_stealth_keys()
+        addr = keypair.address(83)
+        with pytest.raises(StealthError):
+            StealthAddress.decode(str(addr), expected_version=128)
+
+    def test_bad_checksum_rejected(self):
+        keypair = generate_stealth_keys()
+        text = str(keypair.address(83))
+        broken = text[:-2] + ("2" if text[-2] != "2" else "3") + text[-1]
+        with pytest.raises(StealthError):
+            StealthAddress.decode(broken)
+
+    def test_recipient_recognizes_and_spends_own_output(self):
+        keypair = generate_stealth_keys()
+        addr = keypair.address(83)
+        R, r = derive_ephemeral(os.urandom(32))
+        P = derive_one_time_public(r, addr)
+        assert recognize_output(R, P, keypair.view_secret, addr)
+        spend = spend_key_for_output(R, keypair.view_secret, keypair.spend_secret)
+        assert spend * _G == P
+
+    def test_different_recipient_does_not_recognize(self):
+        keypair = generate_stealth_keys()
+        other = generate_stealth_keys()
+        addr = keypair.address(83)
+        R, r = derive_ephemeral(os.urandom(32))
+        P = derive_one_time_public(r, addr)
+        assert not recognize_output(R, P, other.view_secret, other.address(83))
+
+
+class TestRingSignature:
+    @pytest.mark.parametrize("size", [2, 3, 11])
+    def test_sign_and_verify_round_trip(self, size):
+        ring, secrets = _ring(size)
+        idx = size // 2
+        message = os.urandom(32)
+        sig = ring_sign(ring, idx, secrets[idx], message)
+        assert ring_verify(ring, message, sig)
+
+    def test_rejects_wrong_message(self):
+        ring, secrets = _ring(3)
+        sig = ring_sign(ring, 0, secrets[0], os.urandom(32))
+        assert not ring_verify(ring, os.urandom(32), sig)
+
+    def test_rejects_tampered_key_image(self):
+        ring, secrets = _ring(3)
+        message = os.urandom(32)
+        sig = bytearray(ring_sign(ring, 0, secrets[0], message))
+        sig[-1] ^= 0x01
+        assert not ring_verify(ring, message, bytes(sig))
+
+    def test_double_spend_produces_same_key_image(self):
+        ring, secrets = _ring(5)
+        idx = 2
+        sig1 = ring_sign(ring, idx, secrets[idx], os.urandom(32))
+        sig2 = ring_sign(ring, idx, secrets[idx], os.urandom(32))
+        ki1 = extract_key_image(sig1)
+        ki2 = extract_key_image(sig2)
+        assert ki1 is not None
+        assert ki2 is not None
+        assert ki1 == ki2
+
+    def test_different_secret_index_produces_different_key_image(self):
+        ring, secrets = _ring(5)
+        ki0 = extract_key_image(ring_sign(ring, 0, secrets[0], os.urandom(32)))
+        ki1 = extract_key_image(ring_sign(ring, 1, secrets[1], os.urandom(32)))
+        assert ki0 is not None
+        assert ki1 is not None
+        assert ki0 != ki1

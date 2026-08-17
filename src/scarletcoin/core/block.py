@@ -245,13 +245,13 @@ class Block:
         if merkle_root(txids) != self.header.merkle_root:
             raise BlockError("Merkle root does not match the block's transactions")
 
-    def to_dict(self, address_version: int, *, verbose: bool = False) -> dict:
+    def to_dict(self, *, verbose: bool = False) -> dict:
         """Return a JSON-friendly representation."""
         data = self.header.to_dict()
         data["size"] = self.size()
         data["transaction_count"] = len(self.transactions)
         if verbose:
-            data["transactions"] = [tx.to_dict(address_version) for tx in self.transactions]
+            data["transactions"] = [tx.to_dict() for tx in self.transactions]
         else:
             data["transactions"] = [tx.txid_hex() for tx in self.transactions]
         return data

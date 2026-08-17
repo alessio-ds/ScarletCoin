@@ -771,6 +771,11 @@ class Node:
     ) -> MempoolEntry:
         """Validate a transaction, add it to the mempool and relay it.
 
+        A transaction that originates here (``source is None``) enters the
+        Dandelion stem phase: it is announced to a single peer, which hides
+        which node created it. Transactions received from a peer are broadcast
+        normally.
+
         Raises:
             ValidationError: if the transaction is not acceptable.
         """
@@ -781,7 +786,10 @@ class Node:
             entry.size,
             entry.fee,
         )
-        self._relay(InvItem(InvType.TX, entry.txid), source=source)
+        if source is None:
+            self._relay_stem(InvItem(InvType.TX, entry.txid))
+        else:
+            self._relay(InvItem(InvType.TX, entry.txid), source=source)
         return entry
 
     def _relay(self, item: InvItem, *, source: Peer | None = None) -> None:
@@ -794,6 +802,20 @@ class Node:
                 peer.send(message)
             except PeerDisconnected:
                 continue
+
+    def _relay_stem(self, item: InvItem) -> None:
+        """Dandelion stem relay: announce ``item`` to exactly one peer.
+
+        The chosen peer cannot tell whether this node created the transaction or
+        is forwarding it from someone else, so the origin stays hidden.
+        """
+        candidates = [peer for peer in self.peers if peer.handshake_done.is_set()]
+        if not candidates:
+            return
+        peer = random.choice(candidates)
+        peer.note_inventory(item.hash)
+        with contextlib.suppress(PeerDisconnected):
+            peer.send(protocol.Inv((item,)))
 
     def _remember_orphan(self, block: Block) -> None:
         with self._lock:

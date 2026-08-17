@@ -17,6 +17,7 @@ from scarletcoin.cli_common import (
     connection_path,
     load_connection,
     local_url,
+    parse_proxy,
     read_rpc_token,
     save_connection,
 )
@@ -122,6 +123,11 @@ def add_common_gui_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rpc-url", help="node RPC URL")
     parser.add_argument("--rpc-token", help="node RPC token")
     parser.add_argument(
+        "--proxy",
+        metavar="HOST:PORT",
+        help="route RPC requests through a SOCKS5 proxy, e.g. 127.0.0.1:9050 for Tor",
+    )
+    parser.add_argument(
         "--node",
         metavar="local|public|ask|URL",
         help="which node to use: 'local' for one on this machine, 'public' to pick a"
@@ -154,7 +160,16 @@ def settings_from_args(args: argparse.Namespace) -> ConnectionSettings:
         token = read_rpc_token(args.datadir, args.network) or (saved.token if saved else "")
     else:
         token = saved.token if saved else ""
-    return ConnectionSettings(url, token)
+    proxy_host = saved.proxy_host if saved else ""
+    proxy_port = saved.proxy_port if saved else 9050
+    if getattr(args, "proxy", None):
+        try:
+            parsed = parse_proxy(args.proxy)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            proxy_host, proxy_port = parsed
+    return ConnectionSettings(url, token, proxy_host, proxy_port)
 
 
 def client_from_args(args: argparse.Namespace) -> RpcClient:
@@ -250,6 +265,8 @@ class ConnectionSettings:
 
     url: str
     token: str = ""
+    proxy_host: str = ""
+    proxy_port: int = 9050
 
     @staticmethod
     def path(datadir: Path, network: str) -> Path:
@@ -260,15 +277,27 @@ class ConnectionSettings:
     def load(cls, datadir: Path, network: str) -> ConnectionSettings | None:
         """Read saved settings, or ``None`` if there are none."""
         found = load_connection(datadir, network)
-        return None if found is None else cls(found.url, found.token)
+        return (
+            None
+            if found is None
+            else cls(found.url, found.token, found.proxy_host, found.proxy_port)
+        )
 
     def save(self, datadir: Path, network: str) -> None:
         """Store the settings, keeping the file private."""
-        save_connection(datadir, network, NodeConnection(self.url, self.token))
+        save_connection(
+            datadir, network, NodeConnection(self.url, self.token, self.proxy_host, self.proxy_port)
+        )
 
     def client(self, timeout: float = 20.0) -> RpcClient:
         """Build a client from these settings."""
-        return RpcClient(self.url, token=self.token or None, timeout=timeout)
+        return RpcClient(
+            self.url,
+            token=self.token or None,
+            timeout=timeout,
+            proxy_host=self.proxy_host or None,
+            proxy_port=self.proxy_port,
+        )
 
     def answers(self, timeout: float = 6.0) -> bool:
         """Whether a node actually replies here."""
@@ -294,7 +323,9 @@ class NodeDialog(QtWidgets.QDialog):
         self.setWindowTitle("Node connection")
         self.setMinimumWidth(520)
         self._network = network
-        self.settings = ConnectionSettings(settings.url, settings.token)
+        self.settings = ConnectionSettings(
+            settings.url, settings.token, settings.proxy_host, settings.proxy_port
+        )
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(12)
@@ -321,6 +352,25 @@ class NodeDialog(QtWidgets.QDialog):
         self.token_edit.setPlaceholderText("only for your own node")
         self.token_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         form.addRow("RPC token", self.token_edit)
+
+        self.proxy_box = QtWidgets.QCheckBox("Use a SOCKS5 proxy (e.g. Tor)")
+        self.proxy_box.setChecked(bool(self.settings.proxy_host))
+        form.addRow("", self.proxy_box)
+
+        proxy_row = QtWidgets.QHBoxLayout()
+        self.proxy_host_edit = QtWidgets.QLineEdit(self.settings.proxy_host or "127.0.0.1")
+        self.proxy_host_edit.setPlaceholderText("127.0.0.1")
+        proxy_row.addWidget(self.proxy_host_edit, 1)
+        proxy_row.addWidget(QtWidgets.QLabel(":"))
+        self.proxy_port_edit = QtWidgets.QLineEdit(str(self.settings.proxy_port or 9050))
+        self.proxy_port_edit.setPlaceholderText("9050")
+        self.proxy_port_edit.setMaximumWidth(80)
+        proxy_row.addWidget(self.proxy_port_edit)
+        form.addRow("Proxy host:port", proxy_row)
+        self.proxy_box.toggled.connect(self.proxy_host_edit.setEnabled)
+        self.proxy_box.toggled.connect(self.proxy_port_edit.setEnabled)
+        self.proxy_host_edit.setEnabled(self.proxy_box.isChecked())
+        self.proxy_port_edit.setEnabled(self.proxy_box.isChecked())
         layout.addLayout(form)
 
         self.status = QtWidgets.QLabel()
@@ -344,7 +394,21 @@ class NodeDialog(QtWidgets.QDialog):
         layout.addLayout(buttons)
 
     def _current(self) -> ConnectionSettings:
-        return ConnectionSettings(self.url_edit.text().strip(), self.token_edit.text().strip())
+        host = self.proxy_host_edit.text().strip()
+        port_text = self.proxy_port_edit.text().strip()
+        port = 9050
+        try:
+            if port_text:
+                port = int(port_text)
+        except ValueError:
+            port = 9050
+        proxy_host = host if self.proxy_box.isChecked() and host else ""
+        return ConnectionSettings(
+            self.url_edit.text().strip(),
+            self.token_edit.text().strip(),
+            proxy_host,
+            port,
+        )
 
     def _describe(self, settings: ConnectionSettings) -> str:
         """Try the node and return a human description of what happened."""
@@ -1076,7 +1140,12 @@ def resolve_startup(
 
     if requested and not keyword:
         url = directory.normalise_url(requested) or requested
-        settings = ConnectionSettings(url, getattr(args, "rpc_token", None) or "")
+        settings = ConnectionSettings(
+            url,
+            getattr(args, "rpc_token", None) or "",
+            settings.proxy_host,
+            settings.proxy_port,
+        )
         if settings.url == local_url(network) and not settings.token:
             settings.token = read_rpc_token(datadir, network) or ""
 

@@ -12,7 +12,7 @@ from collections.abc import Iterator
 import pytest
 
 from scarletcoin.core.params import REGTEST
-from scarletcoin.crypto.keys import PrivateKey
+from scarletcoin.crypto.keys import StealthKeyPair, generate_stealth_keys
 from scarletcoin.net.client import RpcClient
 from scarletcoin.net.node import Node, NodeConfig
 from scarletcoin.net.rpc import RpcServer
@@ -28,15 +28,15 @@ def params():
 
 
 @pytest.fixture
-def key() -> PrivateKey:
-    """A throwaway private key."""
-    return PrivateKey.generate()
+def key() -> StealthKeyPair:
+    """A throwaway dual-key pair."""
+    return generate_stealth_keys()
 
 
 @pytest.fixture
-def other_key() -> PrivateKey:
-    """A second throwaway private key."""
-    return PrivateKey.generate()
+def other_key() -> StealthKeyPair:
+    """A second throwaway dual-key pair."""
+    return generate_stealth_keys()
 
 
 @pytest.fixture

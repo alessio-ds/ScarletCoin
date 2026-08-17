@@ -18,7 +18,13 @@ from dataclasses import dataclass, field
 from scarletcoin.core.block import Block
 from scarletcoin.core.params import get_params
 from scarletcoin.core.template import BlockTemplate
-from scarletcoin.crypto.keys import Address, InvalidKeyError
+from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
+from scarletcoin.crypto.stealth import (
+    StealthAddress,
+    StealthError,
+    derive_ephemeral,
+    derive_one_time_public,
+)
 from scarletcoin.miner.solver import NONCE_LIMIT, scan_nonces
 from scarletcoin.net.client import RpcClient, RpcClientError
 
@@ -114,7 +120,7 @@ class Miner:
         self._stop = threading.Event()
         self._chunk = 1 << 16
         self._round = 0
-        self._pubkey_hash: bytes | None = None
+        self._stealth_address: StealthAddress | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -136,24 +142,25 @@ class Miner:
 
     # -------------------------------------------------------------------- helpers
 
-    def _resolve_address(self, network: str) -> bytes:
+    def _resolve_address(self, network: str) -> StealthAddress:
         """Check the payout address belongs to the node's network."""
-        version = get_params(network).address_version
+        version = get_params(network).stealth_version
         try:
-            address = Address.decode(self.address_text, expected_version=version)
-        except InvalidKeyError as exc:
+            address = StealthAddress.decode(self.address_text, expected_version=version)
+        except StealthError as exc:
             raise MiningError(
-                f"{self.address_text!r} is not a valid {network} address: {exc}", fatal=True
+                f"{self.address_text!r} is not a valid {network} stealth address: {exc}",
+                fatal=True,
             ) from exc
-        return address.hash
+        return address
 
     def _fetch_template(self) -> BlockTemplate:
         try:
             data = self.client.getblocktemplate()
         except RpcClientError as exc:
             raise MiningError(f"cannot get work from the node: {exc}") from exc
-        if self._pubkey_hash is None:
-            self._pubkey_hash = self._resolve_address(str(data.get("network", "mainnet")))
+        if self._stealth_address is None:
+            self._stealth_address = self._resolve_address(str(data.get("network", "mainnet")))
         return BlockTemplate.from_dict(data)
 
     def _extra_nonce(self) -> bytes:
@@ -213,9 +220,14 @@ class Miner:
 
     def _mine_template(self, template: BlockTemplate, pool) -> None:
         """Search for a solution to one template until it expires."""
-        assert self._pubkey_hash is not None
+        assert self._stealth_address is not None
+        r_point, r_scalar = derive_ephemeral(os.urandom(32))
+        one_time_point = derive_one_time_public(r_scalar, self._stealth_address)
+        one_time_key = schnorr_point_to_bytes(one_time_point)
+        tx_public_key = schnorr_point_to_bytes(r_point)
         candidate = template.build_block(
-            pubkey_hash=self._pubkey_hash,
+            one_time_key=one_time_key,
+            tx_public_key=tx_public_key,
             extra=self._extra_nonce(),
             timestamp=int(time.time()),
         )

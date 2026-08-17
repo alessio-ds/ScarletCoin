@@ -28,7 +28,6 @@ from scarletcoin.core.serialize import SerializationError
 from scarletcoin.core.template import create_block_template
 from scarletcoin.core.transaction import Transaction
 from scarletcoin.core.validation import ValidationError
-from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.net import explorer
 from scarletcoin.net.node import Node
 from scarletcoin.units import format_bytes
@@ -67,11 +66,8 @@ PUBLIC_METHODS = frozenset(
         "gettransaction",
         "getrawtransaction",
         "getmempool",
-        "validateaddress",
-        "getbalance",
-        "getutxos",
-        "getaddresshistory",
-        "getrichlist",
+        "getoutputs",
+        "getkeyimages",
         "sendrawtransaction",
     }
 )
@@ -122,13 +118,6 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     chain = node.chain
     params = node.params
 
-    def address_hash(text: str) -> bytes:
-        try:
-            address = Address.decode(str(text), expected_version=params.address_version)
-        except InvalidKeyError as exc:
-            raise RpcError(str(exc), INVALID_PARAMS) from exc
-        return address.hash
-
     def entry_or_error(block_hash: bytes):
         entry = chain.get_entry(block_hash)
         if entry is None:
@@ -162,7 +151,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         return chain.difficulty()
 
     def getsupply() -> dict:
-        count, total = node.storage.utxo_stats()
+        count, total = node.storage.output_stats()
         return {"supply": total, "utxo_count": count, "height": chain.height}
 
     def getchainsize() -> dict:
@@ -204,7 +193,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         stored = chain.get_block(block_hash)
         if stored is None:
             raise RpcError(_pruned_or_missing(entry))
-        data = stored.to_dict(params.address_version, verbose=bool(verbose))
+        data = stored.to_dict(verbose=bool(verbose))
         data.update(
             {
                 "height": entry.height,
@@ -236,7 +225,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         found = chain.get_transaction(raw_txid)
         if found is not None:
             transaction, location = found
-            data = transaction.to_dict(params.address_version)
+            data = transaction.to_dict()
             data.update(
                 {
                     "confirmations": chain.confirmations(location.height),
@@ -249,7 +238,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         pooled = node.mempool.get(raw_txid)
         if pooled is None:
             raise RpcError("no transaction with that id")
-        data = pooled.to_dict(params.address_version)
+        data = pooled.to_dict()
         data.update({"confirmations": 0, "height": None, "block": None, "in_mempool": True})
         return data
 
@@ -277,95 +266,23 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     def getmempool() -> dict:
         return node.mempool.to_dict()
 
-    # ------------------------------------------------------------------ addresses
+    # ------------------------------------------------------------------ outputs
 
-    def validateaddress(address: str) -> dict:
-        try:
-            parsed = Address.decode(str(address), expected_version=params.address_version)
-        except InvalidKeyError as exc:
-            return {"valid": False, "reason": str(exc)}
-        return {"valid": True, "address": str(parsed), "pubkey_hash": parsed.hash.hex()}
-
-    def getbalance(address: str) -> dict:
-        pubkey_hash = address_hash(address)
-        coins = node.storage.coins_of(pubkey_hash)
-        height = chain.height
-        confirmed = sum(coin.value for _, coin in coins)
-        spendable = sum(
-            coin.value
-            for _, coin in coins
-            if coin.is_spendable_at(height + 1, params.coinbase_maturity)
-        )
-        return {
-            "address": str(address),
-            "balance": confirmed,
-            "spendable": spendable,
-            "immature": confirmed - spendable,
-            "utxo_count": len(coins),
-            "height": height,
-        }
-
-    def getutxos(address: str) -> dict:
-        pubkey_hash = address_hash(address)
-        height = chain.height
-        coins = node.storage.coins_of(pubkey_hash)
-        return {
-            "address": str(address),
-            "height": height,
-            "utxos": [
-                {
-                    "txid": outpoint.txid[::-1].hex(),
-                    "index": outpoint.index,
-                    "value": coin.value,
-                    "height": coin.height,
-                    "confirmations": chain.confirmations(coin.height),
-                    "coinbase": coin.is_coinbase,
-                    "spendable": coin.is_spendable_at(height + 1, params.coinbase_maturity),
-                }
-                for outpoint, coin in coins
-            ],
-        }
-
-    def getaddresshistory(address: str, limit: int = 100) -> dict:
-        pubkey_hash = address_hash(address)
-        limit = max(1, min(int(limit), 1000))
-        history = []
-        for txid, height in node.storage.address_history(pubkey_hash, limit):
-            found = chain.get_transaction(txid)
-            if found is None:  # pragma: no cover - index follows the chain
-                continue
-            transaction, _ = found
-            received = sum(
-                output.value for output in transaction.outputs if output.pubkey_hash == pubkey_hash
-            )
-            sent = 0
-            for txin in transaction.inputs:
-                if txin.prevout.is_null:
-                    continue
-                parent = chain.get_transaction(txin.prevout.txid)
-                if parent is None:
-                    continue
-                output = parent[0].outputs[txin.prevout.index]
-                if output.pubkey_hash == pubkey_hash:
-                    sent += output.value
-            history.append(
-                {
-                    "txid": txid[::-1].hex(),
-                    "height": height,
-                    "confirmations": chain.confirmations(height),
-                    "received": received,
-                    "sent": sent,
-                    "net": received - sent,
-                    "coinbase": transaction.is_coinbase,
-                }
-            )
-        return {"address": str(address), "transactions": history}
-
-    def getrichlist(limit: int = 10) -> list[dict]:
-        limit = max(1, min(int(limit), 100))
+    def getoutputs() -> list[dict]:
         return [
-            {"address": str(Address(params.address_version, pubkey_hash)), "balance": total}
-            for pubkey_hash, total in node.storage.richest_addresses(limit)
+            {
+                "one_time_key": one_time_key.hex(),
+                "value": value,
+                "height": height,
+                "coinbase": is_coinbase,
+            }
+            for one_time_key, value, height, is_coinbase in node.storage.all_outputs()
+        ]
+
+    def getkeyimages() -> list[dict]:
+        return [
+            {"key_image": key_image.hex(), "height": height}
+            for key_image, height in node.storage.all_key_images()
         ]
 
     # ---------------------------------------------------------------- mining
@@ -451,11 +368,8 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getrawtransaction": getrawtransaction,
         "sendrawtransaction": sendrawtransaction,
         "getmempool": getmempool,
-        "validateaddress": validateaddress,
-        "getbalance": getbalance,
-        "getutxos": getutxos,
-        "getaddresshistory": getaddresshistory,
-        "getrichlist": getrichlist,
+        "getoutputs": getoutputs,
+        "getkeyimages": getkeyimages,
         "getblocktemplate": getblocktemplate,
         "submitblock": submitblock,
         "getpeers": getpeers,
@@ -468,17 +382,49 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     if params.name == "regtest":
 
         def generate(count: int = 1, address: str | None = None) -> list[str]:
-            """Mine blocks immediately; only available on regtest."""
-            from scarletcoin.crypto.keys import PrivateKey
+            """Mine blocks immediately; only available on regtest.
+
+            When ``address`` is given, the rewards are paid to it (a stealth
+            address). Otherwise the rewards go to an unspendable one-time key.
+            """
+            import os
+
+            from scarletcoin.crypto.hash_to_point import hash_to_point_bytes
+            from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
+            from scarletcoin.crypto.stealth import (
+                StealthAddress,
+                StealthError,
+                derive_ephemeral,
+                derive_one_time_public,
+            )
             from scarletcoin.miner.solver import solve_block
 
-            pubkey_hash = (
-                address_hash(address) if address else PrivateKey.generate().public_key().hash160()
-            )
+            stealth: StealthAddress | None = None
+            if address:
+                try:
+                    stealth = StealthAddress.decode(
+                        str(address), expected_version=params.stealth_version
+                    )
+                except StealthError as exc:
+                    raise RpcError(str(exc), INVALID_PARAMS) from exc
+
             mined: list[str] = []
             for _ in range(max(1, int(count))):
                 template = create_block_template(chain, node.mempool)
-                candidate = template.build_block(pubkey_hash=pubkey_hash, extra=b"generate")
+                if stealth is not None:
+                    R_point, r_scalar = derive_ephemeral(os.urandom(32))
+                    one_time_key = schnorr_point_to_bytes(
+                        derive_one_time_public(r_scalar, stealth)
+                    )
+                    tx_public_key = schnorr_point_to_bytes(R_point)
+                else:
+                    one_time_key = hash_to_point_bytes(b"regtest/generate/" + os.urandom(8))
+                    tx_public_key = hash_to_point_bytes(b"regtest/epk/" + os.urandom(8))
+                candidate = template.build_block(
+                    one_time_key=one_time_key,
+                    tx_public_key=tx_public_key,
+                    extra=b"generate",
+                )
                 solved = solve_block(candidate)
                 if solved is None:  # pragma: no cover - regtest always solves
                     raise RpcError("could not solve a block")

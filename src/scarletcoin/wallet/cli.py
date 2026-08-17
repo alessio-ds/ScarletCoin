@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("label", nargs="?", default="", help="optional label")
 
     send = subparsers.add_parser("send", help="send coins")
-    send.add_argument("address", help="destination address")
+    send.add_argument("address", help="stealth destination address")
     send.add_argument("amount", help="amount in SCT, or 'all'")
     send.add_argument("--fee-rate", type=int, help="fee in scar per kilobyte")
     send.add_argument(
@@ -70,11 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("unspent", help="list unspent outputs")
 
-    export = subparsers.add_parser("export", help="print an address's private key")
+    export = subparsers.add_parser("export", help="print an address's private keys")
     export.add_argument("address", nargs="?", help="which address (default: the first one)")
 
-    imp = subparsers.add_parser("import", help="import a private key")
-    imp.add_argument("wif", nargs="?", help="the private key; read from a prompt if omitted")
+    imp = subparsers.add_parser("import", help="import a dual-key pair")
+    imp.add_argument(
+        "keys", nargs="?", help="the 'view_wif:spend_wif' pair; read from a prompt if omitted"
+    )
     imp.add_argument("--label", default="imported", help="label for the imported key")
 
     label = subparsers.add_parser("label", help="rename an address")
@@ -159,7 +161,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_info(args: argparse.Namespace) -> int:
-    wallet = _make_wallet(args)
+    wallet = _make_wallet(args, need_keys=True)
     keystore = wallet.keystore
     print(f"wallet     {keystore.path}")
     print(f"network    {keystore.params.name}")
@@ -167,22 +169,25 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print(f"addresses  {len(keystore.addresses())}")
     try:
         balance = wallet.balance()
-        info = wallet.client.getinfo()
+        info = wallet.node_info()
     except RpcClientError as exc:
         die(str(exc))
     print(f"balance    {_amount(balance.confirmed)}")
     print(f"spendable  {_amount(balance.spendable)}")
     if balance.immature:
         print(f"immature   {_amount(balance.immature)} (mined coins that are still maturing)")
-    print(
-        f"node       height {info['height']}, {info['peers']} peers,"
-        f" {info['mempool_size']} tx in mempool"
-    )
+    if "error" in info:
+        print(f"node       {info['error']}")
+    else:
+        print(
+            f"node       height {info.get('height', '?')}, {info.get('peers', 0)} peers,"
+            f" {info.get('mempool_size', 0)} tx in mempool"
+        )
     return 0
 
 
 def _cmd_balance(args: argparse.Namespace) -> int:
-    wallet = _make_wallet(args)
+    wallet = _make_wallet(args, need_keys=True)
     try:
         balance = wallet.balance()
     except RpcClientError as exc:
@@ -192,7 +197,7 @@ def _cmd_balance(args: argparse.Namespace) -> int:
 
 
 def _cmd_addresses(args: argparse.Namespace) -> int:
-    wallet = _make_wallet(args)
+    wallet = _make_wallet(args, need_keys=True)
     try:
         rows = wallet.balances_by_address()
     except RpcClientError as exc:
@@ -229,7 +234,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
     except RpcClientError as exc:
         die(str(exc))
 
-    paid = sum(output.value for output in result.transaction.outputs) - result.change
+    paid = sum(out.value for out in result.transaction.outputs) - result.change
     print(f"to      {args.address}")
     print(f"amount  {_amount(paid)}")
     print(f"fee     {_amount(result.fee)} ({result.size} bytes)")
@@ -255,7 +260,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_history(args: argparse.Namespace) -> int:
-    wallet = _make_wallet(args)
+    wallet = _make_wallet(args, need_keys=True)
     try:
         entries = wallet.history(args.limit)
     except RpcClientError as exc:
@@ -274,7 +279,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
 
 
 def _cmd_unspent(args: argparse.Namespace) -> int:
-    wallet = _make_wallet(args)
+    wallet = _make_wallet(args, need_keys=True)
     try:
         coins = wallet.coins(spendable_only=False)
     except RpcClientError as exc:
@@ -282,10 +287,10 @@ def _cmd_unspent(args: argparse.Namespace) -> int:
     if not coins:
         print("no unspent outputs")
         return 0
-    for outpoint, coin in coins:
+    for one_time_key, coin, _spend in coins:
         kind = "coinbase" if coin.is_coinbase else "payment"
         print(
-            f"{outpoint.txid[::-1].hex()}:{outpoint.index}"
+            f"{one_time_key.hex()}"
             f"  {_amount(coin.value):>18}  height {coin.height}  {kind}"
         )
     return 0
@@ -295,20 +300,20 @@ def _cmd_export(args: argparse.Namespace) -> int:
     keystore = _load_keystore(args, need_keys=True)
     address = args.address or keystore.default_address()
     try:
-        wif = keystore.export_wif(address)
+        keys = keystore.export_key(address)
     except WalletError as exc:
         die(str(exc))
     print(f"address     {address}")
-    print(f"private key {wif}")
+    print(f"private key {keys}")
     print("\nkeep this secret: anyone who has it can spend the coins on that address")
     return 0
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
     keystore = _load_keystore(args, need_keys=True)
-    wif = args.wif or getpass.getpass("Private key: ")
+    combined = args.keys or getpass.getpass("Private keys (view_wif:spend_wif): ")
     try:
-        address = keystore.import_wif(wif, args.label)
+        address = keystore.import_key(combined, args.label)
         keystore.save()
     except WalletError as exc:
         die(str(exc))

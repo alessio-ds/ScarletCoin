@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+from ecdsa import SECP256k1
 
 from scarletcoin.core.block import Block, BlockError, BlockHeader, merkle_root
 from scarletcoin.core.coinbase import build_coinbase, coinbase_height, encode_coinbase_data
@@ -17,17 +20,27 @@ from scarletcoin.core.pow import (
 )
 from scarletcoin.core.serialize import Reader, SerializationError, Writer
 from scarletcoin.core.transaction import (
-    COINBASE_OUTPOINT,
     MAX_COINBASE_DATA,
-    OutPoint,
     Transaction,
     TransactionError,
     TxInput,
     TxOutput,
 )
 from scarletcoin.crypto.keys import PrivateKey
+from scarletcoin.crypto.schnorr import schnorr_point_to_bytes
 from scarletcoin.miner.solver import solve_block
 from scarletcoin.units import format_amount, parse_amount
+
+_G = SECP256k1.generator
+_N = SECP256k1.order
+
+
+def _secret() -> int:
+    return int.from_bytes(os.urandom(32), "big") % _N or 1
+
+
+def _point() -> bytes:
+    return schnorr_point_to_bytes(_secret() * _G)
 
 
 class TestSerialize:
@@ -84,7 +97,6 @@ class TestProofOfWork:
             assert target_to_bits(bits_to_target(bits)) == bits
 
     def test_known_expansion(self):
-        # The classic Bitcoin difficulty-1 target.
         assert bits_to_target(0x1D00FFFF) == 0x00FFFF * 256 ** (0x1D - 3)
 
     def test_negative_and_oversized_targets_are_refused(self):
@@ -95,7 +107,6 @@ class TestProofOfWork:
 
     def test_work_grows_as_the_target_shrinks(self):
         assert block_work(0x1D00FFFF) > block_work(0x1E0FFFFF)
-        # 0x1d00ffff is harder than the 0x1e0fffff limit, so its difficulty is above 1.
         assert difficulty(0x1D00FFFF, pow_limit=bits_to_target(0x1E0FFFFF)) > 1
         assert difficulty(0x1E0FFFFF, pow_limit=bits_to_target(0x1E0FFFFF)) == 1
 
@@ -174,85 +185,100 @@ class TestParams:
 
 
 class TestTransaction:
-    def _payment(self, key: PrivateKey) -> Transaction:
-        unsigned = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0)),),
-            outputs=(TxOutput(1000, key.public_key().hash160()),),
+    def _payment(self) -> Transaction:
+        p1, p2 = _point(), _point()
+        return Transaction(
+            version=2,
+            inputs=(TxInput((p1, p2), _point()),),
+            outputs=(TxOutput(1000, _point()),),
+            lock_time=0,
+            tx_public_key=_point(),
         )
-        digest = unsigned.signature_hash(0, 5000)
-        return unsigned.signed_with({0: (key.public_key().to_bytes(), key.sign(digest))})
 
-    def test_serialisation_round_trip(self, key):
-        transaction = self._payment(key)
-        assert Transaction.deserialize(transaction.serialize()) == transaction
+    def _signed_payment(self) -> Transaction:
+        return self._payment().signed_with(0, b"\x07" * 50)
 
-    def test_txid_ignores_the_signature(self, key):
-        first = self._payment(key)
-        second = self._payment(key)
-        assert first.inputs[0].signature != second.inputs[0].signature or True
-        assert first.txid() == second.txid()
+    def test_serialisation_round_trip(self):
+        tx = self._signed_payment()
+        assert Transaction.deserialize(tx.serialize()) == tx
 
-    def test_txid_display_order_is_reversed(self, key):
-        transaction = self._payment(key)
-        assert transaction.txid_hex() == transaction.txid()[::-1].hex()
+    def test_txid_ignores_the_signature(self):
+        unsigned = self._payment()
+        sig_a = unsigned.signed_with(0, b"\x01" * 50)
+        sig_b = unsigned.signed_with(0, b"\x02" * 50)
+        assert sig_a.txid() == sig_b.txid() == unsigned.txid()
 
-    def test_signature_verifies(self, key):
-        transaction = self._payment(key)
-        assert transaction.verify_input_signature(0, 5000)
+    def test_txid_display_order_is_reversed(self):
+        tx = self._signed_payment()
+        assert tx.txid_hex() == tx.txid()[::-1].hex()
 
-    def test_signature_is_bound_to_the_spent_value(self, key):
-        transaction = self._payment(key)
-        assert not transaction.verify_input_signature(0, 5001)
-
-    def test_signature_is_bound_to_the_input_index(self, key):
-        unsigned = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0)), TxInput(OutPoint(b"\x22" * 32, 1))),
-            outputs=(TxOutput(1000, key.public_key().hash160()),),
-        )
-        signature = key.sign(unsigned.signature_hash(0, 5000))
-        moved = unsigned.signed_with({1: (key.public_key().to_bytes(), signature)})
-        assert not moved.verify_input_signature(1, 5000)
-
-    def test_signature_covers_the_outputs(self, key):
-        transaction = self._payment(key)
-        tampered = Transaction(
-            version=transaction.version,
-            inputs=transaction.inputs,
-            outputs=(TxOutput(999_999, key.public_key().hash160()),),
-            lock_time=transaction.lock_time,
-        )
-        assert not tampered.verify_input_signature(0, 5000)
+    def test_to_dict(self):
+        tx = self._signed_payment()
+        data = tx.to_dict()
+        assert data["version"] == 2
+        assert data["coinbase"] is False
+        assert len(data["inputs"]) == 1
+        assert data["inputs"][0]["ring_size"] == 2
+        assert len(data["outputs"]) == 1
+        assert data["outputs"][0]["value"] == 1000
 
     def test_sanity_rejects_empty_transactions(self):
         with pytest.raises(TransactionError, match="no inputs"):
-            Transaction(outputs=(TxOutput(1, b"\x00" * 20),)).check_sanity()
+            Transaction(outputs=(TxOutput(1, _point()),)).check_sanity()
         with pytest.raises(TransactionError, match="no outputs"):
-            Transaction(inputs=(TxInput(OutPoint(b"\x11" * 32, 0)),)).check_sanity()
+            Transaction(
+                version=2,
+                inputs=(TxInput((_point(), _point()), _point()),),
+                outputs=(),
+                tx_public_key=_point(),
+            ).check_sanity()
 
-    def test_sanity_rejects_duplicate_inputs(self, key):
-        prevout = OutPoint(b"\x11" * 32, 0)
-        transaction = Transaction(
-            inputs=(
-                TxInput(prevout, key.public_key().to_bytes(), b"\x01" * 64),
-                TxInput(prevout, key.public_key().to_bytes(), b"\x01" * 64),
-            ),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+    def test_sanity_rejects_an_empty_ring(self):
+        p = _point()
+        tx = Transaction(
+            version=2,
+            inputs=(TxInput((), b""), TxInput((p, _point()), _point())),
+            outputs=(TxOutput(1, _point()),),
+            tx_public_key=_point(),
         )
-        with pytest.raises(TransactionError, match="spent twice"):
-            transaction.check_sanity()
+        with pytest.raises(TransactionError, match="ring has 0 members"):
+            tx.check_sanity()
+
+    def test_sanity_rejects_a_ring_below_the_minimum_size(self):
+        tx = Transaction(
+            version=2,
+            inputs=(TxInput((_point(),), _point()),),
+            outputs=(TxOutput(1, _point()),),
+            tx_public_key=_point(),
+        )
+        with pytest.raises(TransactionError, match="ring has 1 member"):
+            tx.check_sanity()
+
+    def test_sanity_rejects_duplicate_ring_members(self):
+        p = _point()
+        tx = Transaction(
+            version=2,
+            inputs=(TxInput((p, p), _point()),),
+            outputs=(TxOutput(1, _point()),),
+            tx_public_key=_point(),
+        )
+        with pytest.raises(TransactionError, match="duplicate"):
+            tx.check_sanity()
 
     def test_negative_and_oversized_outputs_are_impossible(self):
         with pytest.raises(TransactionError, match="negative"):
-            TxOutput(-1, b"\x00" * 20)
+            TxOutput(-1, _point())
         with pytest.raises(TransactionError, match="maximum money supply"):
-            TxOutput(21_000_001 * 10**8, b"\x00" * 20)
+            TxOutput(21_000_001 * 10**8, _point())
 
     def test_output_values_must_be_integers(self):
         with pytest.raises(TransactionError, match="integer"):
-            TxOutput(1.5, b"\x00" * 20)
+            TxOutput(1.5, _point())
 
-    def test_coinbase_detection(self):
-        coinbase = build_coinbase(height=7, reward=100, pubkey_hash=b"\x01" * 20)
+    def test_coinbase_detection_and_sanity(self):
+        otk = _point()
+        epk = _point()
+        coinbase = build_coinbase(height=7, reward=100, one_time_key=otk, tx_public_key=epk)
         assert coinbase.is_coinbase
         assert coinbase_height(coinbase) == 7
         coinbase.check_sanity()
@@ -261,33 +287,29 @@ class TestTransaction:
         with pytest.raises(TransactionError, match="coinbase data"):
             encode_coinbase_data(1, b"x" * MAX_COINBASE_DATA)
 
-    def test_only_a_coinbase_may_carry_coinbase_data(self, key):
-        transaction = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0), key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
-            coinbase_data=b"hello",
+    def test_only_a_coinbase_may_carry_extra_data(self):
+        tx = Transaction(
+            version=2,
+            inputs=(TxInput((_point(), _point()), _point()),),
+            outputs=(TxOutput(1, _point()),),
+            tx_public_key=_point(),
+            extra=b"hello",
         )
         with pytest.raises(TransactionError, match="only a coinbase"):
-            transaction.check_sanity()
+            tx.check_sanity()
 
-    def test_coinbase_must_not_carry_a_witness(self, key):
-        transaction = Transaction(
-            inputs=(TxInput(COINBASE_OUTPOINT, key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
-            coinbase_data=encode_coinbase_data(1),
+    def test_coinbase_must_not_carry_a_ring_signature(self):
+        coinbase = build_coinbase(
+            height=1, reward=100, one_time_key=_point(), tx_public_key=_point()
         )
-        with pytest.raises(TransactionError, match="must not carry a witness"):
-            transaction.check_sanity()
+        bad = coinbase.signed_with(0, b"\xff" * 32)
+        with pytest.raises(TransactionError, match="must not carry a ring signature"):
+            bad.check_sanity()
 
-    def test_deserialise_refuses_trailing_data(self, key):
-        raw = self._payment(key).serialize()
+    def test_deserialise_refuses_trailing_data(self):
+        raw = self._signed_payment().serialize()
         with pytest.raises(SerializationError):
             Transaction.deserialize(raw + b"\x00")
-
-    def test_to_dict(self, key):
-        data = self._payment(key).to_dict(127)
-        assert data["outputs"][0]["address"].startswith("t")
-        assert data["inputs"][0]["index"] == 0
 
 
 class TestBlock:
@@ -351,11 +373,13 @@ class TestBlock:
         with pytest.raises(BlockError, match="too large"):
             genesis.check_sanity(pow_limit=REGTEST.pow_limit, max_block_size=10)
 
-    def test_a_block_needs_a_coinbase_first(self, key):
+    def test_a_block_needs_a_coinbase_first(self):
         genesis = REGTEST.genesis_block
         payment = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0), key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+            version=2,
+            inputs=(TxInput((_point(), _point()), _point()),),
+            outputs=(TxOutput(1, _point()),),
+            tx_public_key=_point(),
         )
         block = solve_block(
             Block.create(

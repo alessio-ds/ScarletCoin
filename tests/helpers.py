@@ -1,8 +1,10 @@
-"""Shared helpers for the test suite."""
+"""Shared helpers for the test suite (anonymous v2)."""
 
 from __future__ import annotations
 
 import itertools
+import os
+import random
 from dataclasses import replace
 
 from scarletcoin.core.block import Block
@@ -12,10 +14,19 @@ from scarletcoin.core.mempool import Mempool
 from scarletcoin.core.params import REGTEST, ChainParams
 from scarletcoin.core.storage import Storage
 from scarletcoin.core.template import create_block_template
-from scarletcoin.core.transaction import Transaction
-from scarletcoin.crypto.keys import PrivateKey
+from scarletcoin.core.transaction import Transaction, TxInput, TxOutput
+from scarletcoin.crypto.hash_to_point import hash_to_point
+from scarletcoin.crypto.keys import StealthKeyPair, generate_stealth_keys
+from scarletcoin.crypto.ringsig import ring_sign
+from scarletcoin.crypto.schnorr import point_from_bytes, schnorr_point_to_bytes
+from scarletcoin.crypto.stealth import (
+    StealthAddress,
+    derive_ephemeral,
+    derive_one_time_public,
+    recognize_output,
+    spend_key_for_output,
+)
 from scarletcoin.miner.solver import solve_block
-from scarletcoin.wallet.builder import build_transaction
 
 _counter = itertools.count()
 
@@ -40,9 +51,27 @@ def make_node_state(tmp_path=None, params: ChainParams | None = None) -> tuple[B
     return chain, mempool
 
 
+def make_stealth_key() -> StealthKeyPair:
+    """A throwaway dual-key pair."""
+    return generate_stealth_keys()
+
+
+def stealth_address(keypair: StealthKeyPair, params: ChainParams) -> StealthAddress:
+    """The StealthAddress for ``keypair`` on ``params``' network."""
+    return keypair.address(params.stealth_version)
+
+
+def coinbase_output(keypair: StealthKeyPair, params: ChainParams) -> tuple[bytes, bytes]:
+    """Return ``(one_time_key, tx_public_key)`` paying a fresh coinbase to ``keypair``."""
+    address = stealth_address(keypair, params)
+    R, r = derive_ephemeral(os.urandom(32))
+    P = derive_one_time_public(r, address)
+    return schnorr_point_to_bytes(P), schnorr_point_to_bytes(R)
+
+
 def mine_block(
     chain: Blockchain,
-    key: PrivateKey,
+    keypair: StealthKeyPair,
     mempool: Mempool | None = None,
     *,
     timestamp: int | None = None,
@@ -50,10 +79,11 @@ def mine_block(
 ) -> Block:
     """Mine one block on top of the current tip and return it (not yet submitted)."""
     template = create_block_template(chain, mempool, timestamp=timestamp)
+    one_time_key, tx_public_key = coinbase_output(keypair, chain.params)
     if extra is None:
         extra = f"test-{next(_counter)}".encode()
     candidate = template.build_block(
-        pubkey_hash=key.public_key().hash160(), extra=extra, timestamp=timestamp
+        one_time_key=one_time_key, tx_public_key=tx_public_key, extra=extra, timestamp=timestamp
     )
     solved = solve_block(candidate)
     assert solved is not None, "regtest blocks are always solvable"
@@ -62,7 +92,7 @@ def mine_block(
 
 def make_block(
     chain: Blockchain,
-    key: PrivateKey,
+    keypair: StealthKeyPair,
     *,
     transactions: list[Transaction] | None = None,
     timestamp: int | None = None,
@@ -73,16 +103,15 @@ def make_block(
     extra: bytes = b"",
     solve: bool = True,
 ) -> Block:
-    """Build a block by hand, bypassing the template's safety clamps.
-
-    Useful for tests that need a block breaking a specific rule.
-    """
+    """Build a block by hand, bypassing the template's safety clamps."""
     tip = chain.tip
     height = tip.height + 1 if height is None else height
+    one_time_key, tx_public_key = coinbase_output(keypair, chain.params)
     coinbase = build_coinbase(
         height=height,
         reward=chain.params.subsidy(height) if reward is None else reward,
-        pubkey_hash=key.public_key().hash160(),
+        one_time_key=one_time_key,
+        tx_public_key=tx_public_key,
         extra=extra or f"hand-{next(_counter)}".encode(),
     )
     candidate = Block.create(
@@ -100,7 +129,7 @@ def make_block(
 
 def mine_and_add(
     chain: Blockchain,
-    key: PrivateKey,
+    keypair: StealthKeyPair,
     mempool: Mempool | None = None,
     *,
     count: int = 1,
@@ -110,38 +139,100 @@ def mine_and_add(
     blocks = []
     for index in range(count):
         stamp = None if timestamp is None else timestamp + index
-        block = mine_block(chain, key, mempool, timestamp=stamp)
+        block = mine_block(chain, keypair, mempool, timestamp=stamp)
         result = chain.add_block(block)
         assert result.status.value == "connected", result
         blocks.append(block)
     return blocks
 
 
+def owned_coins(chain: Blockchain, keypair: StealthKeyPair) -> list[tuple[bytes, int, int]]:
+    """Return ``(one_time_key, spend_key, value)`` for every output owned by ``keypair``."""
+    address = stealth_address(keypair, chain.params)
+    owned: list[tuple[bytes, int, int]] = []
+    for height in range(chain.height + 1):
+        block = chain.get_block_by_height(height)
+        if block is None:
+            continue
+        for tx in block.transactions:
+            R = point_from_bytes(tx.tx_public_key)
+            for out in tx.outputs:
+                P = point_from_bytes(out.one_time_key)
+                if recognize_output(R, P, keypair.view_secret, address):
+                    sk = spend_key_for_output(R, keypair.view_secret, keypair.spend_secret)
+                    owned.append((out.one_time_key, sk, out.value))
+    return owned
+
+
+def decoy_outputs(chain: Blockchain, value: int, *, exclude: set[bytes]) -> list[bytes]:
+    """Return one-time keys of outputs worth ``value`` that are not in ``exclude``."""
+    return [
+        key for key, v, *_ in chain.storage.all_outputs() if v == value and key not in exclude
+    ]
+
+
+def build_spend(
+    chain: Blockchain,
+    keypair: StealthKeyPair,
+    destination: StealthAddress,
+    amount: int,
+    *,
+    fee: int = 1000,
+    ring_size: int = 2,
+) -> Transaction:
+    """Build a signed anonymous transaction spending one of ``keypair``'s outputs."""
+    owned = owned_coins(chain, keypair)
+    spendable = [
+        (otk, sk, value)
+        for otk, sk, value in owned
+        if value >= amount + fee
+        and chain.storage.get_coin(otk).is_spendable_at(
+            chain.height + 1, chain.params.coinbase_maturity
+        )
+    ]
+    assert spendable, "no spendable coin available"
+    one_time_key, spend_key, value = spendable[0]
+
+    exclude = {otk for otk, _, _ in owned}
+    decoys = decoy_outputs(chain, value, exclude=exclude)
+    ring = [one_time_key, *decoys[: max(0, ring_size - 1)]]
+    assert len(ring) >= 2, "not enough outputs of the same value to form a ring"
+    random.shuffle(ring)
+    secret_idx = ring.index(one_time_key)
+
+    R, r = derive_ephemeral(os.urandom(32))
+    dest_otk = schnorr_point_to_bytes(derive_one_time_public(r, destination))
+    outputs = [TxOutput(amount, dest_otk)]
+    change = value - amount - fee
+    if change > 0:
+        change_otk = schnorr_point_to_bytes(
+            derive_one_time_public(r, stealth_address(keypair, chain.params))
+        )
+        outputs.append(TxOutput(change, change_otk))
+
+    key_image = schnorr_point_to_bytes(spend_key * hash_to_point(one_time_key))
+    tx = Transaction(
+        version=2,
+        inputs=(TxInput(tuple(ring), key_image),),
+        outputs=tuple(outputs),
+        lock_time=0,
+        tx_public_key=schnorr_point_to_bytes(R),
+    )
+    sig = ring_sign(ring, secret_idx, spend_key, tx.signature_hash(0))
+    return tx.signed_with(0, sig)
+
+
 def spend(
     chain: Blockchain,
-    key: PrivateKey,
-    destination,
+    keypair: StealthKeyPair,
+    destination: StealthAddress,
     amount: int,
     *,
     fee_per_kb: int = 1000,
     mempool: Mempool | None = None,
 ) -> Transaction:
-    """Build (and optionally submit) a transaction spending ``key``'s coins."""
-    coins = chain.storage.coins_of(key.public_key().hash160())
-    spendable = [
-        (outpoint, coin)
-        for outpoint, coin in coins
-        if coin.is_spendable_at(chain.height + 1, chain.params.coinbase_maturity)
-        and not (mempool is not None and mempool.is_spent(outpoint))
-    ]
-    transaction = build_transaction(
-        spendable_coins=spendable,
-        keys={key.public_key().hash160(): key},
-        outputs=[(destination, amount)],
-        change_hash=key.public_key().hash160(),
-        fee_per_kb=fee_per_kb,
-        params=chain.params,
-    ).transaction
+    """Build a transaction spending ``keypair``'s coins and optionally pool it."""
+    tx = build_spend(chain, keypair, destination, amount, fee=fee_per_kb)
     if mempool is not None:
-        mempool.add(transaction)
-    return transaction
+        mempool.add(tx)
+    return tx

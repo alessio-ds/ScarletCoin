@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Mine ScarletCoins: get work from a node, search for a nonce, submit blocks.",
     )
     parser.add_argument("--version", action="version", version=f"scarletcoin {__version__}")
-    parser.add_argument("address", help="address the block rewards are paid to")
+    parser.add_argument("address", help="stealth address the block rewards are paid to")
     parser.add_argument(
         "--workers",
         type=int,

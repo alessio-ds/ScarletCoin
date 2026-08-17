@@ -26,6 +26,7 @@ __all__ = [
     "load_connection",
     "local_url",
     "make_client",
+    "parse_proxy",
     "read_rpc_token",
     "save_connection",
     "setup_logging",
@@ -58,6 +59,24 @@ def die(message: str, code: int = 1) -> None:
     """Print an error to stderr and exit."""
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def parse_proxy(value: str | None) -> tuple[str, int] | None:
+    """Split a ``HOST:PORT`` proxy address into its parts.
+
+    Returns ``None`` when ``value`` is empty, so a caller can treat an unset
+    proxy as "no proxy".
+    """
+    if not value:
+        return None
+    host, sep, port_text = value.rpartition(":")
+    if not sep or not host:
+        raise ValueError(f"proxy must look like HOST:PORT, got {value!r}")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"proxy port must be a number, got {port_text!r}") from exc
+    return host, port
 
 
 def add_network_arguments(parser: argparse.ArgumentParser) -> None:
@@ -95,6 +114,12 @@ def add_connection_arguments(parser: argparse.ArgumentParser) -> None:
         help="RPC token; read from the node's rpc.token file when omitted",
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="RPC timeout in seconds")
+    parser.add_argument(
+        "--proxy",
+        default=os.environ.get("SCARLETCOIN_PROXY"),
+        metavar="HOST:PORT",
+        help="route RPC requests through a SOCKS5 proxy, e.g. 127.0.0.1:9050 for Tor",
+    )
 
 
 def add_node_choice_arguments(parser: argparse.ArgumentParser) -> None:
@@ -168,10 +193,18 @@ class NodeConnection:
 
     url: str
     token: str = ""
+    proxy_host: str = ""
+    proxy_port: int = 9050
 
     def client(self, timeout: float = 30.0) -> RpcClient:
         """Build a client from this connection."""
-        return RpcClient(self.url, token=self.token or None, timeout=timeout)
+        return RpcClient(
+            self.url,
+            token=self.token or None,
+            timeout=timeout,
+            proxy_host=self.proxy_host or None,
+            proxy_port=self.proxy_port,
+        )
 
     def is_local(self, network: str) -> bool:
         """Whether this points at the default node on this machine."""
@@ -198,7 +231,12 @@ def load_connection(datadir: str | Path, network: str) -> NodeConnection | None:
             continue
         url = str(data.get("rpc_url") or "").strip()
         if url:
-            return NodeConnection(url, str(data.get("rpc_token") or ""))
+            return NodeConnection(
+                url,
+                str(data.get("rpc_token") or ""),
+                str(data.get("proxy_host") or ""),
+                int(data.get("proxy_port") or 9050),
+            )
     return None
 
 
@@ -208,7 +246,15 @@ def save_connection(datadir: str | Path, network: str, connection: NodeConnectio
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
-            json.dumps({"rpc_url": connection.url, "rpc_token": connection.token}, indent=1),
+            json.dumps(
+                {
+                    "rpc_url": connection.url,
+                    "rpc_token": connection.token,
+                    "proxy_host": connection.proxy_host,
+                    "proxy_port": connection.proxy_port,
+                },
+                indent=1,
+            ),
             "utf-8",
         )
     except OSError as exc:  # pragma: no cover - disk errors
@@ -229,4 +275,18 @@ def make_client(args: argparse.Namespace) -> RpcClient:
     """Build an :class:`RpcClient` from parsed command line arguments."""
     url = args.rpc_url or local_url(args.network)
     token = args.rpc_token or read_rpc_token(args.datadir, args.network)
-    return RpcClient(url, token=token, timeout=args.timeout)
+    proxy_host: str | None = None
+    proxy_port = 9050
+    try:
+        parsed = parse_proxy(getattr(args, "proxy", None))
+    except ValueError as exc:
+        die(str(exc))
+    if parsed is not None:
+        proxy_host, proxy_port = parsed
+    return RpcClient(
+        url,
+        token=token,
+        timeout=args.timeout,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
+    )
