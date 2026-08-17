@@ -108,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
         " https://scarletcoin.example.net; reported by getpublicnodes",
     )
     run.add_argument(
+        "--rpc-cors",
+        metavar="ORIGIN",
+        help="value of the Access-Control-Allow-Origin header, so browser wallets"
+        " hosted elsewhere can call this node (default: '*' when --rpc-public)",
+    )
+    run.add_argument(
         "--public-peer",
         dest="public_peers",
         action="append",
@@ -180,6 +186,7 @@ def _run(args: argparse.Namespace) -> int:
         rpc_public=args.rpc_public or args.rpc_public_mining,
         rpc_public_mining=args.rpc_public_mining,
         rpc_advertise=args.rpc_advertise,
+        rpc_cors=args.rpc_cors,
         public_peers=tuple(args.public_peers),
         prune=max(0, args.prune),
         max_outbound=args.max_outbound,

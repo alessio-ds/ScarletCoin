@@ -527,6 +527,95 @@ class TestPublicRpc:
         assert not PUBLIC_METHODS & {"stop", "generate", "addpeer", "submitblock"}
 
 
+class TestCors:
+    """The CORS headers a browser wallet hosted elsewhere depends on."""
+
+    def _get_headers(self, url: str, *, method: str = "GET", data: bytes | None = None):
+        request = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}, method=method
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, dict(response.headers.items())
+
+    def test_public_node_advertises_wildcard_cors(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "cors1", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = RpcServer(node, port=0, token="secret", public=True)
+        server.start()
+        try:
+            _, headers = self._get_headers(server.url + "/")
+            assert headers["Access-Control-Allow-Origin"] == "*"
+            _, headers = self._get_headers(
+                server.url + "/rpc", method="POST", data=b'{"method":"getblockcount"}'
+            )
+            assert headers["Access-Control-Allow-Origin"] == "*"
+            assert headers["Access-Control-Allow-Methods"] == "POST, GET, OPTIONS"
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_private_node_serves_no_cors(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "cors2", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = RpcServer(node, port=0, token="secret")
+        server.start()
+        try:
+            _, headers = self._get_headers(server.url + "/")
+            assert "Access-Control-Allow-Origin" not in headers
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_preflight_options_is_answered(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest", datadir=tmp_path / "cors3", listen=False, rpc=False, p2p_port=0
+            )
+        )
+        node.start()
+        server = RpcServer(node, port=0, token="secret", public=True)
+        server.start()
+        try:
+            status, headers = self._get_headers(server.url + "/rpc", method="OPTIONS")
+            assert status == 204
+            assert headers["Access-Control-Allow-Origin"] == "*"
+            assert "Content-Type" in headers["Access-Control-Allow-Headers"]
+        finally:
+            server.stop()
+            node.stop()
+
+    def test_an_explicit_origin_is_respected(self, tmp_path):
+        node = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "cors4",
+                listen=False,
+                rpc=False,
+                p2p_port=0,
+                rpc_public=True,
+                rpc_cors="https://wallet.example.net",
+            )
+        )
+        node.start()
+        server = RpcServer(node, port=0, token="secret")
+        server.start()
+        try:
+            _, headers = self._get_headers(server.url + "/")
+            assert headers["Access-Control-Allow-Origin"] == "https://wallet.example.net"
+            assert headers["Vary"] == "Origin"
+        finally:
+            server.stop()
+            node.stop()
+
+
 class TestExplorer:
     def _get(self, url: str) -> tuple[int, str]:
         try:

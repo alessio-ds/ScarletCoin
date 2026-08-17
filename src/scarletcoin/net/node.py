@@ -91,6 +91,9 @@ class NodeConfig:
     """Also hand out and accept mining work without a token (implies public)."""
     rpc_advertise: str | None = None
     """Base URL other people should use to reach this node's public RPC."""
+    rpc_cors: str | None = None
+    """Value of the ``Access-Control-Allow-Origin`` header, or ``None`` for the
+    default: ``*`` when the node serves public RPC, disabled otherwise."""
     public_peers: tuple[str, ...] = ()
     """Other public nodes to tell clients about, on top of the network's own."""
     prune: int = 0
@@ -136,6 +139,18 @@ class NodeConfig:
     def serves_public_rpc(self) -> bool:
         """Whether anonymous callers get anything at all."""
         return self.rpc_public or self.rpc_public_mining
+
+    @property
+    def resolved_rpc_cors(self) -> str | None:
+        """The CORS origin this node advertises.
+
+        An explicit ``rpc_cors`` always wins. Without one, a node that serves
+        public RPC allows every origin (``*``), because that is what a browser
+        wallet hosted elsewhere needs; a private node advertises no CORS at all.
+        """
+        if self.rpc_cors is not None:
+            return self.rpc_cors
+        return "*" if self.serves_public_rpc else None
 
 
 class Node:

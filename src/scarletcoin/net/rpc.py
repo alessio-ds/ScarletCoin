@@ -505,6 +505,7 @@ class RpcServer:
         token: str | None = None,
         public: bool | None = None,
         public_mining: bool | None = None,
+        cors: str | None = None,
     ) -> None:
         self.node = node
         self.token = token
@@ -521,6 +522,8 @@ class RpcServer:
         # side of the internet has no other way to find out.
         node.config.rpc_public = self.public
         node.config.rpc_public_mining = self.public_mining
+        self.cors = node.config.resolved_rpc_cors if cors is None else cors
+        """Value of the ``Access-Control-Allow-Origin`` header, or ``None``."""
         self.methods = build_methods(node)
         self._server = ThreadingHTTPServer((host, port), self._make_handler())
         self._server.daemon_threads = True
@@ -659,10 +662,22 @@ class RpcServer:
             def log_message(self, format: str, *args: object) -> None:
                 logger.debug("%s - %s", self.address_string(), format % args)
 
+            def _send_cors_headers(self) -> None:
+                """Emit the CORS headers a browser wallet needs, when enabled."""
+                if not server.cors:
+                    return
+                self.send_header("Access-Control-Allow-Origin", server.cors)
+                self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                self.send_header("Access-Control-Max-Age", "86400")
+                if server.cors != "*":
+                    self.send_header("Vary", "Origin")
+
             def _respond(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                self._send_cors_headers()
                 self.end_headers()
                 if self.command != "HEAD":
                     try:
@@ -671,6 +686,13 @@ class RpcServer:
                         # The client went away; nothing to do, and the handler
                         # loop notices the closed socket and disconnects.
                         self.close_connection = True
+
+            def do_OPTIONS(self) -> None:
+                """Answer a CORS preflight, no matter which path it targets."""
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Content-Length", "0")
+                self._send_cors_headers()
+                self.end_headers()
 
             def _json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
                 self._respond(
