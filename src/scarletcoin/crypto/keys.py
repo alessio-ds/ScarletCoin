@@ -1,8 +1,9 @@
 """secp256k1 keys, addresses and ECDSA signatures.
 
 The heavy lifting is delegated to ``cryptography`` (OpenSSL), so the curve
-arithmetic is constant-time and audited rather than hand-rolled.  This module
-only adds the ScarletCoin encodings on top of it:
+arithmetic is constant-time and audited rather than hand-rolled.  Signatures use
+RFC 6979 deterministic nonces, so no randomness is involved in signing.  This
+module only adds the ScarletCoin encodings on top of it:
 
 * private keys are 32 raw bytes, exported as Base58Check "WIF" strings;
 * public keys are always the 33-byte *compressed* SEC1 form, so a signature can
@@ -39,7 +40,7 @@ __all__ = [
 CURVE_ORDER: Final[int] = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 _HALF_ORDER: Final[int] = CURVE_ORDER // 2
 _CURVE: Final[ec.EllipticCurve] = ec.SECP256K1()
-_PREHASHED: Final[ec.ECDSA] = ec.ECDSA(utils.Prehashed(hashes.SHA256()))
+_PREHASHED: Final[ec.ECDSA] = ec.ECDSA(utils.Prehashed(hashes.SHA256()), deterministic_signing=True)
 
 PRIVATE_KEY_LENGTH: Final[int] = 32
 PUBLIC_KEY_LENGTH: Final[int] = 33

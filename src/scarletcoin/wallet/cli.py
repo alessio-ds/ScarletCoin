@@ -49,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create", help="create a new wallet")
     create.add_argument("--no-password", action="store_true", help="store the keys unencrypted")
 
+    restore = subparsers.add_parser("restore", help="rebuild a wallet from its seed phrase")
+    restore.add_argument(
+        "mnemonic", nargs="?", help="the seed phrase; read from a prompt if omitted"
+    )
+    restore.add_argument("--no-password", action="store_true", help="store the keys unencrypted")
+
     subparsers.add_parser("info", help="show balances and node status")
     subparsers.add_parser("balance", help="show the total balance")
     subparsers.add_parser("addresses", help="list the wallet's addresses")
@@ -151,10 +157,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
         keystore = Keystore.create(path, args.network, password=password)
     except WalletError as exc:
         die(str(exc))
+    mnemonic = keystore.new_mnemonic
     print(f"created {path} for the {args.network} network")
     print(f"first address: {keystore.default_address()}")
+    if mnemonic:
+        print("\nThis is the wallet's recovery phrase. Write it down and keep it secret:")
+        print(f"  {mnemonic}\n")
+        print("Anyone who has these words can spend the coins. They are shown only now.")
     if password is None:
-        print("warning: the private keys are stored unencrypted")
+        print("warning: the wallet is stored unencrypted")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    path = _wallet_path(args)
+    mnemonic = args.mnemonic or getpass.getpass("Recovery phrase: ")
+    password = None if args.no_password else _prompt_password(confirm=True)
+    try:
+        keystore = Keystore.restore(path, args.network, mnemonic, password=password)
+    except WalletError as exc:
+        die(str(exc))
+    print(f"restored {path} for the {args.network} network")
+    print(f"first address: {keystore.default_address()}")
     return 0
 
 
@@ -343,6 +367,7 @@ def _cmd_password(args: argparse.Namespace) -> int:
 
 _COMMANDS = {
     "create": _cmd_create,
+    "restore": _cmd_restore,
     "info": _cmd_info,
     "balance": _cmd_balance,
     "addresses": _cmd_addresses,

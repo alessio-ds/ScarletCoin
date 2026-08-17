@@ -1,6 +1,6 @@
 [project]
 name = "scarletcoin"
-version = "2.1.4"
+version = "3.0.0"
 description = "ScarletCoin: a small but complete proof-of-work cryptocurrency with a real blockchain, peer-to-peer nodes, wallet and miner."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -14,7 +14,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Security :: Cryptography",
 ]
-dependencies = ["certifi>=2023.7.22", "cryptography>=41.0"]
+dependencies = [
+    "certifi>=2023.7.22",
+    "cryptography>=41.0",
+    "ecdsa>=0.19.2",
+]
 
 [project.optional-dependencies]
 gui = ["PyQt5>=5.15"]
@@ -38,7 +42,11 @@ build-backend = "hatchling.build"
 packages = ["src/scarletcoin"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = [
+    "hypothesis>=6.165.10",
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -361,6 +361,11 @@ class Blockchain:
                 return AddBlockResult(BlockStatus.INVALID, block_hash, reason=reason)
 
             height = parent.height + 1
+            checkpoint = self.params.checkpoints.get(height)
+            if checkpoint is not None and block.hash_hex() != checkpoint:
+                reason = f"block does not match the checkpoint at height {height}"
+                self._invalid[block_hash] = reason
+                return AddBlockResult(BlockStatus.INVALID, block_hash, height, reason=reason)
             try:
                 self._check_context(block, parent, height)
             except PrematureBlockError as exc:
@@ -565,7 +570,13 @@ class Blockchain:
             for index, output in enumerate(transaction.outputs):
                 self.storage.add_coin(
                     OutPoint(txid, index),
-                    Coin(output.value, output.pubkey_hash, height, transaction.is_coinbase),
+                    Coin(
+                        output.value,
+                        output.type,
+                        output.payload,
+                        height,
+                        transaction.is_coinbase,
+                    ),
                 )
         self._index_block(block, height=height, spent=spent)
 
@@ -573,11 +584,11 @@ class Blockchain:
         """Update the transaction and address indexes for a connected block."""
         block_hash = block.hash()
         for position, transaction in enumerate(block.transactions):
-            touched = {output.pubkey_hash for output in transaction.outputs}
+            touched = {output.payload for output in transaction.outputs}
             for txin in transaction.inputs:
                 coin = spent.get(txin.prevout)
                 if coin is not None:
-                    touched.add(coin.pubkey_hash)
+                    touched.add(coin.payload)
             self.storage.index_transaction(
                 transaction,
                 block_hash=block_hash,

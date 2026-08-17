@@ -24,7 +24,7 @@ from tests.helpers import make_node_state, mine_and_add, spend
 
 def _coins(*values: int, pubkey_hash: bytes) -> list[tuple[OutPoint, Coin]]:
     return [
-        (OutPoint(bytes([index + 1]) * 32, 0), Coin(value, pubkey_hash, 1, False))
+        (OutPoint(bytes([index + 1]) * 32, 0), Coin(value, 0, pubkey_hash, 1, False))
         for index, value in enumerate(values)
     ]
 
@@ -56,9 +56,13 @@ class TestMempool:
         def payment(amount: int) -> Transaction:
             unsigned = Transaction(
                 inputs=(TxInput(outpoint),),
-                outputs=(TxOutput(amount, other_key.public_key().hash160()),),
+                outputs=(TxOutput.p2pkh(amount, other_key.public_key().hash160()),),
             )
-            signature = key.sign(unsigned.signature_hash(0, coin.value))
+            signature = key.sign(
+                unsigned.signature_hash(
+                    0, coin.value, unsigned.p2pkh_script_code(key.public_key().hash160())
+                )
+            )
             return unsigned.signed_with({0: (key.public_key().to_bytes(), signature)})
 
         pool.add(payment(coin.value - 10_000))
@@ -71,9 +75,13 @@ class TestMempool:
         outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
         unsigned = Transaction(
             inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(coin.value, other_key.public_key().hash160()),),
         )
-        signature = key.sign(unsigned.signature_hash(0, coin.value))
+        signature = key.sign(
+            unsigned.signature_hash(
+                0, coin.value, unsigned.p2pkh_script_code(key.public_key().hash160())
+            )
+        )
         free = unsigned.signed_with({0: (key.public_key().to_bytes(), signature)})
         with pytest.raises(MempoolError, match="below the"):
             pool.add(free)
@@ -85,14 +93,73 @@ class TestMempool:
         with pytest.raises(MempoolError, match="coinbase"):
             pool.add(coinbase)
 
+    def _replaceable(self, key, other_key, amount, fee_per_kb, *, chain, outpoint, coin):
+        unsigned = Transaction(
+            inputs=(TxInput(outpoint, sequence=0xFFFFFFFD),),
+            outputs=(TxOutput.p2pkh(amount, other_key.public_key().hash160()),),
+        )
+        signature = key.sign(
+            unsigned.signature_hash(
+                0, coin.value, unsigned.p2pkh_script_code(key.public_key().hash160())
+            )
+        )
+        return unsigned.signed_with({0: (key.public_key().to_bytes(), signature)})
+
+    def test_replace_by_fee_swaps_a_conflicting_transaction(self, chain_and_pool, key, other_key):
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
+        first = self._replaceable(
+            key, other_key, coin.value - 1000, 1000, chain=chain, outpoint=outpoint, coin=coin
+        )
+        pool.add(first)
+        replacement = self._replaceable(
+            key, other_key, coin.value - 10_000, 50_000, chain=chain, outpoint=outpoint, coin=coin
+        )
+        pool.add(replacement)
+        assert len(pool) == 1
+        assert replacement.txid() in pool
+
+    def test_rbf_requires_a_higher_fee_rate(self, chain_and_pool, key, other_key):
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
+        first = self._replaceable(
+            key, other_key, coin.value - 10_000, 50_000, chain=chain, outpoint=outpoint, coin=coin
+        )
+        pool.add(first)
+        cheaper = self._replaceable(
+            key, other_key, coin.value - 1000, 1000, chain=chain, outpoint=outpoint, coin=coin
+        )
+        with pytest.raises(MempoolError, match="fee rate"):
+            pool.add(cheaper)
+
+    def test_rbf_requires_both_sides_to_opt_in(self, chain_and_pool, key, other_key):
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
+        final = spend(
+            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
+        )
+        assert not final.is_replaceable
+        replacement = self._replaceable(
+            key, other_key, coin.value - 10_000, 50_000, chain=chain, outpoint=outpoint, coin=coin
+        )
+        with pytest.raises(MempoolError, match="not replaceable"):
+            pool.add(replacement)
+
     def test_an_orphan_transaction_is_refused(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(b"\x77" * 32, 0)),),
-            outputs=(TxOutput(10**8, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(10**8, other_key.public_key().hash160()),),
         )
-        signature = key.sign(unsigned.signature_hash(0, 10**9))
+        signature = key.sign(
+            unsigned.signature_hash(
+                0, 10**9, unsigned.p2pkh_script_code(key.public_key().hash160())
+            )
+        )
         orphan = unsigned.signed_with({0: (key.public_key().to_bytes(), signature)})
         with pytest.raises(MissingInputError):
             pool.add(orphan)
@@ -118,9 +185,15 @@ class TestMempool:
         change_index = len(parent.outputs) - 1
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(parent.txid(), change_index)),),
-            outputs=(TxOutput(10**8, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(10**8, other_key.public_key().hash160()),),
         )
-        signature = key.sign(unsigned.signature_hash(0, parent.outputs[change_index].value))
+        signature = key.sign(
+            unsigned.signature_hash(
+                0,
+                parent.outputs[change_index].value,
+                unsigned.p2pkh_script_code(key.public_key().hash160()),
+            )
+        )
         child = unsigned.signed_with({0: (key.public_key().to_bytes(), signature)})
         pool.add(child)
 
@@ -251,4 +324,4 @@ class TestCoinSelection:
         transaction.check_sanity()
         coin = chain.get_coin(transaction.inputs[0].prevout)
         assert coin is not None
-        assert transaction.verify_input_signature(0, coin.value)
+        assert transaction.verify_input_signature(0, coin.value, coin.payload)

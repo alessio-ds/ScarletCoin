@@ -64,7 +64,7 @@ def build_coinbase(
     return Transaction(
         version=1,
         inputs=(TxInput(COINBASE_OUTPOINT),),
-        outputs=(TxOutput(reward, pubkey_hash),),
+        outputs=(TxOutput.p2pkh(reward, pubkey_hash),),
         lock_time=lock_time,
         coinbase_data=encode_coinbase_data(height, extra),
     )

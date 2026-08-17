@@ -10,8 +10,8 @@ import threading
 import time
 from collections import deque
 
-from scarletcoin.net import protocol
-from scarletcoin.net.protocol import HEADER_SIZE, Message
+from scarletcoin.net import cipher, protocol
+from scarletcoin.net.protocol import HEADER_SIZE, Message, ProtocolError
 
 __all__ = ["Peer", "PeerDisconnected"]
 
@@ -45,6 +45,11 @@ class Peer:
 
         self._send_lock = threading.Lock()
         self._closed = threading.Event()
+
+        # Link encryption, enabled once the handshake exchanges ephemeral keys.
+        self._cipher: cipher.P2PCipher | None = None
+        self.ephemeral_key = cipher.generate_ephemeral_key()
+        """This connection's ephemeral secp256k1 key for the ECDH handshake."""
 
         # Handshake state, filled in from the peer's ``version`` message.
         self.version: int | None = None
@@ -101,6 +106,10 @@ class Peer:
 
     # ------------------------------------------------------------------- traffic
 
+    def enable_encryption(self, key: bytes) -> None:
+        """Turn on link encryption with the shared session key."""
+        self._cipher = cipher.P2PCipher(key)
+
     def send(self, message: Message) -> None:
         """Send a message.
 
@@ -109,7 +118,10 @@ class Peer:
         """
         if self.closed:
             raise PeerDisconnected(f"{self} is closed")
-        data = protocol.encode_message(self.magic, message)
+        payload = message.encode()
+        if self._cipher is not None:
+            payload = self._cipher.encrypt(payload)
+        data = protocol.encode_payload(self.magic, message.command.encode("ascii"), payload)
         try:
             with self._send_lock:
                 self.socket.sendall(data)
@@ -146,6 +158,11 @@ class Peer:
         command, length, checksum = protocol.parse_header(header, self.magic)
         payload = self._recv_exactly(length) if length else b""
         self.last_message_at = time.time()
+        if self._cipher is not None:
+            plaintext = self._cipher.decrypt(payload)
+            if plaintext is None:
+                raise ProtocolError(f"{self}: cannot decrypt message (forged or replayed)")
+            return protocol.decode_payload(command, plaintext)
         return protocol.decode_payload(command, payload, checksum)
 
     def close(self) -> None:

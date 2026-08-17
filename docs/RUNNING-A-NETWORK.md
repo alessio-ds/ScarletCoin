@@ -682,7 +682,7 @@ uv run scarlet-node rpc --network mainnet getinfo
 ```
 
 ```json
-{ "network": "mainnet", "genesis": "00000ca129aa591d…", "magic": "SCRL",
+{ "network": "mainnet", "genesis": "000006d229b8401a…", "magic": "SCRL",
   "protocol_version": 1, "version": "2.1.3", "height": 1041, … }
 ```
 

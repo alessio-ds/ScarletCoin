@@ -67,23 +67,26 @@ class MempoolEntry:
 class _PoolView:
     """Coin view combining the chain's UTXO set with the pool's own outputs."""
 
-    __slots__ = ("_chain", "_height", "_mempool")
+    __slots__ = ("_chain", "_height", "_ignored", "_mempool")
 
-    def __init__(self, mempool: Mempool, chain: Blockchain, height: int) -> None:
+    def __init__(
+        self, mempool: Mempool, chain: Blockchain, height: int, ignored: frozenset = frozenset()
+    ) -> None:
         self._mempool = mempool
         self._chain = chain
         self._height = height
+        self._ignored = ignored
 
     def get_coin(self, outpoint: OutPoint) -> Coin | None:
         """Return the coin at ``outpoint``, or ``None`` if it is unavailable."""
-        if outpoint in self._mempool._spent_by:
+        if outpoint in self._mempool._spent_by and outpoint not in self._ignored:
             return None
         entry = self._mempool._by_txid.get(outpoint.txid)
         if entry is not None:
             if outpoint.index >= len(entry.transaction.outputs):
                 return None
             output = entry.transaction.outputs[outpoint.index]
-            return Coin(output.value, output.pubkey_hash, self._height, False)
+            return Coin(output.value, output.type, output.payload, self._height, False)
         return self._chain.get_coin(outpoint)
 
 
@@ -138,9 +141,16 @@ class Mempool:
         with self._lock:
             return list(self._order)
 
-    def coin_view(self, height: int | None = None) -> _PoolView:
-        """Return a coin view that also sees the pool's unconfirmed outputs."""
-        return _PoolView(self, self.chain, self.chain.height + 1 if height is None else height)
+    def coin_view(self, height: int | None = None, ignored: frozenset = frozenset()) -> _PoolView:
+        """Return a coin view that also sees the pool's unconfirmed outputs.
+
+        ``ignored`` outpoints are treated as unspent by the pool, which is what a
+        replace-by-fee candidate needs: it spends the same outputs as the
+        transaction it replaces.
+        """
+        return _PoolView(
+            self, self.chain, self.chain.height + 1 if height is None else height, ignored
+        )
 
     # ------------------------------------------------------------------ mutation
 
@@ -176,17 +186,22 @@ class Mempool:
             if size > self.params.max_block_size // 2:
                 raise MempoolError("transaction is too large to be relayed")
 
-            for txin in transaction.inputs:
-                owner = self._spent_by.get(txin.prevout)
-                if owner is not None:
-                    raise MempoolError(
-                        f"output {txin.prevout} is already spent by mempool transaction"
-                        f" {owner[::-1].hex()}"
-                    )
+            conflicts = {
+                self._spent_by[txin.prevout]
+                for txin in transaction.inputs
+                if txin.prevout in self._spent_by
+            }
+            if conflicts:
+                ignored = frozenset(txin.prevout for txin in transaction.inputs)
+                fee = check_transaction_inputs(
+                    transaction, self.coin_view(height, ignored), height=height, params=self.params
+                )
+                self._replace_conflicts(transaction, fee, size, conflicts)
+            else:
+                fee = check_transaction_inputs(
+                    transaction, self.coin_view(height), height=height, params=self.params
+                )
 
-            fee = check_transaction_inputs(
-                transaction, self.coin_view(height), height=height, params=self.params
-            )
             minimum = self.minimum_fee(size)
             if fee < minimum:
                 raise MempoolError(
@@ -198,9 +213,52 @@ class Mempool:
             self._evict_if_needed()
             return entry
 
+    def _replace_conflicts(self, transaction: Transaction, fee: int, size: int, conflicts) -> None:
+        """Replace pooled transactions this one double-spends, or refuse.
+
+        Replace-by-fee: both the newcomer and every conflicting transaction must
+        have signalled replaceability (every input sequence below
+        ``SEQUENCE_FINAL - 1``), and the newcomer must pay a higher fee rate.
+        """
+        if not transaction.is_replaceable:
+            owner = next(iter(conflicts))
+            raise MempoolError(
+                f"output is already spent by mempool transaction {owner[::-1].hex()};"
+                " it is not replaceable"
+            )
+        for txid in conflicts:
+            old = self._by_txid[txid]
+            if not old.transaction.is_replaceable:
+                raise MempoolError(
+                    f"output is already spent by mempool transaction {txid[::-1].hex()};"
+                    " it is not replaceable"
+                )
+            if fee * old.size <= old.fee * size:
+                raise MempoolError(
+                    f"replacement pays a lower fee rate than {txid[::-1].hex()}"
+                )
+        for txid in conflicts:
+            self.remove(txid)
+
     def minimum_fee(self, size: int) -> int:
         """Return the smallest fee the node will relay for a transaction of ``size``."""
         return max(1, (size * self.params.min_relay_fee_per_kb + 999) // 1000)
+
+    def estimate_fee_rate(self, blocks: int = 1) -> int:
+        """Roughly estimate the fee rate (scar/kB) needed to confirm in ``blocks``.
+
+        This is a simple percentile of the fee rates currently in the pool, not a
+        prediction: for one block it aims at the 90th percentile, and each extra
+        block of patience widens the window.  Falls back to the relay minimum
+        when the pool is empty.
+        """
+        entries = self.entries()
+        if not entries:
+            return self.params.min_relay_fee_per_kb
+        rates = sorted(entry.fee_rate for entry in entries)
+        percentile = max(0.5, 1.0 - 0.1 * max(1, int(blocks)))
+        index = min(len(rates) - 1, int(len(rates) * percentile))
+        return max(self.params.min_relay_fee_per_kb, int(rates[index]))
 
     def _insert(self, entry: MempoolEntry) -> None:
         self._by_txid[entry.txid] = entry

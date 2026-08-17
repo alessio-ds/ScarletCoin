@@ -720,7 +720,7 @@ def _address_page(server: RpcServer, text: str) -> str:
         if found is None:  # pragma: no cover
             continue
         transaction, _ = found
-        received = sum(o.value for o in transaction.outputs if o.pubkey_hash == address.hash)
+        received = sum(o.value for o in transaction.outputs if o.payload == address.hash)
         sent = 0
         for txin in transaction.inputs:
             if txin.prevout.is_null:
@@ -729,7 +729,7 @@ def _address_page(server: RpcServer, text: str) -> str:
             if parent is None:  # pragma: no cover
                 continue
             output = parent[0].outputs[txin.prevout.index]
-            if output.pubkey_hash == address.hash:
+            if output.payload == address.hash:
                 sent += output.value
         rows.append(
             [

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from scarletcoin.core.params import ChainParams
-from scarletcoin.core.transaction import MAX_MONEY, Transaction
+from scarletcoin.core.script import MAX_SCRIPT_SIZE, ScriptError, evaluate_script
+from scarletcoin.core.transaction import MAX_MONEY, OUTPUT_P2PKH, OUTPUT_P2SH, Transaction
 from scarletcoin.core.utxo import CoinView
-from scarletcoin.crypto.hashing import hash160
-from scarletcoin.crypto.keys import InvalidKeyError, InvalidSignatureError
 
 __all__ = [
     "MissingInputError",
@@ -50,6 +49,19 @@ def check_transaction_final(transaction: Transaction, height: int) -> bool:
     return transaction.lock_time == 0 or transaction.lock_time <= height
 
 
+def _verify_p2sh(transaction: Transaction, index: int, prevout_value: int) -> bool:
+    txin = transaction.inputs[index]
+    if not txin.witness or len(txin.witness[0]) > MAX_SCRIPT_SIZE:
+        return False
+    redeem_script = txin.witness[0]
+    arguments = list(txin.witness[1:])
+    digest = transaction.signature_hash(index, prevout_value, redeem_script)
+    try:
+        return evaluate_script(redeem_script, arguments, digest)
+    except ScriptError:
+        return False
+
+
 def check_transaction_inputs(
     transaction: Transaction,
     view: CoinView,
@@ -60,9 +72,9 @@ def check_transaction_inputs(
     """Validate a non-coinbase transaction's inputs and return the fee it pays.
 
     Every input must reference an existing unspent output, be old enough if that
-    output came from a coinbase, reveal the public key the output committed to,
-    and carry a valid signature.  The total value spent must be at least the
-    total value created.
+    output came from a coinbase, and satisfy the output's lock: reveal a matching
+    public key and signature for P2PKH, or run a valid redeem script for P2SH.
+    The total value spent must be at least the total value created.
 
     Args:
         transaction: The transaction to check.
@@ -90,16 +102,15 @@ def check_transaction_inputs(
                 f"input {index} spends a coinbase output from height {coin.height};"
                 f" it matures at height {coin.height + params.coinbase_maturity}"
             )
-        try:
-            txin.check_witness_shape()
-        except ValueError as exc:
-            raise ValidationError(f"input {index}: {exc}") from exc
-        if hash160(txin.public_key) != coin.pubkey_hash:
-            raise ValidationError(f"input {index} reveals a public key with the wrong hash")
-        try:
-            valid = transaction.verify_input_signature(index, coin.value)
-        except (InvalidKeyError, InvalidSignatureError, ValueError) as exc:
-            raise ValidationError(f"input {index}: {exc}") from exc
+        if coin.output_type not in (OUTPUT_P2PKH, OUTPUT_P2SH):
+            raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
+
+        if coin.output_type == OUTPUT_P2PKH:
+            valid = transaction.verify_input_signature(index, coin.value, coin.payload)
+        elif coin.output_type == OUTPUT_P2SH:
+            valid = _verify_p2sh(transaction, index, coin.value)
+        else:  # pragma: no cover - checked just above
+            raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
         if not valid:
             raise ValidationError(f"input {index} has an invalid signature")
         total_in += coin.value

@@ -170,7 +170,7 @@ class TestRpc:
         # These are what two operators compare to prove they run the same chain.
         assert info["genesis"] == REGTEST.genesis_hash[::-1].hex()
         assert info["magic"] == "SCRR"
-        assert info["protocol_version"] == 1
+        assert info["protocol_version"] == 2
         assert info["version"] == __version__
 
     def test_getinfo_and_supply(self, rpc):

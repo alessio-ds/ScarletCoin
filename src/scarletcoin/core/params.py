@@ -41,6 +41,8 @@ class ChainParams:
     magic: bytes
     address_version: int
     wif_version: int
+    script_address_version: int
+    """Version byte of P2SH addresses (distinct prefix from ``address_version``)."""
     default_p2p_port: int
     default_rpc_port: int
 
@@ -68,6 +70,19 @@ class ChainParams:
     """Window used for the "greater than the median of the last N" timestamp rule."""
     min_relay_fee_per_kb: int = 1_000
     """Cheapest fee rate a node will relay or mine, in scar per kilobyte."""
+
+    # BIP-0044
+    bip44_coin_type: int = 0
+    """Coin type used in BIP-0044 derivation paths (m/44'/coin'/...)."""
+
+    # Checkpoints
+    checkpoints: dict[int, str] = field(default_factory=dict)
+    """Known-good block hashes by height, in display (big-endian) hex.
+
+    A block at a checkpoint height whose hash differs is rejected outright.  This
+    prevents reorganisations past the newest checkpoint and bounds how much work
+    an attacker needs to rewrite deep history.
+    """
 
     # Genesis
     genesis_timestamp: int = 0
@@ -156,6 +171,7 @@ MAINNET = ChainParams(
     magic=b"SCRL",
     address_version=63,  # addresses start with "S"
     wif_version=191,
+    script_address_version=50,  # P2SH addresses start with "M"
     default_p2p_port=20333,
     default_rpc_port=20332,
     target_spacing=60,
@@ -163,7 +179,7 @@ MAINNET = ChainParams(
     pow_limit_bits=0x1E0FFFFF,
     genesis_timestamp=1_700_000_000,
     genesis_bits=0x1E0FFFFF,
-    genesis_nonce=366_905,
+    genesis_nonce=816_317,
     genesis_message=_GENESIS_MESSAGE,
     # Long-lived host names of the network's public nodes. A name may hold
     # several A/AAAA records; a starting node tries all of them and then learns
@@ -183,15 +199,17 @@ TESTNET = ChainParams(
     magic=b"SCRT",
     address_version=127,  # addresses start with "t"
     wif_version=239,
+    script_address_version=65,  # P2SH addresses start with "T"
     default_p2p_port=30333,
     default_rpc_port=30332,
     target_spacing=60,
     retarget_interval=60,
     pow_limit_bits=0x1E0FFFFF,
     coinbase_maturity=20,
+    bip44_coin_type=1,
     genesis_timestamp=1_700_000_001,
     genesis_bits=0x1E0FFFFF,
-    genesis_nonce=3_460_012,
+    genesis_nonce=154_650,
     genesis_message=_GENESIS_MESSAGE + b" (testnet)",
     seeds=(),
 )
@@ -201,6 +219,7 @@ REGTEST = ChainParams(
     magic=b"SCRR",
     address_version=127,
     wif_version=239,
+    script_address_version=65,
     default_p2p_port=40333,
     default_rpc_port=40332,
     target_spacing=10,
@@ -208,9 +227,10 @@ REGTEST = ChainParams(
     pow_limit_bits=0x207FFFFF,
     coinbase_maturity=2,
     max_future_time=2 * 60 * 60,
+    bip44_coin_type=1,
     genesis_timestamp=1_700_000_002,
     genesis_bits=0x207FFFFF,
-    genesis_nonce=0,
+    genesis_nonce=5,
     genesis_message=_GENESIS_MESSAGE + b" (regtest)",
     seeds=(),
 )

@@ -43,8 +43,9 @@ __all__ = [
 ]
 
 #: 1: the original schema.  2: ``blocks.pruned``, so a body can be dropped while
-#: the header stays.  Older databases are migrated in place on first open.
-SCHEMA_VERSION = 2
+#: the header stays.  3: the output rewrite (P2SH): the UTXO set gained a type
+#: and the serialisation changed, so the whole database is rebuilt.
+SCHEMA_VERSION = 3
 
 #: How long :meth:`Storage.size_stats` may reuse its last measurement.
 SIZE_CACHE_SECONDS = 5.0
@@ -73,12 +74,13 @@ CREATE TABLE IF NOT EXISTS utxo (
     txid        BLOB NOT NULL,
     idx         INTEGER NOT NULL,
     value       INTEGER NOT NULL,
-    pubkey_hash BLOB NOT NULL,
+    type        INTEGER NOT NULL,
+    payload     BLOB NOT NULL,
     height      INTEGER NOT NULL,
     coinbase    INTEGER NOT NULL,
     PRIMARY KEY (txid, idx)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS utxo_address ON utxo (pubkey_hash);
+CREATE INDEX IF NOT EXISTS utxo_address ON utxo (payload);
 
 CREATE TABLE IF NOT EXISTS undo (
     block_hash BLOB PRIMARY KEY,
@@ -287,15 +289,15 @@ class Storage:
     def _migrate(self, from_version: int) -> None:
         """Bring an older database up to :data:`SCHEMA_VERSION`.
 
-        Migrations only ever add to the schema, so a database stays readable by
-        the build that wrote it until the next block is stored.
+        The schema 3 rewrite changes the serialisation of blocks, transactions
+        and coins, so databases from before it are not migrated: every table is
+        dropped and the chain is rebuilt from the new genesis.  This is the
+        hard-fork reset.
         """
-        if from_version < 2:
-            columns = {
-                row["name"] for row in self._query("SELECT name FROM pragma_table_info('blocks')")
-            }
-            if "pruned" not in columns:
-                self._execute("ALTER TABLE blocks ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0")
+        if from_version < 3:
+            for table in ("blocks", "utxo", "undo", "tx_location", "address_history", "meta"):
+                self._execute(f"DROP TABLE IF EXISTS {table}")
+            self._connection.executescript(_SCHEMA)
         self.set_meta("schema_version", str(SCHEMA_VERSION).encode())
 
     def close(self) -> None:
@@ -628,14 +630,15 @@ class Storage:
     def get_coin(self, outpoint: OutPoint) -> Coin | None:
         """Return the unspent coin at ``outpoint``, if any."""
         row = self._one(
-            "SELECT value, pubkey_hash, height, coinbase FROM utxo WHERE txid = ? AND idx = ?",
+            "SELECT value, type, payload, height, coinbase FROM utxo WHERE txid = ? AND idx = ?",
             (outpoint.txid, outpoint.index),
         )
         if row is None:
             return None
         return Coin(
             value=int(row["value"]),
-            pubkey_hash=bytes(row["pubkey_hash"]),
+            output_type=int(row["type"]),
+            payload=bytes(row["payload"]),
             height=int(row["height"]),
             is_coinbase=bool(row["coinbase"]),
         )
@@ -643,13 +646,14 @@ class Storage:
     def add_coin(self, outpoint: OutPoint, coin: Coin) -> None:
         """Insert an unspent output."""
         self._execute(
-            "INSERT OR REPLACE INTO utxo (txid, idx, value, pubkey_hash, height, coinbase)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO utxo (txid, idx, value, type, payload, height, coinbase)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 outpoint.txid,
                 outpoint.index,
                 coin.value,
-                coin.pubkey_hash,
+                coin.output_type,
+                coin.payload,
                 coin.height,
                 1 if coin.is_coinbase else 0,
             ),
@@ -661,19 +665,20 @@ class Storage:
             "DELETE FROM utxo WHERE txid = ? AND idx = ?", (outpoint.txid, outpoint.index)
         )
 
-    def coins_of(self, pubkey_hash: bytes) -> list[tuple[OutPoint, Coin]]:
-        """Return every unspent output paying ``pubkey_hash``."""
+    def coins_of(self, payload: bytes) -> list[tuple[OutPoint, Coin]]:
+        """Return every unspent output paying ``payload`` (pubkey or script hash)."""
         rows = self._query(
-            "SELECT txid, idx, value, pubkey_hash, height, coinbase"
-            " FROM utxo WHERE pubkey_hash = ? ORDER BY height, txid, idx",
-            (pubkey_hash,),
+            "SELECT txid, idx, value, type, payload, height, coinbase"
+            " FROM utxo WHERE payload = ? ORDER BY height, txid, idx",
+            (payload,),
         )
         return [
             (
                 OutPoint(bytes(row["txid"]), int(row["idx"])),
                 Coin(
                     value=int(row["value"]),
-                    pubkey_hash=bytes(row["pubkey_hash"]),
+                    output_type=int(row["type"]),
+                    payload=bytes(row["payload"]),
                     height=int(row["height"]),
                     is_coinbase=bool(row["coinbase"]),
                 ),
@@ -691,11 +696,11 @@ class Storage:
     def richest_addresses(self, limit: int = 10) -> list[tuple[bytes, int]]:
         """Return the ``limit`` public-key hashes holding the most value."""
         rows = self._query(
-            "SELECT pubkey_hash, SUM(value) AS total FROM utxo"
-            " GROUP BY pubkey_hash ORDER BY total DESC LIMIT ?",
+            "SELECT payload, SUM(value) AS total FROM utxo"
+            " GROUP BY payload ORDER BY total DESC LIMIT ?",
             (limit,),
         )
-        return [(bytes(row["pubkey_hash"]), int(row["total"])) for row in rows]
+        return [(bytes(row["payload"]), int(row["total"])) for row in rows]
 
     # --------------------------------------------------------------- undo data
 

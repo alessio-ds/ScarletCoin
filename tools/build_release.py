@@ -43,6 +43,13 @@ APPS = [
     ("scarlet-node", "src/scarletcoin/net/cli.py", True),
 ]
 
+#: Package data files PyInstaller would otherwise not bundle.  Each entry is a
+#: (source path, destination inside the frozen bundle).
+DATA_FILES = [
+    ("src/scarletcoin/crypto/wordlist", "scarletcoin/crypto/wordlist"),
+    ("src/scarletcoin/miner/_scan_nonces.c", "scarletcoin/miner"),
+]
+
 
 def run(argv: list[str]) -> None:
     """Print and run a command, failing the build if it does."""
@@ -115,6 +122,8 @@ def build_apps(python: Path) -> None:
         ]
         if not console:
             command.append("--noconsole")
+        for source, destination in DATA_FILES:
+            command.extend(["--add-data", f"{source}{os.pathsep}{destination}"])
         command.append(str(ROOT / entry))
         run(command)
 

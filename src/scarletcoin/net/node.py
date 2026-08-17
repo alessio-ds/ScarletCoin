@@ -34,7 +34,7 @@ from scarletcoin.core.params import ChainParams, get_params
 from scarletcoin.core.storage import Storage
 from scarletcoin.core.transaction import Transaction
 from scarletcoin.core.validation import MissingInputError, ValidationError
-from scarletcoin.net import protocol
+from scarletcoin.net import cipher, protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
 from scarletcoin.net.peer import Peer, PeerDisconnected, connect_to
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
@@ -476,6 +476,7 @@ class Node:
                 nonce=self._nonce,
                 listen_port=self.p2p_port,
                 timestamp=int(time.time()),
+                ephemeral_pubkey=cipher.public_bytes(peer.ephemeral_key),
             )
         )
 
@@ -557,6 +558,11 @@ class Node:
         peer.listen_port = message.listen_port or None
         if peer.inbound:
             self._send_version(peer)
+        if message.ephemeral_pubkey:
+            # Both version messages have now been exchanged (plaintext); from
+            # the next message on, the link is encrypted.
+            key = cipher.derive_shared_key(peer.ephemeral_key, message.ephemeral_pubkey)
+            peer.enable_encryption(key)
         peer.send(protocol.VerAck())
         if peer.advertised_address is not None:
             host, port = peer.advertised_address

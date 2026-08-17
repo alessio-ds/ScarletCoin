@@ -46,9 +46,10 @@ explorers.
 * Public key: always the 33-byte compressed SEC1 encoding (`0x02`/`0x03` prefix).
 * Signature: 64 bytes, `r || s`, both big-endian. Only canonical signatures are
   valid: `1 ≤ r < n`, `1 ≤ s ≤ n/2`. High-`s` signatures are rejected, which
-  removes signature malleability.
-* Address: `Base58Check(version || hash160(compressed_public_key))`, where
-  `Base58Check(payload) = Base58(payload || hash256(payload)[:4])`.
+  removes signature malleability. Nonces are deterministic (RFC 6979).
+* P2PKH address: `Base58Check(address_version || hash160(compressed_public_key))`.
+* P2SH address: `Base58Check(script_address_version || hash256(redeem_script)[:20])`.
+* `Base58Check(payload) = Base58(payload || hash256(payload)[:4])`.
 * Private key export ("WIF"): `Base58Check(wif_version || secret || 0x01)`.
   The trailing byte marks the compressed public key, as in Bitcoin.
 
@@ -72,17 +73,24 @@ body:
       per input:
         hash32  previous transaction id
         uint32  previous output index
+        uint32  sequence number
     varint   output count
       per output:
+        uint8   type            (0 = P2PKH, 1 = P2SH)
         uint64  value in scar
-        [20]    public-key hash
+        [20]    hash            (public-key hash, or script hash)
     uint32   lock_time
     varbytes coinbase data           (empty unless this is a coinbase)
 
-witnesses (one pair per input, same order):
-    varbytes public key   (33 bytes, or empty in a coinbase)
-    varbytes signature    (64 bytes, or empty in a coinbase)
+witnesses (one stack per input, same order):
+    varint   item count
+      per item:
+        varbytes  item           (at most 520 bytes each)
 ```
+
+A P2PKH input's witness is `[public key (33), signature (64)]`. A P2SH input's
+witness is `[redeem script, …arguments]`, where the arguments satisfy the redeem
+script (see [Script](#script)). A coinbase input carries an empty witness.
 
 **Transaction id** = `hash256(body)`. Signatures are therefore *not* covered by
 the id: a transaction's identity is fixed the moment its inputs and outputs are
@@ -91,17 +99,52 @@ decided.
 **Signature hash** for input `i` spending an output worth `v`:
 
 ```
-hash256( varbytes("ScarletCoin/sighash/1") || body || uint32(i) || uint64(v) )
+hash256( varbytes("ScarletCoin/sighash/2") || body || uint32(i) || uint64(v) || varbytes(script_code) )
 ```
 
-It commits to every input and output, to which input is being signed, and to the
-value being spent, so a signature cannot be replayed elsewhere.
+`script_code` is the *type byte plus hash* of a P2PKH output, or the full redeem
+script of a P2SH output. The digest therefore commits to every input and output,
+to which input is being signed, to the value being spent, and to the exact lock
+being opened, so a signature cannot be replayed anywhere else.
+
+**Sequence numbers.** An input's `sequence` is `0xffffffff` by default (final).
+An input with `sequence < 0xfffffffe` marks the transaction replace-by-fee
+eligible.
 
 **Coinbase.** The first transaction of a block has exactly one input whose
 previous outpoint is `(0x00…00, 0xffffffff)` and whose witness is empty. Its
 `coinbase data` starts with the block height as a `uint32`, followed by up to 96
 free bytes (extra nonce, messages). Committing to the height makes every
 coinbase unique, so no two blocks can share a transaction id.
+
+## Script
+
+Redeem scripts are small, non-Turing-complete bytecode programs: there are no
+loops and no backwards jumps, so evaluation is bounded by the script's length.
+`OP_HASH160` uses `hash256(x)[:20]`, the same convention as addresses.
+
+| Opcode | Value | Meaning |
+|---|---|---|
+| `OP_0` | `0x00` | push an empty item |
+| `OP_PUSHBYTES_N` | `0x01`…`0x4b` | push the next `N` bytes |
+| `OP_PUSHDATA1` | `0x4c` | push `len` bytes, `len` as one byte |
+| `OP_PUSHDATA2` | `0x4d` | push `len` bytes, `len` as a little-endian `uint16` |
+| `OP_1`…`OP_16` | `0x51`…`0x60` | push the small integer 1…16 |
+| `OP_DUP` | `0x76` | duplicate the top item |
+| `OP_EQUAL` | `0x87` | pop two, push 1 if equal else 0 |
+| `OP_EQUALVERIFY` | `0x88` | `OP_EQUAL`, then fail if the result is 0 |
+| `OP_HASH160` | `0xa9` | replace the top item with `hash256(it)[:20]` |
+| `OP_CHECKSIG` | `0xac` | pop pubkey and signature; verify against the input digest |
+| `OP_CHECKMULTISIG` | `0xae` | m-of-n multisig (see below) |
+
+`OP_CHECKMULTISIG` expects the stack, top first, to hold
+`n pubkeys… m sigs…`; it succeeds when the `m` signatures match `m` of the `n`
+public keys in order. Unlike Bitcoin there is no dummy element, and `m` and `n`
+are bounded to 1…16 and 1…15 public keys. The whole redeem script is at most 520
+bytes.
+
+A script succeeds when it finishes with a truthy top-of-stack item. A standard
+multisig redeem script is `OP_m <pub1>…<pubn> OP_n OP_CHECKMULTISIG`.
 
 ## Blocks
 
@@ -180,14 +223,15 @@ possible before it is stored.
 * every transaction is well formed: at least one input and one output, no output
   negative or above the money supply, no output value sum above it, no duplicate
   inputs, no null outpoint outside a coinbase, coinbase data only in a coinbase,
-  witnesses exactly 33 and 64 bytes long.
+  witness items bounded (at most 100, each at most 520 bytes).
 
 **2. Context** (needs the parent block only)
 
 * `bits` equals the value the retargeting rule requires;
 * `timestamp` is strictly greater than the median of the last 11 blocks;
 * `timestamp` is at most two hours ahead of the validating node's clock;
-* the height in the coinbase data equals the parent's height plus one.
+* the height in the coinbase data equals the parent's height plus one;
+* the block hash matches any checkpoint at that height.
 
 **3. Connection** (needs the UTXO set at the parent)
 
@@ -195,8 +239,10 @@ possible before it is stored.
   created earlier *in the same block*;
 * a coinbase output may only be spent once `coinbase_maturity` blocks have been
   built on top of the block that created it;
-* the revealed public key hashes to the output's `hash160`;
-* the signature is valid and canonical;
+* for a P2PKH output, the revealed public key hashes to the output's hash and
+  the signature is valid and canonical;
+* for a P2SH output, the revealed redeem script hashes to the output's hash and
+  evaluates to a truthy result;
 * input value sum ≥ output value sum; the difference is the fee;
 * every transaction is final: `lock_time == 0` or `lock_time ≤ height`;
 * the coinbase pays at most subsidy plus fees.
@@ -222,7 +268,8 @@ longer valid are dropped.
 | | mainnet | testnet | regtest |
 |---|---|---|---|
 | Magic | `SCRL` | `SCRT` | `SCRR` |
-| Address version | 63 (`S…`) | 127 (`t…`) | 127 (`t…`) |
+| P2PKH address version | 63 (`S…`) | 127 (`t…`) | 127 (`t…`) |
+| P2SH address version | 50 (`M…`) | 65 (`T…`) | 65 (`T…`) |
 | WIF version | 191 | 239 | 239 |
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | `target_spacing` | 60 s | 60 s | 10 s |
@@ -232,7 +279,16 @@ longer valid are dropped.
 | `halving_interval` | 210 000 | 210 000 | 210 000 |
 | `max_block_size` | 1 000 000 | 1 000 000 | 1 000 000 |
 | `min_relay_fee_per_kb` | 1 000 scar | 1 000 scar | 1 000 scar |
-| Genesis hash | `00000ca129aa591dffe251f7815ed4a2ae87db9005945842bd7297a869c9ba1f` | `00000761a924bc06afd611e52b7d4414e780f1a1bd0d9c1203992186a7cd41a5` | `3094ff7a10619c989c07fd4807368bf0b638ea0a62f5f8eb763c5485aa4a3d50` |
+| Genesis hash | `000006d229b8401ae0890255bd8a2dc65891f0018653eb0a1082d4f61cbf8027` | `000001806517072288ef3287e8c1203081318765df5a039ab37bdd2d6aad05c1` | `7812fcab2949f16309257b4813b1b3d478a06b938fd040a4784965b04885f518` |
+
+## Replace-by-fee
+
+A transaction whose inputs all carry `sequence < 0xfffffffe` may be replaced in
+the mempool by another spending the same outputs, as long as the replacement also
+signals replaceability and pays a strictly higher fee rate. Neither side of a
+replacement needs to signal anything for the ordinary first-spend-wins rule to
+apply.
+
 
 ## Peer-to-peer protocol
 
@@ -308,7 +364,8 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `getrawtransaction` | `txid` | hex-encoded transaction |
 | `sendrawtransaction` | `hex` | txid, after validation and relay |
 | `getmempool` | — | pool contents with fees |
-| `validateaddress` | `address` | validity and public-key hash |
+| `estimatefee` | `blocks=1` | a rough fee-rate estimate in scar/kB |
+| `validateaddress` | `address` | validity, type and hash |
 | `getbalance` | `address` | confirmed, spendable and immature balance |
 | `getutxos` | `address` | unspent outputs |
 | `getaddresshistory` | `address`, `limit=100` | transactions touching the address |
@@ -385,12 +442,20 @@ its extra nonce without asking for new work.
 
 ## Wallet file format
 
+A wallet is a BIP-0039 mnemonic sentence whose 64-byte seed is stored encrypted
+(or in the clear, for unencrypted wallets). Addresses are derived along
+`m/44'/coin_type'/0'/0/i` (BIP-0032/BIP-0044); imported private keys are kept
+alongside the seed.
+
 ```json
 {
-  "version": 1,
+  "version": 2,
   "network": "mainnet",
   "encrypted": true,
-  "addresses": [{"address": "S…", "label": "main", "created": 1700000000}],
+  "next_index": 3,
+  "addresses": [
+    {"address": "S…", "label": "main", "created": 1700000000, "path": "m/44'/0'/0'/0/0"}
+  ],
   "crypto": {
     "kdf": "scrypt",
     "kdf_params": {"n": 65536, "r": 8, "p": 1, "salt": "<hex>"},
@@ -401,8 +466,11 @@ its extra nonce without asking for new work.
 }
 ```
 
-The plaintext inside `crypto` is a JSON list of `{"wif", "label", "created"}`.
-The additional authenticated data is `scarletcoin-wallet-v1:<network>`, so a
-wallet file cannot be replayed onto another network. Unencrypted wallets carry
-the same list in a top-level `keys` field instead. Addresses stay readable
-either way, which lets the wallet show balances while locked.
+The plaintext inside `crypto` is `{"seed": "<hex 64 bytes>", "imported": […]}`,
+where each imported entry is `{"wif", "label", "created"}`. The additional
+authenticated data is `scarletcoin-wallet-v2:<network>`, so a wallet file cannot
+be replayed onto another network. Unencrypted wallets carry the same `seed` and
+`imported` keys at the top level instead. Addresses stay readable either way,
+which lets the wallet show balances while locked. Version 1 wallets (a plain
+list of WIF keys) still load and are written back as version 2 with their keys
+kept as imported keys.
