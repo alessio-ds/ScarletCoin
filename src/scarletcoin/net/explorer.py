@@ -104,6 +104,7 @@ def _page(server: RpcServer, title: str, body: str) -> str:
     <a href="/mempool">Mempool</a>
     <a href="/peers">Peers</a>
     <a href="/rich">Rich list</a>
+    <a href="https://alessio-ds.github.io/scarletcoin-web-wallet/">Web wallet</a>
   </nav>
   <form action="/search" method="get">
     <input type="text" name="q" placeholder="block height, hash, txid or address" required>
