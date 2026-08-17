@@ -101,6 +101,7 @@ class WalletWindow(QtWidgets.QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction("&Open wallet...", self._open_wallet)
         file_menu.addAction("&New wallet...", self._create_wallet)
+        file_menu.addAction("&Restore from seed phrase...", self._restore_wallet)
         file_menu.addSeparator()
         file_menu.addAction("&Quit", self.close, QtGui.QKeySequence("Ctrl+Q"))
 
@@ -657,6 +658,55 @@ class WalletWindow(QtWidgets.QMainWindow):
         if keystore is not None:
             self._swap(keystore)
 
+    def _restore_wallet(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Restore wallet from seed phrase",
+            str(self.keystore.path.parent / "wallet.json"),
+            "Wallets (*.json)",
+        )
+        if not path:
+            return
+        phrase, ok = QtWidgets.QInputDialog.getMultiLineText(
+            self, "Restore wallet", "Enter the 12-word recovery phrase:"
+        )
+        if not ok or not phrase.strip():
+            return
+        phrase = " ".join(phrase.strip().split())
+        password, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Restore wallet",
+            "Choose a password (leave empty to store the keys unencrypted):",
+            QtWidgets.QLineEdit.Password,
+        )
+        if not accepted:
+            return
+        if password:
+            repeat, accepted = QtWidgets.QInputDialog.getText(
+                self, "Restore wallet", "Repeat the password:", QtWidgets.QLineEdit.Password
+            )
+            if not accepted or repeat != password:
+                show_error(self, "Restore wallet", "The passwords do not match.")
+                return
+        try:
+            keystore = Keystore.restore(
+                Path(path), self.keystore.params.name, phrase, password=password or None
+            )
+        except WalletError as exc:
+            show_error(self, "Could not restore that wallet", str(exc))
+            return
+        if keystore.new_mnemonic:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Recovery phrase",
+                "Write these words down and keep them secret. Anyone who has them "
+                "can spend the coins. They are shown only now:\n\n" + keystore.new_mnemonic,
+            )
+        QtWidgets.QMessageBox.information(
+            self, "Wallet restored", f"Wallet created at\n{path}"
+        )
+        self._swap(keystore)
+
     def _swap(self, keystore: Keystore) -> None:
         self._stop_polling()
         window = WalletWindow(keystore, self.client)
@@ -772,17 +822,70 @@ def main(argv: list[str] | None = None) -> int:
             show_error(None, "Could not open that wallet", str(exc))
             return 1
     else:
-        answer = QtWidgets.QMessageBox.question(
-            None,
+        box = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Information,
             "ScarletCoin",
-            f"No wallet at\n{path}\n\nCreate one now?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            f"No wallet at\n{path}\n\nWhat would you like to do?",
+            QtWidgets.QMessageBox.Cancel,
         )
-        if answer != QtWidgets.QMessageBox.Yes:
+        create_btn = box.addButton("Create a new wallet", QtWidgets.QMessageBox.ActionRole)
+        restore_btn = box.addButton("Restore from seed phrase", QtWidgets.QMessageBox.ActionRole)
+        open_btn = box.addButton("Open an existing wallet", QtWidgets.QMessageBox.ActionRole)
+        box.exec_()
+        chosen = box.clickedButton()
+        keystore = None
+        if chosen is create_btn:
+            keystore = create_wallet(path, args.network, None)
+        elif chosen is restore_btn:
+            phrase, ok = QtWidgets.QInputDialog.getMultiLineText(
+                None, "Restore wallet", "Enter the 12-word recovery phrase:"
+            )
+            if ok and phrase.strip():
+                phrase = " ".join(phrase.strip().split())
+                password, accepted = QtWidgets.QInputDialog.getText(
+                    None,
+                    "Restore wallet",
+                    "Choose a password (leave empty to store the keys unencrypted):",
+                    QtWidgets.QLineEdit.Password,
+                )
+                if accepted:
+                    if password:
+                        repeat, accepted = QtWidgets.QInputDialog.getText(
+                            None,
+                            "Restore wallet",
+                            "Repeat the password:",
+                            QtWidgets.QLineEdit.Password,
+                        )
+                        if not accepted or repeat != password:
+                            show_error(None, "Restore wallet", "The passwords do not match.")
+                            return 1
+                    try:
+                        keystore = Keystore.restore(
+                            path, args.network, phrase, password=password or None
+                        )
+                        if keystore.new_mnemonic:
+                            QtWidgets.QMessageBox.information(
+                                None,
+                                "Recovery phrase",
+                                "Write these words down and keep them secret. Anyone who has "
+                                "them can spend the coins. They are shown only now:\n\n"
+                                + keystore.new_mnemonic,
+                            )
+                    except WalletError as exc:
+                        show_error(None, "Could not restore that wallet", str(exc))
+                        return 1
+            else:
+                return 1
+        elif chosen is open_btn:
+            try:
+                keystore = load_wallet(path, None)
+            except WalletError as exc:
+                show_error(None, "Could not open that wallet", str(exc))
+                return 1
+        else:
             return 1
-        keystore = create_wallet(path, args.network, None)
-    if keystore is None:
-        return 1
+        if keystore is None:
+            return 1
 
     settings, local_node = resolve_startup(args)
     if settings is None:
