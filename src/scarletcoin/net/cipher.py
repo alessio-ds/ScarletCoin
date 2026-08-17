@@ -40,15 +40,13 @@ def public_bytes(key: ec.EllipticCurvePrivateKey) -> bytes:
     return key.public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
 
 
-def derive_shared_key(
-    private_key: ec.EllipticCurvePrivateKey, peer_public_key: bytes
-) -> bytes:
+def derive_shared_key(private_key: ec.EllipticCurvePrivateKey, peer_public_key: bytes) -> bytes:
     """Derive the 32-byte session key from our ephemeral key and the peer's."""
     peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), peer_public_key)
     shared = private_key.exchange(ec.ECDH(), peer)
-    return HKDF(
-        algorithm=hashes.SHA256(), length=_KEY_SIZE, salt=b"", info=_HKDF_INFO
-    ).derive(shared)
+    return HKDF(algorithm=hashes.SHA256(), length=_KEY_SIZE, salt=b"", info=_HKDF_INFO).derive(
+        shared
+    )
 
 
 class P2PCipher:

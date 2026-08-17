@@ -90,9 +90,7 @@ def p2pkh_redeem(pubkey_hash: bytes) -> bytes:
     if len(pubkey_hash) != 20:
         raise ScriptError("a public-key hash must be 20 bytes")
     return (
-        bytes([OP_DUP, OP_HASH160])
-        + push_data(pubkey_hash)
-        + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+        bytes([OP_DUP, OP_HASH160]) + push_data(pubkey_hash) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
     )
 
 
@@ -154,14 +152,18 @@ def decode_ops(script: bytes) -> list[tuple[int, bytes]]:
                 raise ScriptError("script ends in the middle of a data push")
             ops.append((opcode, script[offset : offset + length]))
             offset += length
-        elif opcode in (
-            OP_DUP,
-            OP_EQUAL,
-            OP_EQUALVERIFY,
-            OP_HASH160,
-            OP_CHECKSIG,
-            OP_CHECKMULTISIG,
-        ) or OP_1 <= opcode <= OP_16:
+        elif (
+            opcode
+            in (
+                OP_DUP,
+                OP_EQUAL,
+                OP_EQUALVERIFY,
+                OP_HASH160,
+                OP_CHECKSIG,
+                OP_CHECKMULTISIG,
+            )
+            or OP_1 <= opcode <= OP_16
+        ):
             ops.append((opcode, b""))
         else:
             raise ScriptError(f"unknown script opcode {opcode:#04x}")

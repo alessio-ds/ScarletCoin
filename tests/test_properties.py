@@ -66,9 +66,7 @@ def test_fee_rounds_up(size: int):
 
 
 @given(
-    st.lists(
-        st.integers(min_value=1, max_value=10**9), min_size=1, max_size=30
-    ),
+    st.lists(st.integers(min_value=1, max_value=10**9), min_size=1, max_size=30),
     st.integers(min_value=1, max_value=10**9),
 )
 def test_coin_selection_covers_the_amount(values, amount):

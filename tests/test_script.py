@@ -67,9 +67,7 @@ class TestScript:
         key = PrivateKey.generate()
         script = p2pkh_redeem(bytes(20))
         digest = b"\x24" * 32
-        assert not evaluate_script(
-            script, [key.sign(digest), key.public_key().to_bytes()], digest
-        )
+        assert not evaluate_script(script, [key.sign(digest), key.public_key().to_bytes()], digest)
 
     def test_unknown_opcode_is_refused(self):
         with pytest.raises(ScriptError, match="unknown script opcode"):

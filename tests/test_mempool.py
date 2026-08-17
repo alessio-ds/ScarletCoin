@@ -138,9 +138,7 @@ class TestMempool:
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)
         outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
-        final = spend(
-            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
-        )
+        final = spend(chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool)
         assert not final.is_replaceable
         replacement = self._replaceable(
             key, other_key, coin.value - 10_000, 50_000, chain=chain, outpoint=outpoint, coin=coin

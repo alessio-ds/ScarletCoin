@@ -7,9 +7,9 @@ mining backend. Because the transaction serialisation changed, the genesis block
 was re-mined and every existing chain is reset: old databases are refused and
 the three networks restart from new genesis blocks.
 
-This document lists every change, the files it touches, and what is still to be
-done. The normative wire format is [PROTOCOL.md](PROTOCOL.md); the honest list
-of remaining limitations is in the [README](../README.md#honest-limitations).
+This document lists every change and the files it touches. The normative wire
+format is [PROTOCOL.md](PROTOCOL.md); the honest list of remaining limitations
+is in the [README](../README.md#honest-limitations).
 
 * [Consensus changes](#consensus-changes)
 * [Crypto and wallets](#crypto-and-wallets)
@@ -20,7 +20,8 @@ of remaining limitations is in the [README](../README.md#honest-limitations).
 * [New genesis and the reset](#new-genesis-and-the-reset)
 * [Dependencies](#dependencies)
 * [Compatibility](#compatibility)
-* [Still to do](#still-to-do)
+* [Known limitation](#known-limitation)
+* [Sibling projects](#sibling-projects)
 
 ## Consensus changes
 
@@ -115,6 +116,16 @@ key (version 1) stays in the clear, so old and new nodes interoperate. The
 envelope framing is unchanged for plaintext; encrypted links wrap only the
 payload, and the checksum is taken over the ciphertext.
 
+### Headers-first synchronisation (`net/protocol.py`, `core/storage.py`, `core/chain.py`, `net/node.py`)
+
+Initial block download now happens in two phases. After the handshake a node
+behind its peer sends `getheaders` and receives up to 2000 headers, which are
+checked for proof of work, difficulty and their link to a known parent and
+stored in a new `headers` table. Once the header chain is ahead, the missing
+bodies are requested from any connected peer with `getdata`, in parallel, and
+the process repeats until the chains agree. This removes the old one-peer,
+full-block sequential download.
+
 ## Mining
 
 ### Native SHA-256 backend (`miner/_scan_nonces.c`, `miner/solver.py`)
@@ -133,6 +144,12 @@ C source and the wordlist so PyInstaller builds carry both.
   minimum.
 * **Prometheus metrics** (`net/rpc.py`) — `GET /metrics` exposes height, peers,
   mempool size, UTXO count, supply, difficulty and chain sizes in text format.
+* **Live explorer updates** (`net/websocket.py`, new; `net/rpc.py`,
+  `net/explorer.py`) — a WebSocket endpoint pushes `block`, `reorg` and `tx`
+  events; the explorer reloads when a new block arrives. Enabled by default and
+  reported in `getinfo` under `ws_port`.
+* **Explorer favicon** — the browser wallet's icon is served at `/icon.svg` and
+  `/favicon.ico`.
 * **`sweep`** — already expressible as `scarlet-wallet send ADDRESS all` via
   `Wallet.send_everything`; no new command was needed.
 * `validateaddress` now recognises P2SH addresses and reports the type.
@@ -145,11 +162,12 @@ C source and the wordlist so PyInstaller builds carry both.
   spending through `check_transaction_inputs`.
 * `tests/test_cipher.py` — encryption round-trip, tamper detection, version
   message with/without an ephemeral key.
+* `tests/test_websocket.py` — WebSocket broadcast and node block-event push.
 * `tests/test_properties.py` — `hypothesis` properties over target encoding,
   Base58, varbytes, amount formatting and coin selection.
-* RBF and checkpoint cases added to `tests/test_mempool.py` and
+* RBF, checkpoint and header-sync cases added to `tests/test_mempool.py` and
   `tests/test_chain.py`; `test_crypto.py` gained the RFC 6979 vector.
-* The suite grew from 456 to 512 tests; `ruff` passes.
+* The suite grew from 456 to 524 tests; `ruff` passes.
 
 ## New genesis and the reset
 
@@ -170,6 +188,7 @@ chain restarts from the new genesis. The reference public node
 
 * Added `ecdsa` (pure Python elliptic-curve arithmetic, used by BIP-0032 public
   derivation — the `cryptography` API does not expose point addition).
+* Added `websockets` (pure Python, for the explorer's live-update endpoint).
 * Added `hypothesis` to the development group.
 * Version bumped to `2.2.0` in both `pyproject.toml` and
   `src/scarletcoin/__init__.py`.
@@ -181,30 +200,9 @@ with earlier releases, and its chains start from new genesis blocks. Private
 keys remain valid secp256k1 keys, and version 1 wallet files are still readable
 (they upgrade to format 2 on save).
 
-## Headers-first synchronisation (item 7)
+## Known limitation
 
-Initial block download now happens in two phases. After the handshake a node
-behind its peer sends `getheaders` and receives up to 2000 headers, which are
-checked for proof of work, difficulty and their link to a known parent and
-stored in a new `headers` table (`core/storage.py`, `core/chain.py`). Once the
-header chain is ahead, the missing bodies are requested from any connected peer
-with `getdata`, in parallel, and the process repeats until the chains agree.
-The `getheaders`/`headers` messages live in `net/protocol.py`; `net/node.py`
-drives the download.
-
-## Explorer WebSocket (item 11)
-
-The node runs a WebSocket endpoint (`net/websocket.py`, the `websockets`
-library) that pushes `block`, `reorg` and `tx` events to connected browsers. The
-explorer embeds a small script that reloads the page when a new block arrives.
-The endpoint is enabled by default (`NodeConfig.ws`) and its port is reported in
-`getinfo` under `ws_port`.
-
-## Still to do
-
-One planned item remains blocked:
-
-### Native secp256k1 for signature verification (item 2, blocked)
+### Native secp256k1 for signature verification
 
 `coincurve` and `python-secp256k1` do not build on Python 3.14 in this
 environment (packaging/build failures), so the planned swap from `cryptography`

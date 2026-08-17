@@ -234,9 +234,7 @@ class Mempool:
                     " it is not replaceable"
                 )
             if fee * old.size <= old.fee * size:
-                raise MempoolError(
-                    f"replacement pays a lower fee rate than {txid[::-1].hex()}"
-                )
+                raise MempoolError(f"replacement pays a lower fee rate than {txid[::-1].hex()}")
         for txid in conflicts:
             self.remove(txid)
 

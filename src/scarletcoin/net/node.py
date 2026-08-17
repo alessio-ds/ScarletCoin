@@ -284,9 +284,7 @@ class Node:
                 node.ws_hub.broadcast({"type": "block", "height": height, "hash": block.hash_hex()})
 
             def block_disconnected(self, block: Block, height: int) -> None:
-                node.ws_hub.broadcast(
-                    {"type": "reorg", "height": height, "hash": block.hash_hex()}
-                )
+                node.ws_hub.broadcast({"type": "reorg", "height": height, "hash": block.hash_hex()})
 
         return _Listener()
 
@@ -878,9 +876,7 @@ class Node:
             entry.size,
             entry.fee,
         )
-        self.ws_hub.broadcast(
-            {"type": "tx", "txid": entry.txid[::-1].hex(), "fee": entry.fee}
-        )
+        self.ws_hub.broadcast({"type": "tx", "txid": entry.txid[::-1].hex(), "fee": entry.fee})
         self._relay(InvItem(InvType.TX, entry.txid), source=source)
         return entry
 

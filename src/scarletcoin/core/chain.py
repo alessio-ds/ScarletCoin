@@ -75,6 +75,7 @@ class _ChainNode:
     bits: int
     timestamp: int
 
+
 #: Fewest recent blocks a pruned node keeps.
 #:
 #: Pruning throws away the undo data that a reorganisation needs, so the margin
@@ -343,14 +344,22 @@ class Blockchain:
         entry = self.storage.get_entry(block_hash)
         if entry is not None:
             return _ChainNode(
-                entry.hash, entry.height, entry.prev_hash, entry.chainwork,
-                entry.bits, entry.timestamp,
+                entry.hash,
+                entry.height,
+                entry.prev_hash,
+                entry.chainwork,
+                entry.bits,
+                entry.timestamp,
             )
         header = self.storage.header_entry(block_hash)
         if header is not None:
             return _ChainNode(
-                header.hash, header.height, header.prev_hash, header.chainwork,
-                header.header.bits, header.header.timestamp,
+                header.hash,
+                header.height,
+                header.prev_hash,
+                header.chainwork,
+                header.header.bits,
+                header.header.timestamp,
             )
         return None
 
@@ -375,8 +384,7 @@ class Blockchain:
             expected = self._next_bits_for_node(parent, height)
             if header.bits != expected:
                 return (
-                    f"wrong difficulty: header says {header.bits:#010x},"
-                    f" expected {expected:#010x}"
+                    f"wrong difficulty: header says {header.bits:#010x}, expected {expected:#010x}"
                 )
             self.storage.put_header(
                 header, height=height, chainwork=parent.chainwork + block_work(header.bits)

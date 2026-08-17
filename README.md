@@ -39,8 +39,9 @@ See [What changed from v1](docs/CHANGES-V2.md).
   SCT maximum. Difficulty retargets every 60 blocks towards one block per minute.
   Mined coins mature for 100 blocks before they can be spent.
 * **A peer-to-peer network.** Nodes hand-shake, gossip addresses, announce blocks
-  and transactions, serve initial block download, expire orphans, ping idle
-  peers, and ban peers that send invalid blocks. No node is special.
+  and transactions, sync headers first and their bodies in parallel, encrypt
+  their links, expire orphans, ping idle peers, and ban peers that send invalid
+  blocks. No node is special.
 * **A wallet that owns its keys.** A BIP-0039 recovery phrase derives every key
   (BIP-0032/0044); the seed lives in a JSON file encrypted with AES-256-GCM
   behind an scrypt-derived key. Signing happens locally; the node only ever sees
@@ -410,8 +411,7 @@ uv run python tools/mine_genesis.py   # only if the genesis definition changes
 * [docs/PROTOCOL.md](docs/PROTOCOL.md) — consensus rules, serialisation formats,
   the peer-to-peer messages and the RPC methods.
 * [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the rewrite fixed, and why.
-* [docs/CHANGES-V2.2.md](docs/CHANGES-V2.2.md) — the version 2.2 upgrade, and what is
-  still to do.
+* [docs/CHANGES-V2.2.md](docs/CHANGES-V2.2.md) — the version 2.2 upgrade.
 
 ## Honest limitations
 
@@ -423,8 +423,7 @@ It is a hobby chain, and it says so:
 * the script language is deliberately small: P2SH redeem scripts support
   multisig and single-key spending, but there are no contracts and no time
   locks beyond a block-height `lock_time`;
-* no compact block relay, no headers-first sync, no SPV proofs, and no
-  encryption or authentication on the peer-to-peer link;
+* no compact block relay and no SPV proofs;
 * pruning drops old block bodies but there is no way back: a pruned node cannot
   help a new one sync, and cannot show the transactions it forgot;
 * the wallet trusts the node it is configured to talk to — a public node most of
