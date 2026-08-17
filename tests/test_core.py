@@ -177,9 +177,11 @@ class TestTransaction:
     def _payment(self, key: PrivateKey) -> Transaction:
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(b"\x11" * 32, 0)),),
-            outputs=(TxOutput(1000, key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(1000, key.public_key().hash160()),),
         )
-        digest = unsigned.signature_hash(0, 5000)
+        digest = unsigned.signature_hash(
+            0, 5000, unsigned.p2pkh_script_code(key.public_key().hash160())
+        )
         return unsigned.signed_with({0: (key.public_key().to_bytes(), key.sign(digest))})
 
     def test_serialisation_round_trip(self, key):
@@ -189,7 +191,6 @@ class TestTransaction:
     def test_txid_ignores_the_signature(self, key):
         first = self._payment(key)
         second = self._payment(key)
-        assert first.inputs[0].signature != second.inputs[0].signature or True
         assert first.txid() == second.txid()
 
     def test_txid_display_order_is_reversed(self, key):
@@ -198,58 +199,61 @@ class TestTransaction:
 
     def test_signature_verifies(self, key):
         transaction = self._payment(key)
-        assert transaction.verify_input_signature(0, 5000)
+        assert transaction.verify_input_signature(0, 5000, key.public_key().hash160())
 
     def test_signature_is_bound_to_the_spent_value(self, key):
         transaction = self._payment(key)
-        assert not transaction.verify_input_signature(0, 5001)
+        assert not transaction.verify_input_signature(0, 5001, key.public_key().hash160())
 
     def test_signature_is_bound_to_the_input_index(self, key):
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(b"\x11" * 32, 0)), TxInput(OutPoint(b"\x22" * 32, 1))),
-            outputs=(TxOutput(1000, key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(1000, key.public_key().hash160()),),
         )
-        signature = key.sign(unsigned.signature_hash(0, 5000))
+        signature = key.sign(
+            unsigned.signature_hash(0, 5000, unsigned.p2pkh_script_code(key.public_key().hash160()))
+        )
         moved = unsigned.signed_with({1: (key.public_key().to_bytes(), signature)})
-        assert not moved.verify_input_signature(1, 5000)
+        assert not moved.verify_input_signature(1, 5000, key.public_key().hash160())
 
     def test_signature_covers_the_outputs(self, key):
         transaction = self._payment(key)
         tampered = Transaction(
             version=transaction.version,
             inputs=transaction.inputs,
-            outputs=(TxOutput(999_999, key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(999_999, key.public_key().hash160()),),
             lock_time=transaction.lock_time,
         )
-        assert not tampered.verify_input_signature(0, 5000)
+        assert not tampered.verify_input_signature(0, 5000, key.public_key().hash160())
 
     def test_sanity_rejects_empty_transactions(self):
         with pytest.raises(TransactionError, match="no inputs"):
-            Transaction(outputs=(TxOutput(1, b"\x00" * 20),)).check_sanity()
+            Transaction(outputs=(TxOutput.p2pkh(1, b"\x00" * 20),)).check_sanity()
         with pytest.raises(TransactionError, match="no outputs"):
             Transaction(inputs=(TxInput(OutPoint(b"\x11" * 32, 0)),)).check_sanity()
 
     def test_sanity_rejects_duplicate_inputs(self, key):
         prevout = OutPoint(b"\x11" * 32, 0)
+        witness = (key.public_key().to_bytes(), b"\x01" * 64)
         transaction = Transaction(
             inputs=(
-                TxInput(prevout, key.public_key().to_bytes(), b"\x01" * 64),
-                TxInput(prevout, key.public_key().to_bytes(), b"\x01" * 64),
+                TxInput(prevout, witness=witness),
+                TxInput(prevout, witness=witness),
             ),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+            outputs=(TxOutput.p2pkh(1, b"\x00" * 20),),
         )
         with pytest.raises(TransactionError, match="spent twice"):
             transaction.check_sanity()
 
     def test_negative_and_oversized_outputs_are_impossible(self):
         with pytest.raises(TransactionError, match="negative"):
-            TxOutput(-1, b"\x00" * 20)
+            TxOutput.p2pkh(-1, b"\x00" * 20)
         with pytest.raises(TransactionError, match="maximum money supply"):
-            TxOutput(21_000_001 * 10**8, b"\x00" * 20)
+            TxOutput.p2pkh(21_000_001 * 10**8, b"\x00" * 20)
 
     def test_output_values_must_be_integers(self):
         with pytest.raises(TransactionError, match="integer"):
-            TxOutput(1.5, b"\x00" * 20)
+            TxOutput.p2pkh(1.5, b"\x00" * 20)
 
     def test_coinbase_detection(self):
         coinbase = build_coinbase(height=7, reward=100, pubkey_hash=b"\x01" * 20)
@@ -263,8 +267,13 @@ class TestTransaction:
 
     def test_only_a_coinbase_may_carry_coinbase_data(self, key):
         transaction = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0), key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+            inputs=(
+                TxInput(
+                    OutPoint(b"\x11" * 32, 0),
+                    witness=(key.public_key().to_bytes(), b"\x00" * 64),
+                ),
+            ),
+            outputs=(TxOutput.p2pkh(1, b"\x00" * 20),),
             coinbase_data=b"hello",
         )
         with pytest.raises(TransactionError, match="only a coinbase"):
@@ -272,8 +281,13 @@ class TestTransaction:
 
     def test_coinbase_must_not_carry_a_witness(self, key):
         transaction = Transaction(
-            inputs=(TxInput(COINBASE_OUTPOINT, key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+            inputs=(
+                TxInput(
+                    COINBASE_OUTPOINT,
+                    witness=(key.public_key().to_bytes(), b"\x00" * 64),
+                ),
+            ),
+            outputs=(TxOutput.p2pkh(1, b"\x00" * 20),),
             coinbase_data=encode_coinbase_data(1),
         )
         with pytest.raises(TransactionError, match="must not carry a witness"):
@@ -337,8 +351,10 @@ class TestBlock:
                 genesis.header.nonce,
             )
         )
+        solved = solve_block(broken)
+        assert solved is not None
         with pytest.raises(BlockError, match="Merkle root"):
-            broken.check_sanity(pow_limit=REGTEST.pow_limit, max_block_size=1_000_000)
+            solved.check_sanity(pow_limit=REGTEST.pow_limit, max_block_size=1_000_000)
 
     def test_sanity_detects_bad_proof_of_work(self):
         genesis = MAINNET.genesis_block
@@ -354,8 +370,13 @@ class TestBlock:
     def test_a_block_needs_a_coinbase_first(self, key):
         genesis = REGTEST.genesis_block
         payment = Transaction(
-            inputs=(TxInput(OutPoint(b"\x11" * 32, 0), key.public_key().to_bytes(), b"\x00" * 64),),
-            outputs=(TxOutput(1, b"\x00" * 20),),
+            inputs=(
+                TxInput(
+                    OutPoint(b"\x11" * 32, 0),
+                    witness=(key.public_key().to_bytes(), b"\x00" * 64),
+                ),
+            ),
+            outputs=(TxOutput.p2pkh(1, b"\x00" * 20),),
         )
         block = solve_block(
             Block.create(

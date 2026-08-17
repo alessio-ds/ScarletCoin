@@ -239,7 +239,24 @@ class TestPublicRpcSurface:
         info = client.getinfo()
         for field in ("chain_bytes", "chain_size", "disk_bytes", "disk_size", "prune_height"):
             assert field in info
-        assert info["chain_size"] == "214 B"
+        assert info["chain_size"] == "218 B"
+
+    def test_estimatefee_is_public_and_has_a_floor(self, rpc):
+        node, _, client = rpc
+        assert "estimatefee" in PUBLIC_METHODS
+        estimate = client.call("estimatefee", 2)
+        assert estimate["fee_per_kb"] >= node.params.min_relay_fee_per_kb
+        assert estimate["blocks"] == 2
+
+    def test_metrics_endpoint_is_served(self, rpc):
+        _, server, _ = rpc
+        import urllib.request
+
+        with urllib.request.urlopen(f"{server.url}/metrics", timeout=10.0) as response:
+            body = response.read().decode("utf-8")
+        assert "scarletcoin_height" in body
+        assert "scarletcoin_peers" in body
+        assert response.headers["Content-Type"].startswith("text/plain")
 
     def test_getinfo_says_whether_the_node_is_public(self, public_node, rpc):
         _, server = public_node

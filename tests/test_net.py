@@ -39,6 +39,8 @@ class TestProtocol:
             protocol.GetData((InvItem(InvType.TX, b"\x02" * 32),)),
             protocol.NotFound((InvItem(InvType.TX, b"\x03" * 32),)),
             protocol.GetBlocks((b"\x04" * 32, b"\x05" * 32)),
+            protocol.GetHeaders((b"\x04" * 32, b"\x05" * 32)),
+            protocol.Headers((b"\x06" * 80, b"\x07" * 80)),
             protocol.BlockMessage(REGTEST.genesis_block),
             protocol.TxMessage(REGTEST.genesis_coinbase),
         ],
@@ -170,7 +172,7 @@ class TestRpc:
         # These are what two operators compare to prove they run the same chain.
         assert info["genesis"] == REGTEST.genesis_hash[::-1].hex()
         assert info["magic"] == "SCRR"
-        assert info["protocol_version"] == 1
+        assert info["protocol_version"] == 2
         assert info["version"] == __version__
 
     def test_getinfo_and_supply(self, rpc):
@@ -778,8 +780,24 @@ class TestExplorer:
         _, server, _ = rpc
         status, body = self._get(server.url + "/search?q=%3Cscript%3Ealert(1)%3C/script%3E")
         assert status == 404
-        assert "<script>" not in body
-        assert "&lt;script&gt;" in body
+        assert "<script>alert(1)</script>" not in body
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+
+    def test_favicon_is_served(self, rpc):
+        _, server, _ = rpc
+        status, body = self._get(server.url + "/icon.svg")
+        assert status == 200
+        assert "<svg" in body
+        status, _ = self._get(server.url + "/favicon.ico")
+        assert status == 200
+
+    def test_pages_render_with_a_live_reload_script(self, rpc):
+        node, server, _ = rpc
+        status, body = self._get(server.url + "/")
+        assert status == 200
+        assert 'type="image/svg+xml"' in body  # favicon link
+        if node.config.ws:
+            assert "new WebSocket" in body
 
 
 class TestWrongClock:

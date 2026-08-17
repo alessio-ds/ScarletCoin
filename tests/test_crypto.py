@@ -135,6 +135,17 @@ class TestKeys:
             signature = key.sign(sha256(f"message {index}".encode()))
             assert int.from_bytes(signature[32:], "big") <= half
 
+    def test_signatures_are_deterministic_rfc6979(self):
+        secret = bytes.fromhex("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721")
+        key = PrivateKey(secret)
+        digest = sha256(b"sample")
+        signature = key.sign(digest)
+        assert signature == bytes.fromhex(
+            "432310e32cb80eb6503a26ce83cc165c783b870845fb8aad6d970889fcd7a6c8"
+            "530128b6b81c548874a6305d93ed071ca6e05074d85863d4056ce89b02bfab69"
+        )
+        assert key.sign(digest) == signature
+
     def test_high_s_signatures_are_rejected(self):
         key = PrivateKey.generate()
         digest = sha256(b"malleable")

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from scarletcoin.core.serialize import Reader, Writer
-from scarletcoin.core.transaction import OutPoint, Transaction
+from scarletcoin.core.transaction import OUTPUT_P2SH, OutPoint, Transaction
 
 __all__ = ["Coin", "CoinOverlay", "CoinView"]
 
@@ -30,15 +30,22 @@ class Coin:
     """An unspent transaction output."""
 
     value: int
-    pubkey_hash: bytes
+    output_type: int
+    payload: bytes
     height: int
     is_coinbase: bool
+
+    @property
+    def is_p2sh(self) -> bool:
+        """``True`` for a pay-to-script-hash output."""
+        return self.output_type == OUTPUT_P2SH
 
     def serialize(self) -> bytes:
         """Encode the coin (used for block undo data)."""
         writer = Writer()
         writer.uint64(self.value)
-        writer.raw(self.pubkey_hash)
+        writer.uint8(self.output_type)
+        writer.raw(self.payload)
         writer.uint32(self.height)
         writer.uint8(1 if self.is_coinbase else 0)
         return writer.getvalue()
@@ -48,7 +55,8 @@ class Coin:
         """Decode a coin from ``reader``."""
         return cls(
             value=reader.uint64(),
-            pubkey_hash=reader.raw(20),
+            output_type=reader.uint8(),
+            payload=reader.raw(20),
             height=reader.uint32(),
             is_coinbase=bool(reader.uint8()),
         )
@@ -112,7 +120,7 @@ class CoinOverlay:
         for index, output in enumerate(transaction.outputs):
             self.add(
                 OutPoint(txid, index),
-                Coin(output.value, output.pubkey_hash, height, is_coinbase),
+                Coin(output.value, output.type, output.payload, height, is_coinbase),
             )
 
     @property

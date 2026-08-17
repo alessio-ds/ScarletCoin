@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,6 +68,7 @@ PUBLIC_METHODS = frozenset(
         "gettransaction",
         "getrawtransaction",
         "getmempool",
+        "estimatefee",
         "validateaddress",
         "getbalance",
         "getutxos",
@@ -123,11 +125,13 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     params = node.params
 
     def address_hash(text: str) -> bytes:
-        try:
-            address = Address.decode(str(text), expected_version=params.address_version)
-        except InvalidKeyError as exc:
-            raise RpcError(str(exc), INVALID_PARAMS) from exc
-        return address.hash
+        for version in (params.address_version, params.script_address_version):
+            try:
+                address = Address.decode(str(text), expected_version=version)
+            except InvalidKeyError:
+                continue
+            return address.hash
+        raise RpcError(f"{text!r} is not a valid {params.name} address", INVALID_PARAMS)
 
     def entry_or_error(block_hash: bytes):
         entry = chain.get_entry(block_hash)
@@ -277,14 +281,30 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
     def getmempool() -> dict:
         return node.mempool.to_dict()
 
+    def estimatefee(blocks: int = 1) -> dict:
+        rate = node.mempool.estimate_fee_rate(blocks)
+        return {
+            "fee_per_kb": rate,
+            "blocks": blocks,
+            "mempool_size": len(node.mempool),
+        }
+
     # ------------------------------------------------------------------ addresses
 
     def validateaddress(address: str) -> dict:
-        try:
-            parsed = Address.decode(str(address), expected_version=params.address_version)
-        except InvalidKeyError as exc:
-            return {"valid": False, "reason": str(exc)}
-        return {"valid": True, "address": str(parsed), "pubkey_hash": parsed.hash.hex()}
+        for version in (params.address_version, params.script_address_version):
+            try:
+                parsed = Address.decode(str(address), expected_version=version)
+            except InvalidKeyError:
+                continue
+            kind = "p2sh" if version == params.script_address_version else "p2pkh"
+            return {
+                "valid": True,
+                "address": str(parsed),
+                "pubkey_hash": parsed.hash.hex(),
+                "type": kind,
+            }
+        return {"valid": False, "reason": f"{address!r} is not a {params.name} address"}
 
     def getbalance(address: str) -> dict:
         pubkey_hash = address_hash(address)
@@ -336,7 +356,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
                 continue
             transaction, _ = found
             received = sum(
-                output.value for output in transaction.outputs if output.pubkey_hash == pubkey_hash
+                output.value for output in transaction.outputs if output.payload == pubkey_hash
             )
             sent = 0
             for txin in transaction.inputs:
@@ -346,7 +366,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
                 if parent is None:
                     continue
                 output = parent[0].outputs[txin.prevout.index]
-                if output.pubkey_hash == pubkey_hash:
+                if output.payload == pubkey_hash:
                     sent += output.value
             history.append(
                 {
@@ -451,6 +471,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getrawtransaction": getrawtransaction,
         "sendrawtransaction": sendrawtransaction,
         "getmempool": getmempool,
+        "estimatefee": estimatefee,
         "validateaddress": validateaddress,
         "getbalance": getbalance,
         "getutxos": getutxos,
@@ -729,6 +750,20 @@ class RpcServer:
                     if path == "/api/info":
                         self._json(server.node.info())
                         return
+                    if path in ("/icon.svg", "/favicon.ico"):
+                        self._respond(
+                            HTTPStatus.OK,
+                            explorer.FAVICON_SVG.encode("utf-8"),
+                            "image/svg+xml",
+                        )
+                        return
+                    if path == "/metrics":
+                        self._respond(
+                            HTTPStatus.OK,
+                            metrics_text(server.node).encode("utf-8"),
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )
+                        return
                     markup = explorer.render(server, path, query)
                 except explorer.NotFound as exc:
                     self._html(explorer.render_error(server, str(exc)), HTTPStatus.NOT_FOUND)
@@ -743,3 +778,47 @@ class RpcServer:
 
 def _error_response(request_id: object, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def metrics_text(node: Node) -> str:
+    """Render Prometheus-format metrics for ``node``."""
+    chain = node.chain
+    stats = chain.stats()
+    peers = node.peers
+    mempool = node.mempool
+    lines = [
+        "# HELP scarletcoin_height Active chain height.",
+        "# TYPE scarletcoin_height gauge",
+        f"scarletcoin_height {chain.height}",
+        "# HELP scarletcoin_peers Connected peers.",
+        "# TYPE scarletcoin_peers gauge",
+        f"scarletcoin_peers {len(peers)}",
+        "# HELP scarletcoin_inbound_peers Inbound peer connections.",
+        "# TYPE scarletcoin_inbound_peers gauge",
+        f"scarletcoin_inbound_peers {sum(1 for p in peers if p.inbound)}",
+        "# HELP scarletcoin_mempool_transactions Unconfirmed transactions.",
+        "# TYPE scarletcoin_mempool_transactions gauge",
+        f"scarletcoin_mempool_transactions {len(mempool)}",
+        "# HELP scarletcoin_mempool_bytes Unconfirmed transaction bytes.",
+        "# TYPE scarletcoin_mempool_bytes gauge",
+        f"scarletcoin_mempool_bytes {mempool.total_bytes}",
+        "# HELP scarletcoin_utxo_count Unspent outputs.",
+        "# TYPE scarletcoin_utxo_count gauge",
+        f"scarletcoin_utxo_count {stats['utxo_count']}",
+        "# HELP scarletcoin_supply_scar Circulating supply in scar.",
+        "# TYPE scarletcoin_supply_scar gauge",
+        f"scarletcoin_supply_scar {stats['supply']}",
+        "# HELP scarletcoin_difficulty Current difficulty.",
+        "# TYPE scarletcoin_difficulty gauge",
+        f"scarletcoin_difficulty {stats['difficulty']:.4f}",
+        "# HELP scarletcoin_chain_bytes Serialised active-chain size.",
+        "# TYPE scarletcoin_chain_bytes gauge",
+        f"scarletcoin_chain_bytes {stats['chain_bytes']}",
+        "# HELP scarletcoin_disk_bytes On-disk database size.",
+        "# TYPE scarletcoin_disk_bytes gauge",
+        f"scarletcoin_disk_bytes {stats['disk_bytes']}",
+        "# HELP scarletcoin_uptime_seconds Process uptime.",
+        "# TYPE scarletcoin_uptime_seconds gauge",
+        f"scarletcoin_uptime_seconds {time.time() - node.started_at:.1f}",
+    ]
+    return "\n".join(lines) + "\n"

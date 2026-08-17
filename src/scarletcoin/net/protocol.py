@@ -42,6 +42,8 @@ __all__ = [
     "GetAddr",
     "GetBlocks",
     "GetData",
+    "GetHeaders",
+    "Headers",
     "Inv",
     "InvItem",
     "InvType",
@@ -57,10 +59,11 @@ __all__ = [
     "Version",
     "decode_payload",
     "encode_message",
+    "encode_payload",
     "parse_header",
 ]
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 HEADER_SIZE = 24
 #: Largest payload we will read: a maximum-size block with room to spare.
 MAX_PAYLOAD = 2 * 1024 * 1024
@@ -70,6 +73,8 @@ MAX_INV_ITEMS = 5_000
 MAX_ADDR_ITEMS = 1_000
 #: Most block hashes a ``getblocks`` answer may contain.
 MAX_BLOCKS_PER_INV = 500
+#: Most headers a ``headers`` answer may carry.
+MAX_HEADERS_PER_MESSAGE = 2_000
 
 
 class ProtocolError(Exception):
@@ -164,6 +169,7 @@ class Version(Message):
     nonce: int
     listen_port: int
     timestamp: int
+    ephemeral_pubkey: bytes = b""
 
     def encode(self) -> bytes:
         writer = Writer()
@@ -173,11 +179,13 @@ class Version(Message):
         writer.uint64(self.nonce)
         writer.uint16(self.listen_port)
         writer.uint64(self.timestamp)
+        writer.varbytes(self.ephemeral_pubkey)
         return writer.getvalue()
 
     @classmethod
     def decode(cls, payload: bytes) -> Version:
         reader = Reader(payload)
+        ephemeral_pubkey = b""
         message = cls(
             version=reader.uint32(),
             user_agent=reader.varstr(max_length=128),
@@ -186,8 +194,18 @@ class Version(Message):
             listen_port=reader.uint16(),
             timestamp=reader.uint64(),
         )
+        if reader.remaining:
+            ephemeral_pubkey = reader.varbytes(max_length=33)
         reader.expect_end()
-        return message
+        return cls(
+            version=message.version,
+            user_agent=message.user_agent,
+            start_height=message.start_height,
+            nonce=message.nonce,
+            listen_port=message.listen_port,
+            timestamp=message.timestamp,
+            ephemeral_pubkey=ephemeral_pubkey,
+        )
 
 
 class VerAck(Message):
@@ -351,6 +369,67 @@ class GetBlocks(Message):
 
 
 @dataclass(frozen=True)
+class GetHeaders(Message):
+    """Asks for the block *headers* that follow a locator."""
+
+    command: ClassVar[str] = "getheaders"
+
+    locator: tuple[bytes, ...]
+    stop_hash: bytes = b"\x00" * 32
+
+    def encode(self) -> bytes:
+        if not self.locator or len(self.locator) > 64:
+            raise ProtocolError("a locator must contain between 1 and 64 hashes")
+        writer = Writer()
+        writer.varint(len(self.locator))
+        for block_hash in self.locator:
+            writer.hash32(block_hash)
+        writer.hash32(self.stop_hash)
+        return writer.getvalue()
+
+    @classmethod
+    def decode(cls, payload: bytes) -> GetHeaders:
+        reader = Reader(payload)
+        count = reader.varint()
+        if not 1 <= count <= 64:
+            raise ProtocolError("a locator must contain between 1 and 64 hashes")
+        locator = tuple(reader.hash32() for _ in range(count))
+        stop_hash = reader.hash32()
+        reader.expect_end()
+        return cls(locator, stop_hash)
+
+
+@dataclass(frozen=True)
+class Headers(Message):
+    """Carries block headers, each 80 bytes."""
+
+    command: ClassVar[str] = "headers"
+
+    headers: tuple[bytes, ...] = field(default_factory=tuple)
+
+    def encode(self) -> bytes:
+        if len(self.headers) > MAX_HEADERS_PER_MESSAGE:
+            raise ProtocolError("too many headers in one message")
+        writer = Writer()
+        writer.varint(len(self.headers))
+        for header in self.headers:
+            if len(header) != 80:
+                raise ProtocolError("each header must be exactly 80 bytes")
+            writer.raw(header)
+        return writer.getvalue()
+
+    @classmethod
+    def decode(cls, payload: bytes) -> Headers:
+        reader = Reader(payload)
+        count = reader.varint()
+        if count > MAX_HEADERS_PER_MESSAGE:
+            raise ProtocolError("too many headers in one message")
+        headers = tuple(reader.raw(80) for _ in range(count))
+        reader.expect_end()
+        return cls(headers)
+
+
+@dataclass(frozen=True)
 class BlockMessage(Message):
     """Carries a whole block."""
 
@@ -395,6 +474,8 @@ _MESSAGE_TYPES: dict[str, type[Message]] = {
         GetData,
         NotFound,
         GetBlocks,
+        GetHeaders,
+        Headers,
         BlockMessage,
         TxMessage,
         Mempool,
@@ -402,16 +483,18 @@ _MESSAGE_TYPES: dict[str, type[Message]] = {
 }
 
 
-def encode_message(magic: bytes, message: Message) -> bytes:
-    """Wrap ``message`` in its envelope."""
+def encode_payload(magic: bytes, command: bytes, payload: bytes) -> bytes:
+    """Wrap a command name and payload in the message envelope.
+
+    The checksum is ``hash256(payload)[:4]``; when the payload has already been
+    encrypted by the caller, it is therefore taken over the ciphertext.
+    """
     if len(magic) != 4:
         raise ProtocolError("network magic must be 4 bytes")
-    command = message.command.encode("ascii")
     if not command or len(command) > 12:
-        raise ProtocolError(f"invalid command name {message.command!r}")
-    payload = message.encode()
+        raise ProtocolError(f"invalid command name {command!r}")
     if len(payload) > MAX_PAYLOAD:
-        raise ProtocolError(f"{message.command} payload is too large: {len(payload)} bytes")
+        raise ProtocolError(f"payload is too large: {len(payload)} bytes")
     return (
         magic
         + command.ljust(12, b"\x00")
@@ -419,6 +502,11 @@ def encode_message(magic: bytes, message: Message) -> bytes:
         + hash256(payload)[:4]
         + payload
     )
+
+
+def encode_message(magic: bytes, message: Message) -> bytes:
+    """Wrap ``message`` in its envelope."""
+    return encode_payload(magic, message.command.encode("ascii"), message.encode())
 
 
 def parse_header(header: bytes, magic: bytes) -> tuple[str, int, bytes]:
@@ -445,8 +533,8 @@ def parse_header(header: bytes, magic: bytes) -> tuple[str, int, bytes]:
     return command, length, header[20:24]
 
 
-def decode_payload(command: str, payload: bytes, checksum: bytes) -> Message | None:
-    """Verify a payload's checksum and decode it.
+def decode_payload(command: str, payload: bytes, checksum: bytes | None = None) -> Message | None:
+    """Verify a payload's checksum (when given) and decode it.
 
     Returns:
         The message, or ``None`` if the command is unknown (unknown commands are
@@ -455,7 +543,7 @@ def decode_payload(command: str, payload: bytes, checksum: bytes) -> Message | N
     Raises:
         ProtocolError: if the checksum or the payload is malformed.
     """
-    if hash256(payload)[:4] != checksum:
+    if checksum is not None and hash256(payload)[:4] != checksum:
         raise ProtocolError(f"bad checksum on {command} message")
     message_type = _MESSAGE_TYPES.get(command)
     if message_type is None:

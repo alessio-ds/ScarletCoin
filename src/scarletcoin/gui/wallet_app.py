@@ -738,10 +738,18 @@ def create_wallet(path: Path, network: str, parent: QtWidgets.QWidget | None) ->
             show_error(parent, "New wallet", "The passwords do not match.")
             return None
     try:
-        return Keystore.create(path, network, password=password or None)
+        keystore = Keystore.create(path, network, password=password or None)
     except WalletError as exc:
         show_error(parent, "Could not create that wallet", str(exc))
         return None
+    if keystore.new_mnemonic:
+        QtWidgets.QMessageBox.information(
+            parent,
+            "Recovery phrase",
+            "Write these words down and keep them secret. Anyone who has them "
+            "can spend the coins. They are shown only now:\n\n" + keystore.new_mnemonic,
+        )
+    return keystore
 
 
 def main(argv: list[str] | None = None) -> int:

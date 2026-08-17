@@ -84,7 +84,8 @@ class Wallet:
                         OutPoint(bytes.fromhex(item["txid"])[::-1], int(item["index"])),
                         Coin(
                             value=int(item["value"]),
-                            pubkey_hash=pubkey_hash,
+                            output_type=0,
+                            payload=pubkey_hash,
                             height=int(item["height"]),
                             is_coinbase=bool(item["coinbase"]),
                         ),

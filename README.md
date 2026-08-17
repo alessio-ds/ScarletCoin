@@ -4,10 +4,13 @@ A small but complete proof-of-work cryptocurrency, written in Python: a real
 blockchain, peer-to-peer nodes that reach consensus on their own, a wallet with
 proper keys and signatures, a miner, and a block explorer served by every node.
 
-This is version 2 — a full rewrite. The original ScarletCoin (2022) was a
-central Flask server that kept balances in text files; there was no chain, no
-signatures, and the "private key" was a password stored in the clear on the
-server. None of that is left. See [What changed from v1](docs/CHANGES-V2.md).
+This is version 2.2 — a consensus-breaking release on top of the version 2
+rewrite. It adds pay-to-script-hash (multisig), replace-by-fee, hierarchical
+deterministic (BIP-0039/0032) wallets, deterministic RFC 6979 signatures, and an
+optional native mining backend. The transaction serialisation changed and the
+genesis was re-mined, so the chain restarts. The original ScarletCoin (2022) was
+a central Flask server that kept balances in text files; none of that is left.
+See [What changed from v1](docs/CHANGES-V2.md).
 
 ```
 ┌────────────────┐   getblocktemplate / submitblock   ┌───────────────┐
@@ -28,21 +31,29 @@ server. None of that is left. See [What changed from v1](docs/CHANGES-V2.md).
   the most cumulative proof of work wins; nodes reorganise when a heavier branch
   appears.
 * **UTXO transactions.** Coins are unspent outputs, each locked to a public-key
-  hash. Spending one means revealing the public key and signing the transaction
-  with secp256k1 (ECDSA, canonical low-`s`, deterministic transaction ids).
+  hash (P2PKH) or a script hash (P2SH). Spending one means revealing the public
+  key and signing with secp256k1 (ECDSA, RFC 6979 deterministic nonces,
+  canonical low-`s`, deterministic transaction ids), or satisfying a redeem
+  script. Multisig is built on P2SH.
 * **Real money rules.** 50 SCT per block, halving every 210 000 blocks, 21 000 000
   SCT maximum. Difficulty retargets every 60 blocks towards one block per minute.
   Mined coins mature for 100 blocks before they can be spent.
 * **A peer-to-peer network.** Nodes hand-shake, gossip addresses, announce blocks
-  and transactions, serve initial block download, expire orphans, ping idle
-  peers, and ban peers that send invalid blocks. No node is special.
-* **A wallet that owns its keys.** Keys live in a JSON file encrypted with
-  AES-256-GCM behind an scrypt-derived key. Signing happens locally; the node
-  only ever sees finished transactions.
-* **A miner.** Asks a node for work, searches the nonce space across CPU cores,
+  and transactions, sync headers first and their bodies in parallel, encrypt
+  their links, expire orphans, ping idle peers, and ban peers that send invalid
+  blocks. No node is special.
+* **A wallet that owns its keys.** A BIP-0039 recovery phrase derives every key
+  (BIP-0032/0044); the seed lives in a JSON file encrypted with AES-256-GCM
+  behind an scrypt-derived key. Signing happens locally; the node only ever sees
+  finished transactions.
+* **Replace-by-fee.** A transaction can signal replaceability so its sender can
+  raise the fee while it is still unconfirmed.
+* **A miner.** Asks a node for work, searches the nonce space across CPU cores
+  (with an optional compiled SHA-256 backend and a pure-Python fallback),
   submits solved blocks, and collects fees along with the subsidy.
 * **A block explorer** on the node's HTTP port: blocks, transactions,
-  addresses, the mempool, peers and a rich list.
+  addresses, the mempool, peers and a rich list, live-updating over a WebSocket
+  endpoint, plus a Prometheus `/metrics` endpoint.
 
 ## Install
 
@@ -316,7 +327,8 @@ when one answers and edits the file in place when none does.
 ### `scarlet-wallet`
 
 ```sh
-scarlet-wallet create [--no-password]   # new wallet file, encrypted by default
+scarlet-wallet create [--no-password]   # new wallet, encrypted by default
+scarlet-wallet restore [PHRASE]         # rebuild a wallet from its recovery phrase
 scarlet-wallet info | balance | addresses | unspent | history
 scarlet-wallet new [LABEL]              # a fresh receiving address
 scarlet-wallet send ADDRESS AMOUNT|all [--fee-rate N] [--dry-run] [--yes]
@@ -328,8 +340,10 @@ scarlet-wallet --node local|public|ask|URL ...
 scarlet-wallet --forget-node ...        # choose again
 ```
 
-The wallet file defaults to `<datadir>/<network>/wallet.json`. Amounts are
-decimal SCT (`12.5`), never floats internally: 1 SCT is 100 000 000 *scar*.
+`create` prints a 12-word recovery phrase that must be written down; `restore`
+recreates the wallet (and its addresses) from it. The wallet file defaults to
+`<datadir>/<network>/wallet.json`. Amounts are decimal SCT (`12.5`), never
+floats internally: 1 SCT is 100 000 000 *scar*.
 
 ### `scarlet-miner`
 
@@ -350,6 +364,7 @@ and says which it is, rather than looping on a rejected `getblocktemplate`.
 | | mainnet | testnet | regtest |
 |---|---|---|---|
 | Address prefix | `S` | `t` | `t` |
+| P2SH address prefix | `M` | `T` | `T` |
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | Target spacing | 60 s | 60 s | 10 s |
 | Retarget every | 60 blocks | 60 blocks | 20 blocks |
@@ -396,17 +411,19 @@ uv run python tools/mine_genesis.py   # only if the genesis definition changes
 * [docs/PROTOCOL.md](docs/PROTOCOL.md) — consensus rules, serialisation formats,
   the peer-to-peer messages and the RPC methods.
 * [docs/CHANGES-V2.md](docs/CHANGES-V2.md) — what the rewrite fixed, and why.
+* [docs/CHANGES-V2.2.md](docs/CHANGES-V2.2.md) — the version 2.2 upgrade.
 
 ## Honest limitations
 
 It is a hobby chain, and it says so:
 
-* proof of work is pure Python, so the hash rate is tiny; a real network would
-  be trivial to out-mine;
-* there is no script language — outputs pay a public-key hash and nothing else,
-  so no multisig, no time locks beyond a block-height `lock_time`, no contracts;
-* no replace-by-fee, no compact block relay, no headers-first sync, no SPV proofs,
-  and no encryption or authentication on the peer-to-peer link;
+* proof of work is Python by default, so the hash rate is tiny; a compiled
+  backend helps on source installs, but a real network would still be trivial
+  to out-mine;
+* the script language is deliberately small: P2SH redeem scripts support
+  multisig and single-key spending, but there are no contracts and no time
+  locks beyond a block-height `lock_time`;
+* no compact block relay and no SPV proofs;
 * pruning drops old block bodies but there is no way back: a pruned node cannot
   help a new one sync, and cannot show the transactions it forgot;
 * the wallet trusts the node it is configured to talk to — a public node most of

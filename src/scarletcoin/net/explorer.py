@@ -86,13 +86,16 @@ class NotFound(Exception):
 def _page(server: RpcServer, title: str, body: str) -> str:
     node = server.node
     network = escape(node.params.name)
+    live_script = _live_reload_script(node)
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} - ScarletCoin explorer</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <style>{_STYLE}</style>
+{live_script}
 </head>
 <body>
 <header>
@@ -119,6 +122,42 @@ def _page(server: RpcServer, title: str, body: str) -> str:
 </body>
 </html>
 """
+
+
+def _live_reload_script(node) -> str:
+    """A small script that reloads the page when a new block arrives.
+
+    Returns an empty string when the WebSocket endpoint is not running.
+    """
+    if not node.config.ws or not node.ws_hub.running or not node.ws_hub.port:
+        return ""
+    port = node.ws_hub.port
+    return f"""<script>
+(function () {{
+  if (!window.WebSocket) return;
+  var connect = function () {{
+    var socket = new WebSocket("ws://" + location.hostname + ":{port}/");
+    socket.onmessage = function (event) {{
+      try {{ if (JSON.parse(event.data).type === "block") location.reload(); }}
+      catch (e) {{ }}
+    }};
+    // Reconnect silently when the link drops; never reload here, or a normal
+    // click that navigates to another page would be aborted.
+    socket.onclose = function () {{ setTimeout(connect, 2000); }};
+  }};
+  connect();
+}})();
+</script>"""
+
+
+#: The explorer's favicon, shared with the browser wallet.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="14" fill="#12100f"/>'
+    '<circle cx="32" cy="32" r="22" fill="none" stroke="#e33a4e" stroke-width="6"/>'
+    '<path d="M32 14 L46 56 L32 44 L18 56 Z" fill="#e33a4e"/>'
+    "</svg>"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -721,7 +760,7 @@ def _address_page(server: RpcServer, text: str) -> str:
         if found is None:  # pragma: no cover
             continue
         transaction, _ = found
-        received = sum(o.value for o in transaction.outputs if o.pubkey_hash == address.hash)
+        received = sum(o.value for o in transaction.outputs if o.payload == address.hash)
         sent = 0
         for txin in transaction.inputs:
             if txin.prevout.is_null:
@@ -730,7 +769,7 @@ def _address_page(server: RpcServer, text: str) -> str:
             if parent is None:  # pragma: no cover
                 continue
             output = parent[0].outputs[txin.prevout.index]
-            if output.pubkey_hash == address.hash:
+            if output.payload == address.hash:
                 sent += output.value
         rows.append(
             [

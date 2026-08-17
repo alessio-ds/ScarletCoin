@@ -46,8 +46,8 @@ def main() -> None:
 
     digest = hash256(b"ScarletCoin golden fixture")
 
-    coin1 = (OutPoint(bytes(range(1, 33)), 0), Coin(50 * COIN, pub1.hash160(), 100, False))
-    coin2 = (OutPoint(bytes(range(33, 65)), 1), Coin(25 * COIN, pub2.hash160(), 101, False))
+    coin1 = (OutPoint(bytes(range(1, 33)), 0), Coin(50 * COIN, 0, pub1.hash160(), 100, False))
+    coin2 = (OutPoint(bytes(range(33, 65)), 1), Coin(25 * COIN, 0, pub2.hash160(), 101, False))
 
     destination = Address(MAINNET.address_version, pub3.hash160())
 

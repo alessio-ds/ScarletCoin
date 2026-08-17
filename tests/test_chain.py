@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import pytest
 
-from scarletcoin.core.block import Block
+from scarletcoin.core.block import Block, BlockHeader
 from scarletcoin.core.chain import Blockchain, BlockStatus
 from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.params import REGTEST
@@ -32,10 +33,11 @@ from tests.helpers import (
 
 
 def _sign(unsigned: Transaction, key: PrivateKey, values: list[int]) -> Transaction:
+    script_code = unsigned.p2pkh_script_code(key.public_key().hash160())
     witnesses = {
         index: (
             key.public_key().to_bytes(),
-            key.sign(unsigned.signature_hash(index, values[index])),
+            key.sign(unsigned.signature_hash(index, values[index], script_code)),
         )
         for index in range(len(unsigned.inputs))
     }
@@ -68,6 +70,102 @@ class TestGenesis:
         other = replace(REGTEST, name="regtest", genesis_timestamp=REGTEST.genesis_timestamp + 1)
         with pytest.raises(ValidationError, match="different network"):
             Blockchain(Storage(tmp_path / "chain.sqlite3"), other)
+
+
+class TestCheckpoints:
+    def test_a_block_matching_the_checkpoint_is_accepted(self, key):
+        params = replace(REGTEST)
+        base = make_chain(params=params)
+        blocks = []
+        for i in range(3):
+            block = make_block(base, key, timestamp=REGTEST.genesis_timestamp + i + 1, extra=b"cp")
+            base.add_block(block)
+            blocks.append(block)
+        checkpoint = base.get_entry_by_height(2).hash[::-1].hex()
+
+        guarded = make_chain(params=replace(REGTEST, checkpoints={2: checkpoint}))
+        for block in blocks:
+            assert guarded.add_block(block).status is BlockStatus.CONNECTED
+        guarded.storage.close()
+
+    def test_a_block_against_the_checkpoint_is_rejected(self, key):
+        guarded = make_chain(params=replace(REGTEST, checkpoints={2: "00" * 32}))
+        first = make_block(guarded, key, timestamp=REGTEST.genesis_timestamp + 1, extra=b"x")
+        assert guarded.add_block(first).status is BlockStatus.CONNECTED
+        second = make_block(guarded, key, timestamp=REGTEST.genesis_timestamp + 2, extra=b"x")
+        result = guarded.add_block(second)
+        assert result.status is BlockStatus.INVALID
+        assert "checkpoint" in result.reason
+        guarded.storage.close()
+
+
+class TestHeaderSync:
+    def _headers(self, chain, key, count):
+        blocks = []
+        for i in range(count):
+            block = make_block(chain, key, timestamp=REGTEST.genesis_timestamp + i + 1, extra=b"h")
+            chain.add_block(block)
+            blocks.append(block)
+        return [block.header.serialize() for block in blocks]
+
+    def test_headers_are_accepted_and_tracked(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 5)
+        source.storage.close()
+
+        target = make_chain()
+        for raw in raw_headers:
+            assert target.add_header(BlockHeader.deserialize(raw)) is None
+        assert target.header_height() == 5
+        assert len(target.headers_to_download()) == 5
+        assert target.header_tip().height == 5
+        target.storage.close()
+
+    def test_headers_list_the_missing_blocks_in_order(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 5)
+        hashes = [BlockHeader.deserialize(raw).hash() for raw in raw_headers]
+        source.storage.close()
+
+        target = make_chain()
+        for raw in raw_headers:
+            target.add_header(BlockHeader.deserialize(raw))
+        assert target.headers_to_download() == hashes
+        target.storage.close()
+
+    def test_a_bad_header_is_rejected(self, key):
+        from scarletcoin.core.pow import check_proof_of_work
+
+        source = make_chain()
+        raw_headers = self._headers(source, key, 2)
+        source.storage.close()
+
+        target = make_chain()
+        assert target.add_header(BlockHeader.deserialize(raw_headers[0])) is None
+        header = BlockHeader.deserialize(raw_headers[1])
+        nonce = header.nonce
+        while True:  # regtest's target is easy, so find a hash that misses it
+            nonce += 1
+            broken = header.with_nonce(nonce)
+            if not check_proof_of_work(broken.hash(), broken.bits, pow_limit=REGTEST.pow_limit):
+                break
+        assert target.add_header(broken) is not None
+        assert target.header_height() == 1
+        target.storage.close()
+
+    def test_an_orphan_header_is_held_until_its_parent_arrives(self, key):
+        source = make_chain()
+        raw_headers = self._headers(source, key, 3)
+        source.storage.close()
+
+        target = make_chain()
+        second = BlockHeader.deserialize(raw_headers[1])
+        assert target.add_header(second) is None  # parent unknown: deferred, not an error
+        assert target.header_height() == 0
+        target.add_header(BlockHeader.deserialize(raw_headers[0]))
+        assert target.add_header(second) is None
+        assert target.header_height() == 2
+        target.storage.close()
 
 
 class TestBlockAcceptance:
@@ -177,7 +275,7 @@ class TestSpending:
         outpoint, coin = coins[0]
         unsigned = Transaction(
             inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value - 1000, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(coin.value - 1000, other_key.public_key().hash160()),),
         )
         transaction = _sign(unsigned, key, [coin.value])
         with pytest.raises(ValidationError, match="matures at height"):
@@ -186,7 +284,7 @@ class TestSpending:
     def test_spending_an_unknown_output_is_a_missing_input(self, chain, key):
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(b"\x33" * 32, 0)),),
-            outputs=(TxOutput(1, key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(1, key.public_key().hash160()),),
         )
         transaction = _sign(unsigned, key, [1000])
         with pytest.raises(MissingInputError):
@@ -197,11 +295,11 @@ class TestSpending:
         outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
         unsigned = Transaction(
             inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value - 1000, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(coin.value - 1000, other_key.public_key().hash160()),),
         )
         # other_key signs, but the coin belongs to key
         forged = _sign(unsigned, other_key, [coin.value])
-        with pytest.raises(ValidationError, match="wrong hash"):
+        with pytest.raises(ValidationError, match="invalid signature"):
             check_transaction_inputs(forged, chain, height=chain.height + 1, params=REGTEST)
 
     def test_spending_more_than_the_inputs_hold_is_rejected(self, chain, key):
@@ -209,7 +307,7 @@ class TestSpending:
         outpoint, coin = chain.storage.coins_of(key.public_key().hash160())[0]
         unsigned = Transaction(
             inputs=(TxInput(outpoint),),
-            outputs=(TxOutput(coin.value + 1, key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(coin.value + 1, key.public_key().hash160()),),
         )
         transaction = _sign(unsigned, key, [coin.value])
         with pytest.raises(ValidationError, match="only provides"):
@@ -224,7 +322,7 @@ class TestSpending:
         def payment(amount: int) -> Transaction:
             unsigned = Transaction(
                 inputs=(TxInput(outpoint),),
-                outputs=(TxOutput(amount, destination),),
+                outputs=(TxOutput.p2pkh(amount, destination),),
             )
             return _sign(unsigned, key, [coin.value])
 
@@ -244,7 +342,7 @@ class TestSpending:
         change_index = 1 if len(first.outputs) > 1 else 0
         unsigned = Transaction(
             inputs=(TxInput(OutPoint(first.txid(), change_index)),),
-            outputs=(TxOutput(10**8, other_key.public_key().hash160()),),
+            outputs=(TxOutput.p2pkh(10**8, other_key.public_key().hash160()),),
         )
         second = _sign(unsigned, key, [first.outputs[change_index].value])
         pool.add(second)
@@ -397,7 +495,7 @@ class TestUtxoOverlay:
     def test_overlay_hides_spent_coins(self, chain):
         overlay = CoinOverlay(chain)
         outpoint = OutPoint(b"\x44" * 32, 0)
-        coin = Coin(100, b"\x01" * 20, 1, False)
+        coin = Coin(100, 0, b"\x01" * 20, 1, False)
         overlay.add(outpoint, coin)
         assert overlay.get_coin(outpoint) == coin
         assert overlay.spend(outpoint) == coin

@@ -11,8 +11,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from scarletcoin.core.params import ChainParams
+from scarletcoin.core.script import multisig_redeem
 from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
 from scarletcoin.core.utxo import Coin
+from scarletcoin.crypto.hashing import hash256
 from scarletcoin.crypto.keys import Address, PrivateKey
 
 __all__ = [
@@ -23,13 +25,15 @@ __all__ = [
     "build_transaction",
     "dust_threshold",
     "estimate_size",
+    "multisig_address",
     "select_coins",
 ]
 
-#: Serialised cost of one input: 36-byte outpoint + 34-byte public key + 65-byte signature.
-PER_INPUT_BYTES = 135
-#: Serialised cost of one output: 8-byte amount + 20-byte public-key hash.
-PER_OUTPUT_BYTES = 28
+#: Serialised cost of one input: 36-byte outpoint + 4-byte sequence + a witness
+#: of one length byte, a 34-byte public key and a 65-byte signature.
+PER_INPUT_BYTES = 140
+#: Serialised cost of one output: 1-byte type + 8-byte amount + 20-byte hash.
+PER_OUTPUT_BYTES = 29
 #: Version, input and output counts, lock time and the empty coinbase-data field.
 #: Exact while a transaction has fewer than 253 inputs and outputs.
 BASE_BYTES = 11
@@ -52,6 +56,20 @@ def fee_for_size(size: int, fee_per_kb: int) -> int:
 def dust_threshold(fee_per_kb: int) -> int:
     """Return the value below which an output costs more to spend than it holds."""
     return fee_for_size(PER_INPUT_BYTES, fee_per_kb) * 3
+
+
+def multisig_address(
+    pubkeys: list[bytes], threshold: int, params: ChainParams
+) -> tuple[bytes, Address]:
+    """Return the ``(redeem_script, P2SH address)`` for an m-of-n multisig.
+
+    Args:
+        pubkeys: The 33-byte compressed public keys.
+        threshold: How many signatures are required to spend.
+        params: Chain parameters (for the P2SH address version).
+    """
+    script = multisig_redeem(pubkeys, threshold)
+    return script, Address(params.script_address_version, hash256(script)[:20])
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +176,7 @@ def build_sweep_transaction(
     unsigned = Transaction(
         version=1,
         inputs=tuple(TxInput(outpoint) for outpoint, _ in spendable_coins),
-        outputs=(TxOutput(amount, pubkey_hash),),
+        outputs=(TxOutput.p2pkh(amount, pubkey_hash),),
         lock_time=lock_time,
     )
     return BuiltTransaction(
@@ -175,13 +193,15 @@ def _sign_inputs(
     coins: Sequence[tuple[OutPoint, Coin]],
     keys: Mapping[bytes, PrivateKey],
 ) -> Transaction:
-    """Sign every input of ``unsigned`` with the key owning the matching coin."""
-    witnesses: dict[int, tuple[bytes, bytes]] = {}
+    """Sign every P2PKH input of ``unsigned`` with the key owning the matching coin."""
+    witnesses: dict[int, tuple[bytes, ...]] = {}
     for index, (outpoint, coin) in enumerate(coins):
-        key = keys.get(coin.pubkey_hash)
+        key = keys.get(coin.payload)
         if key is None:
             raise ValueError(f"no private key for coin {outpoint}")
-        digest = unsigned.signature_hash(index, coin.value)
+        digest = unsigned.signature_hash(
+            index, coin.value, unsigned.p2pkh_script_code(coin.payload)
+        )
         witnesses[index] = (key.public_key().to_bytes(), key.sign(digest))
     return unsigned.signed_with(witnesses)
 
@@ -230,9 +250,9 @@ def build_transaction(
     if change < 0:  # pragma: no cover - select_coins guarantees this
         raise InsufficientFundsError("selected coins do not cover the fee")
 
-    tx_outputs = [TxOutput(value, pubkey_hash) for pubkey_hash, value in targets]
+    tx_outputs = [TxOutput.p2pkh(value, pubkey_hash) for pubkey_hash, value in targets]
     if change > dust_threshold(fee_per_kb):
-        tx_outputs.append(TxOutput(change, bytes(change_hash)))
+        tx_outputs.append(TxOutput.p2pkh(change, bytes(change_hash)))
     else:
         # Too small to be worth its own output: leave it to the miner as extra fee.
         fee += change

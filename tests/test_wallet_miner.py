@@ -112,6 +112,47 @@ class TestKeystore:
         assert str(second) in keystore.address_strings()
         assert len(Keystore.load(tmp_path / "wallet.json").addresses()) == 2
 
+    def test_restoring_a_mnemonic_rebuilds_the_wallet(self, tmp_path):
+        mnemonic = (
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+            " abandon abandon about"
+        )
+        first = Keystore.create(tmp_path / "one.json", "regtest", mnemonic=mnemonic)
+        second = Keystore.create(tmp_path / "two.json", "regtest", mnemonic=mnemonic)
+        assert first.default_address() == second.default_address()
+        first.new_key("extra")
+        second.new_key("extra")
+        assert first.addresses()[1].address == second.addresses()[1].address
+
+    def test_invalid_mnemonic_is_refused(self, tmp_path):
+        with pytest.raises(WalletError, match="checksum"):
+            Keystore.create(tmp_path / "wallet.json", "regtest", mnemonic="abandon " * 12)
+
+    def test_version_1_wallet_still_loads(self, tmp_path):
+        key = PrivateKey.generate()
+        document = {
+            "version": 1,
+            "network": "regtest",
+            "encrypted": False,
+            "addresses": [
+                {
+                    "address": str(key.address(REGTEST.address_version)),
+                    "label": "legacy",
+                    "created": 1,
+                }
+            ],
+            "keys": [{"wif": key.to_wif(REGTEST.wif_version), "label": "legacy", "created": 1}],
+        }
+        path = tmp_path / "wallet.json"
+        path.write_text(json.dumps(document))
+        keystore = Keystore.load(path)
+        assert keystore.default_address() == str(key.address(REGTEST.address_version))
+        assert keystore.export_wif(keystore.default_address()) == key.to_wif(REGTEST.wif_version)
+        keystore.save()
+        assert json.loads(path.read_text())["version"] == 2
+        reloaded = Keystore.load(path)
+        assert reloaded.export_wif(reloaded.default_address()) == key.to_wif(REGTEST.wif_version)
+
 
 class TestWallet:
     def test_balance_and_history(self, rpc, wallet):
