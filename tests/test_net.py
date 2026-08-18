@@ -231,6 +231,40 @@ class TestRpc:
         with pytest.raises(RpcClientError, match="already in the mempool"):
             client.sendrawtransaction(transaction.serialize().hex())
 
+    def test_coins_spent_by_mempool_transactions_are_not_spendable(self, rpc, key, other_key):
+        node, _, client = rpc
+        address = str(key.address(REGTEST.address_version))
+        client.call("generate", 4, address)
+
+        before = client.getbalance(address)
+        assert before["mempool_spent"] == 0
+        assert before["mempool_spent_count"] == 0
+
+        transaction = spend(node.chain, key, other_key.address(REGTEST.address_version), 10**8)
+        client.sendrawtransaction(transaction.serialize().hex())
+
+        # The coin this transaction spent is pooled: still listed, but not spendable.
+        utxos = client.getutxos(address)
+        spent = [item for item in utxos["utxos"] if item["mempool_spent"]]
+        assert spent
+        assert all(item["spendable"] is False for item in spent)
+
+        after = client.getbalance(address)
+        spent_value = sum(item["value"] for item in spent)
+        assert after["mempool_spent"] == spent_value
+        assert after["mempool_spent_count"] == len(spent)
+        assert after["spendable"] == before["spendable"] - spent_value
+        assert after["balance"] == before["balance"]
+        assert after["balance"] == after["spendable"] + after["immature"] + after["mempool_spent"]
+
+        # Once the transaction is mined the coin is gone from the chain entirely.
+        client.call("generate", 1)
+        final = client.getbalance(address)
+        assert final["mempool_spent"] == 0
+        assert final["mempool_spent_count"] == 0
+        assert final["balance"] == final["spendable"] + final["immature"]
+        assert final["utxo_count"] == before["utxo_count"]
+
     def test_block_template_and_submission(self, rpc, key):
         _, _, client = rpc
         from scarletcoin.core.template import BlockTemplate

@@ -124,7 +124,8 @@ class Mempool:
 
     def is_spent(self, outpoint: OutPoint) -> bool:
         """Return ``True`` if a pooled transaction already spends ``outpoint``."""
-        return outpoint in self._spent_by
+        with self._lock:
+            return outpoint in self._spent_by
 
     def get(self, txid: bytes) -> Transaction | None:
         """Return a pooled transaction by id."""

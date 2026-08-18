@@ -313,15 +313,27 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         confirmed = sum(coin.value for _, coin in coins)
         spendable = sum(
             coin.value
-            for _, coin in coins
+            for outpoint, coin in coins
             if coin.is_spendable_at(height + 1, params.coinbase_maturity)
+            and not node.mempool.is_spent(outpoint)
+        )
+        immature = sum(
+            coin.value
+            for _, coin in coins
+            if not coin.is_spendable_at(height + 1, params.coinbase_maturity)
+        )
+        mempool_spent_value = confirmed - spendable - immature
+        mempool_spent_count = sum(
+            1 for outpoint, _coin in coins if node.mempool.is_spent(outpoint)
         )
         return {
             "address": str(address),
             "balance": confirmed,
             "spendable": spendable,
-            "immature": confirmed - spendable,
+            "immature": immature,
             "utxo_count": len(coins),
+            "mempool_spent": mempool_spent_value,
+            "mempool_spent_count": mempool_spent_count,
             "height": height,
         }
 
@@ -340,7 +352,9 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
                     "height": coin.height,
                     "confirmations": chain.confirmations(coin.height),
                     "coinbase": coin.is_coinbase,
-                    "spendable": coin.is_spendable_at(height + 1, params.coinbase_maturity),
+                    "spendable": coin.is_spendable_at(height + 1, params.coinbase_maturity)
+                    and not node.mempool.is_spent(outpoint),
+                    "mempool_spent": node.mempool.is_spent(outpoint),
                 }
                 for outpoint, coin in coins
             ],

@@ -194,6 +194,24 @@ class TestWallet:
         client.call("generate", 1)
         assert client.getbalance(destination)["balance"] == spendable - result.fee
 
+    def test_wallet_ignores_coins_spent_by_mempool_transactions(self, rpc, wallet, other_key):
+        _, _, client = rpc
+        client.call("generate", 4, wallet.keystore.default_address())
+        destination = str(other_key.address(REGTEST.address_version))
+
+        first = wallet.send(destination, 10 * 10**8)
+        assert first.change > 0
+        pooled_outpoint = first.transaction.inputs[0].prevout
+
+        # The coin backing this send is pooled but unconfirmed; the wallet must
+        # not offer it again or the node would refuse the next transaction as a
+        # double spend.
+        coins = wallet.coins(spendable_only=True)
+        assert all(outpoint != pooled_outpoint for outpoint, _coin in coins)
+
+        second = wallet.send(destination, 10 * 10**8)
+        assert second.transaction.inputs[0].prevout != pooled_outpoint
+
     def test_sending_more_than_the_balance(self, rpc, wallet, other_key):
         _, _, client = rpc
         client.call("generate", 4, wallet.keystore.default_address())
