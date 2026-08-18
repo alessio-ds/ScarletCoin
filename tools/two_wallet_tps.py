@@ -131,8 +131,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"recovery phrase B: {ks_b.new_mnemonic}")
         print()
     print("send coins to wallet A, then:")
-    print(f"  uv run python tools/two_wallet_tps.py split "
-                f"--utxos {DEFAULT_UTXOS} --network {args.network}")
+    print(
+        f"  uv run python tools/two_wallet_tps.py split "
+        f"--utxos {DEFAULT_UTXOS} --network {args.network}"
+    )
     return 0
 
 
@@ -224,13 +226,16 @@ def _cmd_split(args: argparse.Namespace) -> int:
     if not args.no_confirm:
         _wait_for_confirmation(client, txid, timeout=args.confirm_timeout, network=params.name)
         confirmed = wallet_a.coins(spendable_only=True)
-        print(f"split confirmed at height {client.getblockcount()}:"
-              f" {len(confirmed)} spendable UTXOs")
+        print(
+            f"split confirmed at height {client.getblockcount()}: {len(confirmed)} spendable UTXOs"
+        )
     else:
         print("skipping confirmation wait (--no-confirm)")
 
-    print(f"next: uv run python tools/two_wallet_tps.py run "
-              f"--tps {DEFAULT_TPS} --network {args.network}")
+    print(
+        f"next: uv run python tools/two_wallet_tps.py run "
+        f"--tps {DEFAULT_TPS} --network {args.network}"
+    )
     return 0
 
 
@@ -555,9 +560,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     try:
         info = client.getinfo()
         print(
-                f"node:      height {info['height']}, {info['peers']} peers,"
-                f" {info['mempool_size']} tx in mempool"
-            )
+            f"node:      height {info['height']}, {info['peers']} peers,"
+            f" {info['mempool_size']} tx in mempool"
+        )
     except RpcClientError as exc:
         print(f"node:      unavailable ({exc})")
     return 0
@@ -604,8 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="how many equal UTXOs to create (default: %(default)s)",
     )
     split_parser.add_argument("--fee-rate", type=int, help="fee in scar per kilobyte")
-    split_parser.add_argument("--amount", type=int, default=DEFAULT_AMOUNT,
-                              help="amount per tx in scar")
+    split_parser.add_argument(
+        "--amount", type=int, default=DEFAULT_AMOUNT, help="amount per tx in scar"
+    )
     split_parser.add_argument(
         "--no-confirm",
         action="store_true",
