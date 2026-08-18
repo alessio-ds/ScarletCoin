@@ -71,6 +71,7 @@ PUBLIC_METHODS = frozenset(
         "estimatefee",
         "validateaddress",
         "getbalance",
+        "getbalances",
         "getutxos",
         "getaddresshistory",
         "getrichlist",
@@ -307,6 +308,19 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         return {"valid": False, "reason": f"{address!r} is not a {params.name} address"}
 
     def getbalance(address: str) -> dict:
+        return _balance_of(str(address))
+
+    def getbalances(addresses: list[str]) -> dict:
+        """Return the balances of several addresses in one call.
+
+        A wallet with many addresses otherwise issues one ``getbalance`` round
+        trip per address, which is both slow for the wallet and heavy for a
+        public node.  The result is keyed by address string.
+        """
+        return {str(address): _balance_of(str(address)) for address in addresses}
+
+    def _balance_of(address: str) -> dict:
+        """Shared balance computation for :func:`getbalance` and :func:`getbalances`."""
         pubkey_hash = address_hash(address)
         coins = node.storage.coins_of(pubkey_hash)
         height = chain.height
@@ -323,11 +337,9 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
             if not coin.is_spendable_at(height + 1, params.coinbase_maturity)
         )
         mempool_spent_value = confirmed - spendable - immature
-        mempool_spent_count = sum(
-            1 for outpoint, _coin in coins if node.mempool.is_spent(outpoint)
-        )
+        mempool_spent_count = sum(1 for outpoint, _coin in coins if node.mempool.is_spent(outpoint))
         return {
-            "address": str(address),
+            "address": address,
             "balance": confirmed,
             "spendable": spendable,
             "immature": immature,
@@ -364,24 +376,9 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         pubkey_hash = address_hash(address)
         limit = max(1, min(int(limit), 1000))
         history = []
-        for txid, height in node.storage.address_history(pubkey_hash, limit):
-            found = chain.get_transaction(txid)
-            if found is None:  # pragma: no cover - index follows the chain
-                continue
-            transaction, _ = found
-            received = sum(
-                output.value for output in transaction.outputs if output.payload == pubkey_hash
-            )
-            sent = 0
-            for txin in transaction.inputs:
-                if txin.prevout.is_null:
-                    continue
-                parent = chain.get_transaction(txin.prevout.txid)
-                if parent is None:
-                    continue
-                output = parent[0].outputs[txin.prevout.index]
-                if output.payload == pubkey_hash:
-                    sent += output.value
+        for txid, height, received, sent, coinbase in node.storage.address_history(
+            pubkey_hash, limit
+        ):
             history.append(
                 {
                     "txid": txid[::-1].hex(),
@@ -390,7 +387,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
                     "received": received,
                     "sent": sent,
                     "net": received - sent,
-                    "coinbase": transaction.is_coinbase,
+                    "coinbase": coinbase,
                 }
             )
         return {"address": str(address), "transactions": history}
@@ -488,6 +485,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "estimatefee": estimatefee,
         "validateaddress": validateaddress,
         "getbalance": getbalance,
+        "getbalances": getbalances,
         "getutxos": getutxos,
         "getaddresshistory": getaddresshistory,
         "getrichlist": getrichlist,

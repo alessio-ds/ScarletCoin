@@ -96,8 +96,7 @@ class Wallet:
     def balance(self) -> Balance:
         """Return the wallet's total balance across every address."""
         confirmed = spendable = immature = count = 0
-        for address in self.keystore.address_strings():
-            data = self.client.getbalance(address)
+        for data in self.client.getbalances(self.keystore.address_strings()).values():
             confirmed += int(data["balance"])
             spendable += int(data["spendable"])
             immature += int(data["immature"])
@@ -107,9 +106,10 @@ class Wallet:
     def balances_by_address(self) -> list[tuple[str, str, int]]:
         """Return ``(address, label, balance)`` for every address in the wallet."""
         rows = []
+        data = self.client.getbalances(self.keystore.address_strings())
         for record in self.keystore.addresses():
-            data = self.client.getbalance(record.address)
-            rows.append((record.address, record.label, int(data["balance"])))
+            balance = int(data.get(record.address, {}).get("balance", 0))
+            rows.append((record.address, record.label, balance))
         return rows
 
     def history(self, limit: int = 50) -> list[dict]:

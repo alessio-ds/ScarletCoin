@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from dataclasses import replace
 
@@ -536,4 +537,77 @@ class TestStorage:
         )
         mine_and_add(chain, key, pool, count=1)
         history = chain.storage.address_history(other_key.public_key().hash160())
-        assert [txid for txid, _ in history] == [transaction.txid()]
+        assert [txid for txid, *_ in history] == [transaction.txid()]
+
+    def test_address_history_precomputes_amounts(self, chain_and_pool, key, other_key):
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        transaction = spend(
+            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
+        )
+        spent_value = sum(chain.storage.get_coin(txin.prevout).value for txin in transaction.inputs)
+        mine_and_add(chain, key, pool, count=1)
+
+        other_hash = other_key.public_key().hash160()
+        key_hash = key.public_key().hash160()
+
+        received = sum(o.value for o in transaction.outputs if o.payload == other_hash)
+        assert received == 10**8
+        key_received = sum(o.value for o in transaction.outputs if o.payload == key_hash)
+
+        other_history = {
+            txid: (recv, sent, coinbase)
+            for txid, _height, recv, sent, coinbase in chain.storage.address_history(other_hash)
+        }
+        recv, sent, coinbase = other_history[transaction.txid()]
+        assert (recv, sent, coinbase) == (received, 0, False)
+
+        key_history = {
+            txid: (recv, sent, coinbase)
+            for txid, _height, recv, sent, coinbase in chain.storage.address_history(key_hash)
+        }
+        recv, sent, coinbase = key_history[transaction.txid()]
+        assert (recv, sent, coinbase) == (key_received, spent_value, False)
+
+        # The coinbase transactions that mined those blocks are flagged as such.
+        coinbase_rows = [
+            row for row in chain.storage.address_history(key_hash, limit=1000) if row[4]
+        ]
+        assert len(coinbase_rows) == 5  # the four blocks plus the one mining the spend
+
+    def test_schema_v4_backfills_address_history(self, tmp_path, key, other_key):
+        path = tmp_path / "chain.sqlite3"
+        chain, pool = make_node_state(tmp_path)
+        mine_and_add(chain, key, pool, count=4)
+        transaction = spend(
+            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
+        )
+        spent_value = sum(chain.storage.get_coin(txin.prevout).value for txin in transaction.inputs)
+        mine_and_add(chain, key, pool, count=1)
+        chain.storage.close()
+
+        # Rewind to schema 3 with blanked precomputed columns, then reopen: the
+        # node must recompute them from the stored blocks and undo records.
+        connection = sqlite3.connect(str(path))
+        connection.execute("UPDATE address_history SET received = 0, sent = 0, coinbase = 0")
+        connection.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (b"3",))
+        connection.commit()
+        connection.close()
+
+        reopened = make_chain(tmp_path)
+        other_hash = other_key.public_key().hash160()
+        history = {
+            txid: (recv, sent, coinbase)
+            for txid, _height, recv, sent, coinbase in reopened.storage.address_history(other_hash)
+        }
+        assert history[transaction.txid()] == (10**8, 0, False)
+
+        key_hash = key.public_key().hash160()
+        key_history = {
+            txid: (recv, sent, coinbase)
+            for txid, _height, recv, sent, coinbase in reopened.storage.address_history(key_hash)
+        }
+        recv, sent, coinbase = key_history[transaction.txid()]
+        key_received = sum(o.value for o in transaction.outputs if o.payload == key_hash)
+        assert (recv, sent, coinbase) == (key_received, spent_value, False)
+        reopened.storage.close()

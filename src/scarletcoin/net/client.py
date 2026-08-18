@@ -152,6 +152,10 @@ class RpcClient:
         """Return the balance of an address."""
         return self.call("getbalance", address)
 
+    def getbalances(self, addresses: list[str]) -> dict:
+        """Return the balances of several addresses in one request."""
+        return self.call("getbalances", addresses)
+
     def getutxos(self, address: str) -> dict:
         """Return the unspent outputs of an address."""
         return self.call("getutxos", address)

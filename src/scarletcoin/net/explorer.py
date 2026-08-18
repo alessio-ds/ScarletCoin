@@ -21,6 +21,10 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type check
 
 __all__ = ["NotFound", "render", "render_error"]
 
+#: Maximum number of unspent outputs the address page renders; the rest are
+#: summarised, so an address with thousands of coins cannot produce a huge page.
+MAX_UNSPENT_ROWS = 200
+
 _STYLE = """
 :root {
   --bg: #12100f; --panel: #1b1817; --line: #2e2825; --text: #e8e2df;
@@ -755,26 +759,11 @@ def _address_page(server: RpcServer, text: str) -> str:
         ]
     )
     rows = []
-    for txid, height in history:
-        found = node.chain.get_transaction(txid)
-        if found is None:  # pragma: no cover
-            continue
-        transaction, _ = found
-        received = sum(o.value for o in transaction.outputs if o.payload == address.hash)
-        sent = 0
-        for txin in transaction.inputs:
-            if txin.prevout.is_null:
-                continue
-            parent = node.chain.get_transaction(txin.prevout.txid)
-            if parent is None:  # pragma: no cover
-                continue
-            output = parent[0].outputs[txin.prevout.index]
-            if output.payload == address.hash:
-                sent += output.value
+    for txid, height, received, sent, _coinbase in history:
         rows.append(
             [
                 _html(_height_link(height), numeric=True),
-                _html(_tx_link(transaction.txid_hex())),
+                _html(_tx_link(txid[::-1].hex())),
                 _html(_amount(received - sent), numeric=True),
                 _text(node.chain.confirmations(height), numeric=True),
             ]
@@ -791,8 +780,10 @@ def _address_page(server: RpcServer, text: str) -> str:
             _html(_amount(coin.value), numeric=True),
             _html(_tag("coinbase", "warn") if coin.is_coinbase else ""),
         ]
-        for outpoint, coin in coins
+        for outpoint, coin in coins[:MAX_UNSPENT_ROWS]
     ]
+    if len(coins) > MAX_UNSPENT_ROWS:
+        unspent.append([f"… and {len(coins) - MAX_UNSPENT_ROWS} more", "", "", ""])
     body += "<h2>Unspent outputs</h2>" + _rows(
         ["Transaction", "#Index", "#Amount", "Type"], unspent, empty="No unspent outputs."
     )

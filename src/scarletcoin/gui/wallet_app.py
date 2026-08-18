@@ -262,7 +262,7 @@ class WalletWindow(QtWidgets.QMainWindow):
 
     def _start_polling(self) -> None:
         self._poll_thread = QtCore.QThread(self)
-        self._poller = PollWorker(self._collect, interval_ms=5000)
+        self._poller = PollWorker(self._collect, interval_ms=15000)
         self._poller.moveToThread(self._poll_thread)
         self._poll_thread.started.connect(self._poller.start)
         self._poller.ready.connect(self._apply_snapshot)

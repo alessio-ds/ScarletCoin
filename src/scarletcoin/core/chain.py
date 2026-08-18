@@ -776,17 +776,24 @@ class Blockchain:
         """Update the transaction and address indexes for a connected block."""
         block_hash = block.hash()
         for position, transaction in enumerate(block.transactions):
-            touched = {output.payload for output in transaction.outputs}
+            received: dict[bytes, int] = {}
+            sent: dict[bytes, int] = {}
+            for output in transaction.outputs:
+                received[output.payload] = received.get(output.payload, 0) + output.value
             for txin in transaction.inputs:
                 coin = spent.get(txin.prevout)
                 if coin is not None:
-                    touched.add(coin.payload)
+                    sent[coin.payload] = sent.get(coin.payload, 0) + coin.value
+            deltas = {
+                payload: (received.get(payload, 0), sent.get(payload, 0))
+                for payload in set(received) | set(sent)
+            }
             self.storage.index_transaction(
                 transaction,
                 block_hash=block_hash,
                 position=position,
                 height=height,
-                pubkey_hashes=touched,
+                pubkey_deltas=deltas,
             )
 
     def _disconnect_block(self, entry: BlockIndexEntry) -> Block:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -45,11 +46,17 @@ __all__ = [
 
 #: 1: the original schema.  2: ``blocks.pruned``, so a body can be dropped while
 #: the header stays.  3: the output rewrite (P2SH): the UTXO set gained a type
-#: and the serialisation changed, so the whole database is rebuilt.
-SCHEMA_VERSION = 3
+#: and the serialisation changed, so the whole database is rebuilt.  4: the
+#: ``address_history`` table gained precomputed ``received``, ``sent`` and
+#: ``coinbase`` columns so history queries stop loading whole blocks.
+SCHEMA_VERSION = 4
 
 #: How long :meth:`Storage.size_stats` may reuse its last measurement.
 SIZE_CACHE_SECONDS = 5.0
+
+#: How many deserialised blocks :meth:`Storage.get_block` keeps in memory.
+#: Blocks are immutable, so this is only a read cache; it is dropped on pruning.
+BLOCK_CACHE_SIZE = 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -109,6 +116,9 @@ CREATE TABLE IF NOT EXISTS address_history (
     pubkey_hash BLOB NOT NULL,
     txid        BLOB NOT NULL,
     height      INTEGER NOT NULL,
+    received    INTEGER NOT NULL,
+    sent        INTEGER NOT NULL,
+    coinbase    INTEGER NOT NULL,
     PRIMARY KEY (pubkey_hash, txid)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS address_history_txid ON address_history (txid);
@@ -281,6 +291,7 @@ class Storage:
         self._depth = 0
         self._size_cache: dict | None = None
         self._size_measured_at = 0.0
+        self._block_cache: OrderedDict[bytes, Block] = OrderedDict()
         self._connection = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None, timeout=30.0
         )
@@ -315,12 +326,89 @@ class Storage:
         and coins, so databases from before it are not migrated: every table is
         dropped and the chain is rebuilt from the new genesis.  This is the
         hard-fork reset.
+
+        Schema 4 only adds precomputed amounts to the ``address_history`` index,
+        which is a derived index that can be recomputed from the stored blocks
+        and undo records, so existing databases are upgraded in place.
         """
         if from_version < 3:
             for table in ("blocks", "utxo", "undo", "tx_location", "address_history", "meta"):
                 self._execute(f"DROP TABLE IF EXISTS {table}")
             self._connection.executescript(_SCHEMA)
+        elif from_version == 3:
+            self._migrate_v3_to_v4()
         self.set_meta("schema_version", str(SCHEMA_VERSION).encode())
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Add precomputed ``received``/``sent``/``coinbase`` to ``address_history``."""
+        columns = {row[1] for row in self._connection.execute("PRAGMA table_info(address_history)")}
+        for column, default in (("received", 0), ("sent", 0), ("coinbase", 0)):
+            if column not in columns:
+                self._connection.execute(
+                    "ALTER TABLE address_history ADD COLUMN"
+                    f" {column} INTEGER NOT NULL DEFAULT {default}"
+                )
+        self._backfill_address_history()
+
+    def _backfill_address_history(self) -> None:
+        """Recompute ``received``/``sent``/``coinbase`` for every indexed transaction.
+
+        Replays the active chain using each block's undo record to resolve the
+        coins its inputs spend, so pruned blocks (whose transactions are already
+        unindexed) are never needed.  Runs inside a single transaction.
+        """
+        rows = self._query(
+            "SELECT hash FROM blocks WHERE in_chain = 1 AND pruned = 0 ORDER BY height"
+        )
+        if not rows:
+            return
+        with self.write():
+            for row in rows:
+                block_hash = bytes(row["hash"])
+                block = self.get_block(block_hash)
+                if block is None:  # pragma: no cover - selected a moment ago
+                    continue
+                spent_by_outpoint = dict(self._undo_coins(block_hash))
+                created: dict[OutPoint, tuple[bytes, int]] = {}
+                for transaction in block.transactions:
+                    received: dict[bytes, int] = {}
+                    sent: dict[bytes, int] = {}
+                    for output in transaction.outputs:
+                        received[output.payload] = received.get(output.payload, 0) + output.value
+                    for txin in transaction.inputs:
+                        if txin.prevout.is_null:
+                            continue
+                        coin = spent_by_outpoint.get(txin.prevout)
+                        if coin is None:
+                            payload, value = created.get(txin.prevout, (None, 0))
+                            if payload is None:  # pragma: no cover - valid chain
+                                continue
+                        else:
+                            payload, value = coin.payload, coin.value
+                        sent[payload] = sent.get(payload, 0) + value
+                    txid = transaction.txid()
+                    for index, output in enumerate(transaction.outputs):
+                        created[OutPoint(txid, index)] = (output.payload, output.value)
+                    coinbase = 1 if transaction.is_coinbase else 0
+                    for payload in set(received) | set(sent):
+                        self._execute(
+                            "UPDATE address_history SET received = ?, sent = ?, coinbase = ?"
+                            " WHERE pubkey_hash = ? AND txid = ?",
+                            (
+                                received.get(payload, 0),
+                                sent.get(payload, 0),
+                                coinbase,
+                                payload,
+                                txid,
+                            ),
+                        )
+
+    def _undo_coins(self, block_hash: bytes) -> list[tuple[OutPoint, Coin]]:
+        """Return the coins a block consumed, or ``[]`` if it has no undo record."""
+        try:
+            return self.get_undo(block_hash)
+        except StorageError:
+            return []
 
     def close(self) -> None:
         """Flush and close the database."""
@@ -449,10 +537,22 @@ class Storage:
 
     def get_block(self, block_hash: bytes) -> Block | None:
         """Return a stored block, or ``None`` if it is unknown or pruned."""
-        row = self._one("SELECT raw, pruned FROM blocks WHERE hash = ?", (block_hash,))
-        if row is None or row["pruned"]:
-            return None
-        return Block.deserialize(bytes(row["raw"]))
+        with self._lock:
+            cached = self._block_cache.get(block_hash)
+            if cached is not None:
+                self._block_cache.move_to_end(block_hash)
+                return cached
+            row = self._connection.execute(
+                "SELECT raw, pruned FROM blocks WHERE hash = ?", (block_hash,)
+            ).fetchone()
+            if row is None or row["pruned"]:
+                return None
+            block = Block.deserialize(bytes(row["raw"]))
+            self._block_cache[block_hash] = block
+            self._block_cache.move_to_end(block_hash)
+            while len(self._block_cache) > BLOCK_CACHE_SIZE:
+                self._block_cache.popitem(last=False)
+            return block
 
     def set_in_chain(self, block_hash: bytes, in_chain: bool) -> None:
         """Mark a block as being on (or off) the active chain."""
@@ -699,6 +799,7 @@ class Storage:
             marker = max(height, marker)
             self.set_meta("prune_height", str(marker).encode())
             self._forget_sizes()
+            self._block_cache.clear()
         return PruneResult(
             blocks=len(candidates),
             transactions=transactions,
@@ -828,20 +929,27 @@ class Storage:
         block_hash: bytes,
         position: int,
         height: int,
-        pubkey_hashes: set[bytes],
+        pubkey_deltas: dict[bytes, tuple[int, int]],
     ) -> None:
-        """Record where a confirmed transaction lives and which addresses it touches."""
+        """Record where a confirmed transaction lives and which addresses it touches.
+
+        ``pubkey_deltas`` maps every touched address hash to its ``(received,
+        sent)`` amounts in this transaction, so history queries never have to
+        load the block again.
+        """
         txid = transaction.txid()
         self._execute(
             "INSERT OR REPLACE INTO tx_location (txid, block_hash, position, height)"
             " VALUES (?, ?, ?, ?)",
             (txid, block_hash, position, height),
         )
-        for pubkey_hash in pubkey_hashes:
+        coinbase = 1 if transaction.is_coinbase else 0
+        for pubkey_hash, (received, sent) in pubkey_deltas.items():
             self._execute(
-                "INSERT OR REPLACE INTO address_history (pubkey_hash, txid, height)"
-                " VALUES (?, ?, ?)",
-                (pubkey_hash, txid, height),
+                "INSERT OR REPLACE INTO address_history"
+                " (pubkey_hash, txid, height, received, sent, coinbase)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (pubkey_hash, txid, height, received, sent, coinbase),
             )
 
     def unindex_transaction(self, txid: bytes) -> None:
@@ -858,11 +966,25 @@ class Storage:
             return None
         return TxLocation(bytes(row["block_hash"]), int(row["position"]), int(row["height"]))
 
-    def address_history(self, pubkey_hash: bytes, limit: int = 200) -> list[tuple[bytes, int]]:
-        """Return ``(txid, height)`` pairs touching ``pubkey_hash``, newest first."""
+    def address_history(
+        self, pubkey_hash: bytes, limit: int = 200
+    ) -> list[tuple[bytes, int, int, int, bool]]:
+        """Return ``(txid, height, received, sent, coinbase)`` for ``pubkey_hash``.
+
+        Newest first, capped at ``limit``.
+        """
         rows = self._query(
-            "SELECT txid, height FROM address_history WHERE pubkey_hash = ?"
-            " ORDER BY height DESC LIMIT ?",
+            "SELECT txid, height, received, sent, coinbase FROM address_history"
+            " WHERE pubkey_hash = ? ORDER BY height DESC LIMIT ?",
             (pubkey_hash, limit),
         )
-        return [(bytes(row["txid"]), int(row["height"])) for row in rows]
+        return [
+            (
+                bytes(row["txid"]),
+                int(row["height"]),
+                int(row["received"]),
+                int(row["sent"]),
+                bool(row["coinbase"]),
+            )
+            for row in rows
+        ]
