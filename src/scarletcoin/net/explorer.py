@@ -783,7 +783,14 @@ def _address_page(server: RpcServer, text: str) -> str:
         for outpoint, coin in coins[:MAX_UNSPENT_ROWS]
     ]
     if len(coins) > MAX_UNSPENT_ROWS:
-        unspent.append([f"… and {len(coins) - MAX_UNSPENT_ROWS} more", "", "", ""])
+        unspent.append(
+            [
+                _text(f"… and {len(coins) - MAX_UNSPENT_ROWS} more"),
+                _text(""),
+                _text(""),
+                _text(""),
+            ]
+        )
     body += "<h2>Unspent outputs</h2>" + _rows(
         ["Transaction", "#Index", "#Amount", "Type"], unspent, empty="No unspent outputs."
     )

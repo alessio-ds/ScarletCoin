@@ -687,6 +687,16 @@ class TestExplorer:
             assert status == 200, path
             assert "ScarletCoin" in body, path
 
+    def test_address_page_caps_the_unspent_list(self, rpc, key):
+        """An address with hundreds of coins must not crash or produce a huge page."""
+        _, server, client = rpc
+        address = str(key.address(REGTEST.address_version))
+        client.call("generate", 205, address)
+
+        status, body = self._get(server.url + f"/address/{address}")
+        assert status == 200
+        assert "… and 5 more" in body
+
     def test_overview_shows_network_statistics(self, rpc):
         _, server, client = rpc
         client.call("generate", 5)
