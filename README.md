@@ -13,6 +13,21 @@ P2P links).
 
 **Version 2.2.4 · Mainnet is live and mined · MIT licensed**
 
+<div align="center">
+
+[![Download for Windows (64-bit)](https://img.shields.io/badge/Download-Windows_64--bit-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-2.2.4-win64.zip)
+[![Windows installer](https://img.shields.io/badge/Windows_Installer-.exe-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-Setup-2.2.4.exe)
+
+[![Download for Ubuntu](https://img.shields.io/badge/Download-Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-2.2.4-linux-x86_64.tar.gz)
+[![Download for Fedora](https://img.shields.io/badge/Download-Fedora-51A2DA?style=for-the-badge&logo=fedora&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-2.2.4-linux-fc44-x86_64.tar.gz)
+
+[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-2.2.4-macos-arm64.tar.gz)
+[![Download for macOS (Intel)](https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.4/ScarletCoin-2.2.4-macos-x86_64.tar.gz)
+
+**No Python. No dependencies. Download, extract, run.**
+
+</div>
+
 ```
 ┌────────────────┐   getblocktemplate / submitblock   ┌───────────────┐
 │  scarlet-miner │◄─────────── JSON-RPC ─────────────►│               │
@@ -115,7 +130,29 @@ from existing coins, so they never increase the supply.
 
 ## Install
 
-Needs Python 3.10 or newer. With [uv](https://docs.astral.sh/uv/):
+### Compiled releases (no Python needed)
+
+Use the big buttons at the top of this page. Each archive is a
+self-contained build made with PyInstaller — no Python, no dependencies, no
+installation. What's inside:
+
+| File | What it is |
+|---|---|
+| `scarlet-wallet-gui` | the desktop wallet |
+| `scarlet-miner-gui` | the desktop miner |
+| `scarlet-node` | the node, started in the background by the other two |
+
+Extract the archive anywhere and double-click the wallet or the miner. If no
+node is running yet, the first window to open starts a local node in the
+background (same network and datadir) and stops it again when the last window
+closes. On Linux and macOS, `chmod +x scarlet-*` after extracting. The Windows
+installer `.exe` installs per user (no admin rights) and adds Start-menu
+shortcuts for both applications.
+
+### From source
+
+100% Python, so it also runs anywhere Python does. Needs Python 3.10 or newer.
+With [uv](https://docs.astral.sh/uv/):
 
 ```sh
 uv sync                # node, wallet and miner
@@ -195,12 +232,6 @@ scarlet-wallet export [ADDRESS] | import [WIF]
 
 scarlet-miner ADDRESS [--workers N] [--max-rate HASHES_PER_SEC]
 ```
-
-### Desktop releases
-
-Ready-to-run builds for Windows and Linux are attached to every
-[GitHub release](https://github.com/alessio-ds/ScarletCoin/releases) — wallet,
-miner, and node executables, no Python required. Extract and double-click.
 
 ## Layout
 
