@@ -354,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     import multiprocessing
 
     multiprocessing.freeze_support()
-    multiprocessing.set_start_method("forkserver")
+    if sys.platform != "win32":
+        multiprocessing.set_start_method("forkserver")
 
     parser = argparse.ArgumentParser(
         prog="scarlet-miner-gui", description="ScarletCoin desktop miner."
