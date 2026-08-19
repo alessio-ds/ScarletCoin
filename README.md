@@ -26,6 +26,10 @@ P2P links).
 
 **No Python. No dependencies. Download, extract, run.**
 
+Or use it straight from your browser, nothing to install:
+
+[![Open the ScarletCoin Web Wallet](https://img.shields.io/badge/Open-Web_Wallet-e33a4e?style=for-the-badge&logo=github&logoColor=white)](https://alessio-ds.github.io/scarletcoin-web-wallet/)
+
 </div>
 
 ```
