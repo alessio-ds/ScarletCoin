@@ -245,36 +245,50 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
     try:
         if send_all:
-            result = wallet.send_everything(args.address, fee_per_kb=args.fee_rate, broadcast=False)
+            results = wallet.send_everything(
+                args.address, fee_per_kb=args.fee_rate, broadcast=False
+            )
         else:
-            result = wallet.send(args.address, amount, fee_per_kb=args.fee_rate, broadcast=False)
+            results = [wallet.send(args.address, amount, fee_per_kb=args.fee_rate, broadcast=False)]
     except (WalletError, InsufficientFundsError) as exc:
         die(str(exc))
     except RpcClientError as exc:
         die(str(exc))
 
-    paid = sum(output.value for output in result.transaction.outputs) - result.change
+    results = list(results)
+    paid = sum(
+        sum(output.value for output in result.transaction.outputs) - result.change
+        for result in results
+    )
+    total_fee = sum(result.fee for result in results)
     print(f"to      {args.address}")
     print(f"amount  {_amount(paid)}")
-    print(f"fee     {_amount(result.fee)} ({result.size} bytes)")
-    if result.change:
-        print(f"change  {_amount(result.change)}")
-    print(f"txid    {result.transaction.txid_hex()}")
+    print(f"fee     {_amount(total_fee)} ({sum(r.size for r in results)} bytes)")
+    if len(results) == 1:
+        if results[0].change:
+            print(f"change  {_amount(results[0].change)}")
+        print(f"txid    {results[0].transaction.txid_hex()}")
+    else:
+        print(f"split into {len(results)} transactions:")
+        for result in results:
+            print(f"  txid  {result.transaction.txid_hex()}  fee {_amount(result.fee)}")
 
     if args.dry_run:
         print("\ndry run: nothing was broadcast")
-        print(result.transaction.serialize().hex())
+        for result in results:
+            print(result.transaction.serialize().hex())
         return 0
     if not args.yes:
-        answer = input("send this transaction? [y/N] ").strip().lower()
+        answer = input("send these transactions? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
             print("cancelled")
             return 1
     try:
-        txid = wallet.client.sendrawtransaction(result.transaction.serialize().hex())
+        for result in results:
+            txid = wallet.client.sendrawtransaction(result.transaction.serialize().hex())
+            print(f"broadcast {txid}")
     except RpcClientError as exc:
         die(str(exc))
-    print(f"broadcast {txid}")
     return 0
 
 

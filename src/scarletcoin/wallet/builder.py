@@ -22,6 +22,8 @@ __all__ = [
     "PER_OUTPUT_BYTES",
     "BuiltTransaction",
     "InsufficientFundsError",
+    "build_sweep_transaction",
+    "build_sweep_transactions",
     "build_transaction",
     "dust_threshold",
     "estimate_size",
@@ -34,8 +36,10 @@ __all__ = [
 PER_INPUT_BYTES = 140
 #: Serialised cost of one output: 1-byte type + 8-byte amount + 20-byte hash.
 PER_OUTPUT_BYTES = 29
-#: Version, input and output counts, lock time and the empty coinbase-data field.
-#: Exact while a transaction has fewer than 253 inputs and outputs.
+#: Fixed overhead of the body with single-byte counts: version, input and output
+#: counts, lock time and the empty coinbase-data field.  Exact while a
+#: transaction has fewer than 253 inputs and outputs; :func:`estimate_size`
+#: accounts for the longer count varints above that.
 BASE_BYTES = 11
 
 
@@ -43,9 +47,28 @@ class InsufficientFundsError(ValueError):
     """Raised when the selected coins cannot cover the payment and its fee."""
 
 
+def _varint_size(value: int) -> int:
+    """Number of bytes :meth:`~scarletcoin.core.serialize.Writer.varint` emits."""
+    if value < 0xFD:
+        return 1
+    if value <= 0xFFFF:
+        return 3
+    if value <= 0xFFFFFFFF:
+        return 5
+    return 9
+
+
 def estimate_size(input_count: int, output_count: int) -> int:
-    """Return the expected serialised size of a signed transaction."""
-    return BASE_BYTES + input_count * PER_INPUT_BYTES + output_count * PER_OUTPUT_BYTES
+    """Return the exact serialised size of a signed P2PKH transaction."""
+    return (
+        4  # version (uint32)
+        + _varint_size(input_count)
+        + input_count * PER_INPUT_BYTES
+        + _varint_size(output_count)
+        + output_count * PER_OUTPUT_BYTES
+        + 4  # lock time (uint32)
+        + 1  # empty coinbase data (varbytes of length zero)
+    )
 
 
 def fee_for_size(size: int, fee_per_kb: int) -> int:
@@ -186,6 +209,61 @@ def build_sweep_transaction(
         total_input=total,
         coins=tuple(spendable_coins),
     )
+
+
+def _max_inputs_for_budget(byte_budget: int) -> int:
+    """Largest input count whose one-output transaction fits in ``byte_budget``."""
+    if byte_budget <= 0:
+        return 0
+    low, high = 0, byte_budget // PER_INPUT_BYTES + 1
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_size(mid, 1) <= byte_budget:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def build_sweep_transactions(
+    *,
+    spendable_coins: Sequence[tuple[OutPoint, Coin]],
+    keys: Mapping[bytes, PrivateKey],
+    destination: Address | bytes,
+    fee_per_kb: int,
+    params: ChainParams,
+    lock_time: int = 0,
+) -> list[BuiltTransaction]:
+    """Sweep *every* coin to one destination, splitting into relay-sized chunks.
+
+    A node refuses to relay a transaction larger than half a block, so a wallet
+    with many unspent outputs cannot sweep them in one go.  This splits the coins
+    into the largest groups that each fit under that limit and returns one
+    signed, no-change transaction per group, all paying the same destination.
+
+    Raises:
+        InsufficientFundsError: if there are no coins, or a chunk cannot cover its fee.
+        ValueError: if the destination is invalid or a key is missing.
+    """
+    if not spendable_coins:
+        raise InsufficientFundsError("there are no coins to spend")
+    budget = params.max_block_size // 2
+    per_transaction = max(1, _max_inputs_for_budget(budget))
+    coins = list(spendable_coins)
+    built: list[BuiltTransaction] = []
+    for start in range(0, len(coins), per_transaction):
+        batch = coins[start : start + per_transaction]
+        built.append(
+            build_sweep_transaction(
+                spendable_coins=batch,
+                keys=keys,
+                destination=destination,
+                fee_per_kb=fee_per_kb,
+                params=params,
+                lock_time=lock_time,
+            )
+        )
+    return built
 
 
 def _sign_inputs(

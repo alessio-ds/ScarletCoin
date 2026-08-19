@@ -593,33 +593,44 @@ class WalletWindow(QtWidgets.QMainWindow):
         self._run(build, self._confirm_send, self._send_failed)
 
     def _confirm_send(self, result) -> None:
-        paid = sum(output.value for output in result.transaction.outputs) - result.change
+        results = result if isinstance(result, list) else [result]
+        paid = sum(
+            sum(output.value for output in built.transaction.outputs) - built.change
+            for built in results
+        )
+        total_fee = sum(built.fee for built in results)
+        total_size = sum(built.size for built in results)
+        count = len(results)
         answer = QtWidgets.QMessageBox.question(
             self,
             "Confirm payment",
             f"Pay {format_amount(paid)} SCT to\n{self.send_address.text().strip()}\n\n"
-            f"Fee: {format_amount(result.fee)} SCT ({result.size} bytes)\n"
-            f"Transaction id: {result.transaction.txid_hex()}",
+            f"Fee: {format_amount(total_fee)} SCT ({total_size} bytes, {count} transaction"
+            f"{'s' if count != 1 else ''})",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
         )
         if answer != QtWidgets.QMessageBox.Yes:
             self.send_button.setEnabled(True)
             self.send_status.setText("cancelled")
             return
-        raw = result.transaction.serialize().hex()
         self.send_status.setText("broadcasting...")
         self._run(
-            lambda: self.client.sendrawtransaction(raw),
+            lambda: [
+                self.client.sendrawtransaction(built.transaction.serialize().hex())
+                for built in results
+            ],
             self._send_done,
             self._send_failed,
         )
 
-    def _send_done(self, txid: str) -> None:
+    def _send_done(self, txids: object) -> None:
         self.send_button.setEnabled(True)
         self.send_amount.clear()
         self.send_address.clear()
         self.send_everything.setChecked(False)
-        self.send_status.setText(f"sent: {txid}")
+        if not isinstance(txids, list):
+            txids = [txids]
+        self.send_status.setText("sent: " + ", ".join(str(txid) for txid in txids))
         self._refresh_now()
 
     def _send_failed(self, message: str) -> None:

@@ -189,7 +189,9 @@ class TestWallet:
         destination = str(other_key.address(REGTEST.address_version))
         spendable = wallet.balance().spendable
 
-        result = wallet.send_everything(destination)
+        results = wallet.send_everything(destination)
+        assert isinstance(results, list) and len(results) == 1
+        result = results[0]
         assert result.change == 0
         client.call("generate", 1)
         assert client.getbalance(destination)["balance"] == spendable - result.fee

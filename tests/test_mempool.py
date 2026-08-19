@@ -13,13 +13,15 @@ from scarletcoin.core.validation import MissingInputError
 from scarletcoin.crypto.keys import PrivateKey
 from scarletcoin.wallet.builder import (
     InsufficientFundsError,
+    build_sweep_transaction,
+    build_sweep_transactions,
     build_transaction,
     dust_threshold,
     estimate_size,
     fee_for_size,
     select_coins,
 )
-from tests.helpers import make_node_state, mine_and_add, spend
+from tests.helpers import make_node_state, mine_and_add, regtest_params, spend
 
 
 def _coins(*values: int, pubkey_hash: bytes) -> list[tuple[OutPoint, Coin]]:
@@ -323,3 +325,61 @@ class TestCoinSelection:
         coin = chain.get_coin(transaction.inputs[0].prevout)
         assert coin is not None
         assert transaction.verify_input_signature(0, coin.value, coin.payload)
+
+
+class TestSweep:
+    def test_fee_covers_the_actual_size_for_many_inputs(self):
+        """The size estimate must stay exact past 252 inputs, where the input
+        count varint grows from one byte to three."""
+        key = PrivateKey.generate()
+        pubkey_hash = key.public_key().hash160()
+        coins = [
+            (OutPoint(bytes([index + 1]) * 32, 0), Coin(10_000, 0, pubkey_hash, 1, False))
+            for index in range(253)
+        ]
+        built = build_sweep_transaction(
+            spendable_coins=coins,
+            keys={pubkey_hash: key},
+            destination=pubkey_hash,
+            fee_per_kb=1000,
+            params=REGTEST,
+        )
+        assert built.transaction.size() == estimate_size(253, 1)
+        assert built.fee == fee_for_size(built.transaction.size(), 1000)
+        assert built.fee >= fee_for_size(built.transaction.size(), 1000)
+
+    def test_a_large_sweep_is_split_into_relayable_chunks(self):
+        key = PrivateKey.generate()
+        pubkey_hash = key.public_key().hash160()
+        params = regtest_params(max_block_size=2_000)
+        coins = [
+            (OutPoint(bytes([index + 1]) * 32, 0), Coin(10_000, 0, pubkey_hash, 1, False))
+            for index in range(15)
+        ]
+        results = build_sweep_transactions(
+            spendable_coins=coins,
+            keys={pubkey_hash: key},
+            destination=pubkey_hash,
+            fee_per_kb=1000,
+            params=params,
+        )
+        assert len(results) == 3
+        assert sum(built.total_input for built in results) == 15 * 10_000
+        for built in results:
+            assert built.transaction.size() <= params.max_block_size // 2
+
+    def test_a_small_sweep_is_a_single_transaction(self):
+        key = PrivateKey.generate()
+        pubkey_hash = key.public_key().hash160()
+        coins = [
+            (OutPoint(bytes([index + 1]) * 32, 0), Coin(10_000, 0, pubkey_hash, 1, False))
+            for index in range(3)
+        ]
+        results = build_sweep_transactions(
+            spendable_coins=coins,
+            keys={pubkey_hash: key},
+            destination=pubkey_hash,
+            fee_per_kb=1000,
+            params=REGTEST,
+        )
+        assert len(results) == 1

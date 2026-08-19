@@ -7,13 +7,11 @@ from hypothesis import strategies as st
 
 from scarletcoin.core.pow import bits_to_target, target_to_bits
 from scarletcoin.core.serialize import Reader, Writer
-from scarletcoin.core.utxo import Coin, OutPoint
+from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
+from scarletcoin.core.utxo import Coin
 from scarletcoin.crypto.base58 import b58decode, b58encode
 from scarletcoin.units import format_amount, parse_amount
 from scarletcoin.wallet.builder import (
-    BASE_BYTES,
-    PER_INPUT_BYTES,
-    PER_OUTPUT_BYTES,
     estimate_size,
     fee_for_size,
     select_coins,
@@ -52,10 +50,16 @@ def test_amount_round_trip(scar: int, _junk: int):
 
 
 @given(st.integers(min_value=1, max_value=1000), st.integers(min_value=1, max_value=100))
-def test_size_estimate_grows_linearly(inputs: int, outputs: int):
-    size = estimate_size(inputs, outputs)
-    assert size == BASE_BYTES + inputs * PER_INPUT_BYTES + outputs * PER_OUTPUT_BYTES
-    assert size > 0
+def test_size_estimate_matches_serialisation(inputs: int, outputs: int):
+    transaction = Transaction(
+        inputs=tuple(
+            TxInput(OutPoint(bytes([1]) * 32, index), witness=(b"\x02" * 33, b"\x03" * 64))
+            for index in range(inputs)
+        ),
+        outputs=tuple(TxOutput.p2pkh(1, bytes([2]) * 20) for _ in range(outputs)),
+    )
+    assert estimate_size(inputs, outputs) == transaction.size()
+    assert estimate_size(inputs, outputs) > 0
 
 
 @given(st.integers(min_value=1, max_value=10**9))

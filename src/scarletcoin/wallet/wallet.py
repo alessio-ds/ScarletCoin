@@ -15,7 +15,7 @@ from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.net.client import RpcClient, RpcClientError
 from scarletcoin.wallet.builder import (
     InsufficientFundsError,
-    build_sweep_transaction,
+    build_sweep_transactions,
     build_transaction,
 )
 from scarletcoin.wallet.keystore import Keystore, WalletError
@@ -179,8 +179,12 @@ class Wallet:
 
     def send_everything(
         self, destination: str, *, fee_per_kb: int | None = None, broadcast: bool = True
-    ) -> SendResult:
+    ) -> list[SendResult]:
         """Send the wallet's entire spendable balance to ``destination``.
+
+        When the coins cannot fit in one relayable transaction, they are split
+        into several, each paying the same destination, so a wallet with many
+        unspent outputs is still fully spendable.
 
         Raises:
             InsufficientFundsError: if there is nothing to send, or the balance
@@ -190,17 +194,20 @@ class Wallet:
         coins = self.coins()
         if not coins:
             raise InsufficientFundsError("this wallet has no spendable coins")
-        built = build_sweep_transaction(
+        built = build_sweep_transactions(
             spendable_coins=coins,
             keys=self.keystore.keys_by_hash(),
             destination=target,
             fee_per_kb=fee_per_kb or self.default_fee_rate(),
             params=self.params,
         )
-        txid = built.transaction.txid_hex()
-        if broadcast:
-            txid = self.client.sendrawtransaction(built.transaction.serialize().hex())
-        return SendResult(txid, built.fee, built.change, built.transaction)
+        results: list[SendResult] = []
+        for item in built:
+            txid = item.transaction.txid_hex()
+            if broadcast:
+                txid = self.client.sendrawtransaction(item.transaction.serialize().hex())
+            results.append(SendResult(txid, item.fee, item.change, item.transaction))
+        return results
 
     # -------------------------------------------------------------------- status
 
