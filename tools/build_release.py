@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import textwrap
 import zipfile
 from pathlib import Path
 
@@ -95,21 +96,26 @@ def ensure_venv() -> Path:
 
 
 def _find_cryptography_dylibs(python: Path) -> list[tuple[str, str]]:
-    """macOS only -- locate OpenSSL dylibs bundled inside the ``cryptography``
-    wheel so PyInstaller can bundle those exact libraries, avoiding symbol
-    mismatches (e.g. ``_SSL_get0_group_name``) that happen when a different
-    system ``libssl.3.dylib`` is picked up."""
+    """macOS only -- locate OpenSSL dylibs shipped inside the ``cryptography``
+    wheel and return ``(absolute_source, bundle_relative_dest)`` pairs for
+    ``--add-binary``.  This guarantees the built bundle carries the same
+    ``libssl`` / ``libcrypto`` versions that the pre-compiled ``_rust.abi3.so``
+    was linked against."""
 
     if sys.platform != "darwin":
         return []
 
-    script = (
-        "import cryptography.hazmat, os; "
-        "hazmat_dir = os.path.dirname(cryptography.hazmat.__file__); "
-        "dylibs = [os.path.join(hazmat_dir, f) "
-        "for f in os.listdir(hazmat_dir) if f.endswith('.dylib')]; "
-        "print('\\n'.join(sorted(dylibs)))"
-    )
+    script = textwrap.dedent("""\
+        import cryptography, os, site
+        crypto_dir = os.path.dirname(cryptography.__file__)
+        dylibs = []
+        for root, _dirs, files in os.walk(crypto_dir):
+            for name in sorted(files):
+                if name.endswith('.dylib'):
+                    dylibs.append(os.path.join(root, name))
+        if dylibs:
+            print('\\n'.join(sorted(dylibs)))
+    """)
     try:
         proc = subprocess.run(
             [str(python), "-c", script],
@@ -121,12 +127,29 @@ def _find_cryptography_dylibs(python: Path) -> list[tuple[str, str]]:
         print(f"warning: could not find cryptography dylibs ({exc})")
         return []
 
-    libs = []
+    sitelib = _venv_site_packages(python)
+    libs: list[tuple[str, str]] = []
     for line in proc.stdout.strip().splitlines():
-        line = line.strip()
-        if line:
-            libs.append((line, "cryptography/hazmat"))
+        lib_path = Path(line.strip())
+        try:
+            relative = lib_path.relative_to(sitelib)
+        except ValueError:
+            print(f"  warning: dylib {lib_path} is outside site-packages, skipping")
+            continue
+        libs.append((str(lib_path), str(relative)))
+        print(f"  cryptography dylib: {relative}")
     return libs
+
+
+def _venv_site_packages(python: Path) -> Path:
+    """Return the absolute path of the venv's ``site-packages`` directory."""
+    proc = subprocess.run(
+        [str(python), "-c", "import site; print(site.getsitepackages()[0])"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(proc.stdout.strip())
 
 
 def build_apps(python: Path) -> None:
@@ -157,6 +180,8 @@ def build_apps(python: Path) -> None:
             str(WORK),
             "--paths",
             str(SRC),
+            "--collect-binaries",
+            "cryptography",
         ]
         if not console:
             command.append("--noconsole")
