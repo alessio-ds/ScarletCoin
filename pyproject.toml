@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "certifi>=2023.7.22",
-    "cryptography>=41.0",
+    "cryptography>=41.0,<=48.0.0",
     "ecdsa>=0.19.2",
     "websockets>=16.1.1",
 ]

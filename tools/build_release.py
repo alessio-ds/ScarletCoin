@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import textwrap
 import zipfile
 from pathlib import Path
 
@@ -95,63 +94,6 @@ def ensure_venv() -> Path:
     return python
 
 
-def _find_cryptography_dylibs(python: Path) -> list[tuple[str, str]]:
-    """macOS only -- locate OpenSSL dylibs shipped inside the ``cryptography``
-    wheel and return ``(absolute_source, bundle_relative_dest)`` pairs for
-    ``--add-binary``.  This guarantees the built bundle carries the same
-    ``libssl`` / ``libcrypto`` versions that the pre-compiled ``_rust.abi3.so``
-    was linked against."""
-
-    if sys.platform != "darwin":
-        return []
-
-    script = textwrap.dedent("""\
-        import cryptography, os, site
-        crypto_dir = os.path.dirname(cryptography.__file__)
-        dylibs = []
-        for root, _dirs, files in os.walk(crypto_dir):
-            for name in sorted(files):
-                if name.endswith('.dylib'):
-                    dylibs.append(os.path.join(root, name))
-        if dylibs:
-            print('\\n'.join(sorted(dylibs)))
-    """)
-    try:
-        proc = subprocess.run(
-            [str(python), "-c", script],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        print(f"warning: could not find cryptography dylibs ({exc})")
-        return []
-
-    sitelib = _venv_site_packages(python)
-    libs: list[tuple[str, str]] = []
-    for line in proc.stdout.strip().splitlines():
-        lib_path = Path(line.strip())
-        try:
-            relative = lib_path.relative_to(sitelib)
-        except ValueError:
-            print(f"  warning: dylib {lib_path} is outside site-packages, skipping")
-            continue
-        libs.append((str(lib_path), str(relative)))
-        print(f"  cryptography dylib: {relative}")
-    return libs
-
-
-def _venv_site_packages(python: Path) -> Path:
-    """Return the absolute path of the venv's ``site-packages`` directory."""
-    proc = subprocess.run(
-        [str(python), "-c", "import site; print(site.getsitepackages()[0])"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return Path(proc.stdout.strip())
-
-
 def build_apps(python: Path) -> None:
     """Freeze each program with PyInstaller into the shared bundle directory."""
     if BUNDLE.exists():
@@ -159,8 +101,6 @@ def build_apps(python: Path) -> None:
     if WORK.exists():
         shutil.rmtree(WORK)
     BUNDLE.mkdir(parents=True, exist_ok=True)
-
-    crypto_libs = _find_cryptography_dylibs(python)
 
     for name, entry, console in APPS:
         command = [
@@ -187,9 +127,6 @@ def build_apps(python: Path) -> None:
             command.append("--noconsole")
         for source, destination in DATA_FILES:
             command.extend(["--add-data", f"{ROOT / source}{os.pathsep}{destination}"])
-        for lib_path, bundle_dest in crypto_libs:
-            command.extend(["--add-binary", f"{lib_path}{os.pathsep}{bundle_dest}"])
-            print(f"  bundling cryptography library: {lib_path}")
         command.append(str(ROOT / entry))
         run(command)
 
