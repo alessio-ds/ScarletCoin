@@ -94,6 +94,41 @@ def ensure_venv() -> Path:
     return python
 
 
+def _find_cryptography_dylibs(python: Path) -> list[tuple[str, str]]:
+    """macOS only -- locate OpenSSL dylibs bundled inside the ``cryptography``
+    wheel so PyInstaller can bundle those exact libraries, avoiding symbol
+    mismatches (e.g. ``_SSL_get0_group_name``) that happen when a different
+    system ``libssl.3.dylib`` is picked up."""
+
+    if sys.platform != "darwin":
+        return []
+
+    script = (
+        "import cryptography.hazmat, os; "
+        "hazmat_dir = os.path.dirname(cryptography.hazmat.__file__); "
+        "dylibs = [os.path.join(hazmat_dir, f) "
+        "for f in os.listdir(hazmat_dir) if f.endswith('.dylib')]; "
+        "print('\\n'.join(sorted(dylibs)))"
+    )
+    try:
+        proc = subprocess.run(
+            [str(python), "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"warning: could not find cryptography dylibs ({exc})")
+        return []
+
+    libs = []
+    for line in proc.stdout.strip().splitlines():
+        line = line.strip()
+        if line:
+            libs.append((line, "cryptography/hazmat"))
+    return libs
+
+
 def build_apps(python: Path) -> None:
     """Freeze each program with PyInstaller into the shared bundle directory."""
     if BUNDLE.exists():
@@ -101,6 +136,9 @@ def build_apps(python: Path) -> None:
     if WORK.exists():
         shutil.rmtree(WORK)
     BUNDLE.mkdir(parents=True, exist_ok=True)
+
+    crypto_libs = _find_cryptography_dylibs(python)
+
     for name, entry, console in APPS:
         command = [
             str(python),
@@ -124,6 +162,9 @@ def build_apps(python: Path) -> None:
             command.append("--noconsole")
         for source, destination in DATA_FILES:
             command.extend(["--add-data", f"{ROOT / source}{os.pathsep}{destination}"])
+        for lib_path, bundle_dest in crypto_libs:
+            command.extend(["--add-binary", f"{lib_path}{os.pathsep}{bundle_dest}"])
+            print(f"  bundling cryptography library: {lib_path}")
         command.append(str(ROOT / entry))
         run(command)
 

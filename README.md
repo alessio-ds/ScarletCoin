@@ -11,18 +11,18 @@ retargeting, halvings, a hard supply cap — with faster blocks and a modern
 feature set (BIP-39/32/44 wallets, P2SH multisig, replace-by-fee, encrypted
 P2P links).
 
-**Version 2.2.8 · Mainnet is live and mined · MIT licensed**
+**Version 2.2.9 · Mainnet is live and mined · MIT licensed**
 
 <div align="center">
 
-[![Download for Windows (64-bit)](https://img.shields.io/badge/Download-Windows_64--bit-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-2.2.8-win64.zip)
-[![Windows installer](https://img.shields.io/badge/Windows_Installer-.exe-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-Setup-2.2.8.exe)
+[![Download for Windows (64-bit)](https://img.shields.io/badge/Download-Windows_64--bit-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-2.2.9-win64.zip)
+[![Windows installer](https://img.shields.io/badge/Windows_Installer-.exe-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-Setup-2.2.9.exe)
 
-[![Download for Ubuntu](https://img.shields.io/badge/Download-Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-2.2.8-linux-x86_64.tar.gz)
-[![Download for Fedora](https://img.shields.io/badge/Download-Fedora-51A2DA?style=for-the-badge&logo=fedora&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-2.2.8-linux-fc44-x86_64.tar.gz)
+[![Download for Ubuntu](https://img.shields.io/badge/Download-Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-2.2.9-linux-x86_64.tar.gz)
+[![Download for Fedora](https://img.shields.io/badge/Download-Fedora-51A2DA?style=for-the-badge&logo=fedora&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-2.2.9-linux-fc44-x86_64.tar.gz)
 
-[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-2.2.8-macos-arm64.tar.gz)
-[![Download for macOS (Intel)](https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.8/ScarletCoin-2.2.8-macos-x86_64.tar.gz)
+[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-2.2.9-macos-arm64.tar.gz)
+[![Download for macOS (Intel)](https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.9/ScarletCoin-2.2.9-macos-x86_64.tar.gz)
 
 **No Python. No dependencies. Download, extract, run.**
 
