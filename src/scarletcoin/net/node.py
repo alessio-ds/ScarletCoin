@@ -268,13 +268,16 @@ class Node:
                 continue
             if (host, port) in self._local_addresses:
                 continue  # this node is that seed
-            self.addrbook.add(host, port, source="seed")
             try:
                 resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
             except OSError as exc:
                 logger.warning("cannot resolve seed %s: %s", host, exc)
+                self.addrbook.add(host, port, source="seed")
                 continue
             addresses = {info[4][0] for info in resolved}
+            if any((addr, port) in self._local_addresses for addr in addresses):
+                continue  # resolves to an address already known to be this node
+            self.addrbook.add(host, port, source="seed")
             for address in addresses:
                 if (address, port) not in self._local_addresses:
                     self.addrbook.add(address, port, source="dns")
@@ -435,6 +438,13 @@ class Node:
         if self.addrbook.is_banned(host):
             return False
         if self._already_connected(host, port):
+            return False
+        try:
+            resolved = socket.gethostbyname(host)
+        except OSError:
+            resolved = None
+        if resolved is not None and (resolved, port) in self._local_addresses:
+            self.addrbook.forget(host, port)
             return False
         try:
             peer = connect_to(host, port, magic=self.params.magic)
