@@ -244,6 +244,13 @@ class Node:
             return
         self._local_addresses.add((host, port))
         self.addrbook.forget(host, port)
+        try:
+            resolved = socket.gethostbyname(host)
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved != host:
+            self._local_addresses.add((resolved, port))
+            self.addrbook.forget(resolved, port)
         logger.info("%s:%d is this node; it will not be dialled again", host, port)
 
     def _bootstrap_seeds(self) -> None:
@@ -569,6 +576,9 @@ class Node:
                 self._note_local_address(peer.host, peer.port)
             if message.listen_port:
                 self._note_local_address(peer.host, message.listen_port)
+            elif peer.inbound:
+                # Peer did not advertise a listen port but is ourselves.
+                self._note_local_address(peer.host, peer.port)
             logger.debug("%s is ourselves, dropping", peer)
             peer.close()
             return
@@ -629,6 +639,8 @@ class Node:
 
     def _on_addr(self, message: protocol.Addr) -> None:
         for address in message.addresses:
+            if (address.host, address.port) in self._local_addresses:
+                continue
             self.addrbook.add(address.host, address.port, last_seen=address.last_seen)
 
     def _on_inv(self, peer: Peer, message: protocol.Inv) -> None:
