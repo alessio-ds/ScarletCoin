@@ -732,6 +732,10 @@ class Node:
             batch.append(InvItem(InvType.BLOCK, block_hash))
         if not batch:
             return
+        logger.debug(
+            "%s: requesting %d blocks, %d already in flight",
+            peer, len(batch), len(peer.requested_blocks),
+        )
         peer.requested_blocks.update(item.hash for item in batch)
         peer.send(protocol.GetData(tuple(batch)))
         peer._last_getdata_at = time.time()
@@ -808,6 +812,7 @@ class Node:
 
     def _on_headers(self, peer: Peer, message: protocol.Headers) -> None:
         """Store announced headers and queue the blocks they describe."""
+        accepted = 0
         for raw in message.headers:
             try:
                 header = BlockHeader.deserialize(raw)
@@ -816,6 +821,13 @@ class Node:
             error = self.chain.add_header(header)
             if error:
                 logger.debug("%s sent a bad header: %s", peer, error)
+            else:
+                accepted += 1
+        logger.debug(
+            "%s: processed %d headers (accepted %d), header_height=%d peer_height=%d",
+            peer, len(message.headers), accepted,
+            self.chain.header_height(), peer.start_height,
+        )
         self._queue_missing_blocks()
         # Ask for more headers if the peer still looks ahead.
         if self.chain.header_height() < peer.start_height:
@@ -826,6 +838,10 @@ class Node:
         missing = self.chain.headers_to_download(2_000)
         peers = [p for p in self.peers if p.handshake_done.is_set()]
         if not missing or not peers:
+            logger.debug(
+                "_queue_missing_blocks: %d missing, %d peers — nothing to do",
+                len(missing or []), len(peers),
+            )
             return
         for index, block_hash in enumerate(missing):
             peer = peers[index % len(peers)]
