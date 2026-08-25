@@ -799,13 +799,8 @@ class Node:
     def _on_getheaders(self, peer: Peer, message: protocol.GetHeaders) -> None:
         """Answer ``getheaders`` with up to 2000 headers from the best chain."""
         fork_height = self.chain.find_header_fork_height(message.locator)
-        limit = (
-            protocol.MAX_HEADERS_PER_MESSAGE // 4
-            if peer.start_height == 0
-            else protocol.MAX_HEADERS_PER_MESSAGE
-        )
         headers = self.chain.serialized_headers_after(
-            fork_height, limit, message.stop_hash
+            fork_height, protocol.MAX_HEADERS_PER_MESSAGE, message.stop_hash
         )
         if headers:
             peer.send(protocol.Headers(tuple(headers)))

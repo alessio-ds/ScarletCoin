@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 import time
 from dataclasses import replace
@@ -166,6 +167,39 @@ class TestHeaderSync:
         target.add_header(BlockHeader.deserialize(raw_headers[0]))
         assert target.add_header(second) is None
         assert target.header_height() == 2
+        target.storage.close()
+
+    def test_headers_after_a_far_fork_start_at_the_fork(self, key):
+        """Headers returned after a distant fork are the nearest ones, not the tip.
+
+        A node many blocks behind must be given the headers closest to its fork
+        point so each one's parent is already known. Returning the tip would
+        hand the client only orphans, looping for ever.
+        """
+        source = make_chain()
+        mine_and_add(source, key, count=120)
+        serialized = source.serialized_headers_after(0, 10)
+        source.storage.close()
+
+        headers = [BlockHeader.deserialize(raw) for raw in serialized]
+        assert len(headers) > 0
+        # The first header must attach to genesis — a client that only knows
+        # genesis can validate and store it immediately.
+        assert headers[0].prev_hash == REGTEST.genesis_hash, (
+            f"first header must reference genesis,"
+            f" got prev_hash={headers[0].prev_hash.hex()}"
+            f" vs genesis={REGTEST.genesis_hash.hex()}"
+        )
+        for prev, curr in itertools.pairwise(headers):
+            assert curr.prev_hash == prev.hash(), (
+                f"header chain must be consecutive"
+                f" (prev={prev.hash().hex()}, curr.prev={curr.prev_hash.hex()})"
+            )
+
+        target = make_chain()
+        for raw in serialized:
+            assert target.add_header(BlockHeader.deserialize(raw)) is None
+        assert target.header_height() == len(serialized)
         target.storage.close()
 
 

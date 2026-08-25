@@ -465,19 +465,30 @@ class Blockchain:
     def serialized_headers_after(
         self, height: int, limit: int, stop_hash: bytes | None = None
     ) -> list[bytes]:
-        """Return up to ``limit`` 80-byte headers above ``height``, ascending."""
+        """Return up to ``limit`` 80-byte headers above ``height``, ascending.
+
+        These are the *first* headers after the fork, not the newest ones on the
+        chain: a node that is many blocks behind needs the headers immediately
+        above its fork point so each one's parent is already known. Walking down
+        from the tip and taking the top ``limit`` entries would hand such a node
+        only orphans, which it silently defers and re-requests for ever.
+        """
         tip = self.header_tip()
         if tip is None:
             return []
-        headers: list[bytes] = []
+        chain: list[bytes] = []
         node = tip
-        while node is not None and node.height > height and len(headers) < limit:
-            header_bytes = self._header_bytes(node.hash)
+        while node is not None and node.height > height:
+            chain.append(node.hash)
+            node = self._node(node.prev_hash)
+        selected = chain[-limit:]
+        selected.reverse()  # ascending, closest to the fork first
+        headers: list[bytes] = []
+        for block_hash in selected:
+            header_bytes = self._header_bytes(block_hash)
             if header_bytes is None:  # pragma: no cover - index and data go together
                 break
             headers.append(header_bytes)
-            node = self._node(node.prev_hash)
-        headers.reverse()
         if stop_hash is not None and stop_hash != b"\x00" * 32:
             for index, raw in enumerate(headers):
                 if hash256(raw) == stop_hash:
