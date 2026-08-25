@@ -77,11 +77,11 @@ _RECONNECT_THRESHOLD = 10
 _RECONNECT_WINDOW = 60.0
 #: Maximum ban duration for a rapid-reconnecting IP.
 _MAX_RECONNECT_BAN = 3600.0
+#: If a peer at height 0 has been served this many blocks in a single
+#: maintenance cycle, the connection is closed.
+_MAX_BLOCKS_PER_CYCLE_TO_ZERO = 5_000
 #: Sleep between serving blocks to a syncing peer, to avoid saturating a CPU core.
 _SERVE_BLOCK_DELAY = 0.005
-#: If a peer has been served this many blocks while still reporting height 0,
-#: stop serving it and let the connection time out.
-_MAX_BLOCKS_SERVED_TO_ZERO_HEIGHT = 20_000
 #: Warn every N blocks when a peer at height 0 keeps requesting more.
 _BLOCKS_WARNING_INTERVAL = 500
 
@@ -761,20 +761,11 @@ class Node:
             and peer.blocks_served - getattr(peer, "_last_served_log", 0)
             >= _BLOCKS_WARNING_INTERVAL
         ):
-            logger.debug(
+            logger.info(
                 "served %d blocks to %s (reports height %d)",
                 peer.blocks_served, peer, peer.start_height,
             )
             peer._last_served_log = peer.blocks_served  # type: ignore[attr-defined]
-        if (
-            peer.start_height == 0
-            and peer.blocks_served > _MAX_BLOCKS_SERVED_TO_ZERO_HEIGHT
-        ):
-            logger.warning(
-                "peer %s at height 0 has been served %d blocks — closing connection",
-                peer, peer.blocks_served,
-            )
-            peer.close()
 
     def _on_getblocks(self, peer: Peer, message: protocol.GetBlocks) -> None:
         fork_height = self.chain.find_fork_height(message.locator)
@@ -843,6 +834,10 @@ class Node:
         peer.requested_blocks.discard(block_hash)
         peer.note_inventory(block_hash)
         result = self.submit_block(block, source=peer)
+        logger.debug(
+            "block %s from %s: %s",
+            block.hash_hex(), peer, result.status.value,
+        )
         if result.status is BlockStatus.INVALID:
             self._misbehave(peer, 50, result.reason)
         elif result.status is BlockStatus.PREMATURE:
@@ -1132,6 +1127,19 @@ class Node:
                             "%s: served %d blocks, reports height %d",
                             peer, peer.blocks_served, peer.start_height,
                         )
+                    if (
+                        peer.start_height == 0
+                        and peer.blocks_served
+                        - peer._blocks_served_last_check
+                        > _MAX_BLOCKS_PER_CYCLE_TO_ZERO
+                    ):
+                        logger.warning(
+                            "%s at height 0 received %d blocks this cycle — disconnecting",
+                            peer,
+                            peer.blocks_served - peer._blocks_served_last_check,
+                        )
+                        peer.close()
+                    peer._blocks_served_last_check = peer.blocks_served
 
     # ----------------------------------------------------------------- reporting
 

@@ -71,6 +71,7 @@ class Peer:
         self.requested_blocks: set[bytes] = set()
         self.syncing = False
         self.blocks_served = 0
+        self._blocks_served_last_check = 0
 
     # ------------------------------------------------------------------ helpers
 
