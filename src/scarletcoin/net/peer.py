@@ -13,10 +13,11 @@ from collections import deque
 from scarletcoin.net import cipher, protocol
 from scarletcoin.net.protocol import HEADER_SIZE, Message, ProtocolError
 
-__all__ = ["Peer", "PeerDisconnected"]
+__all__ = ["_RECV_TIMEOUT", "Peer", "PeerDisconnected"]
 
 _ids = itertools.count(1)
 _MAX_KNOWN_INVENTORY = 20_000
+_RECV_TIMEOUT = 120.0
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,10 @@ class Peer:
         """
         header = self._recv_exactly(HEADER_SIZE)
         command, length, checksum = protocol.parse_header(header, self.magic)
+        logger.debug(
+            "%s: received header cmd=%s payload_len=%d",
+            self, command, length,
+        )
         payload = self._recv_exactly(length) if length else b""
         self.last_message_at = time.time()
         if self._cipher is not None:
@@ -205,6 +210,6 @@ def connect_to(host: str, port: int, *, magic: bytes, timeout: float = 10.0) -> 
         sock = socket.create_connection((host, port), timeout=timeout)
     except OSError as exc:
         raise PeerDisconnected(f"cannot connect to {host}:{port}: {exc}") from exc
-    sock.settimeout(None)
+    sock.settimeout(_RECV_TIMEOUT)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return Peer(sock, (host, port), magic=magic, inbound=False)

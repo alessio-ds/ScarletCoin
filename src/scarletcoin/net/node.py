@@ -36,7 +36,7 @@ from scarletcoin.core.transaction import Transaction
 from scarletcoin.core.validation import MissingInputError, ValidationError
 from scarletcoin.net import cipher, protocol
 from scarletcoin.net.addrbook import AddressBook, parse_address
-from scarletcoin.net.peer import Peer, PeerDisconnected, connect_to
+from scarletcoin.net.peer import _RECV_TIMEOUT, Peer, PeerDisconnected, connect_to
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
 from scarletcoin.net.websocket import WebSocketHub
 
@@ -430,7 +430,7 @@ class Node:
             if inbound >= self.config.max_inbound:
                 client.close()
                 continue
-            client.settimeout(None)
+            client.settimeout(_RECV_TIMEOUT)
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             peer = Peer(client, address, magic=self.params.magic, inbound=True)
             self._register(peer)
@@ -790,8 +790,13 @@ class Node:
     def _on_getheaders(self, peer: Peer, message: protocol.GetHeaders) -> None:
         """Answer ``getheaders`` with up to 2000 headers from the best chain."""
         fork_height = self.chain.find_header_fork_height(message.locator)
+        limit = (
+            protocol.MAX_HEADERS_PER_MESSAGE // 4
+            if peer.start_height == 0
+            else protocol.MAX_HEADERS_PER_MESSAGE
+        )
         headers = self.chain.serialized_headers_after(
-            fork_height, protocol.MAX_HEADERS_PER_MESSAGE, message.stop_hash
+            fork_height, limit, message.stop_hash
         )
         if headers:
             peer.send(protocol.Headers(tuple(headers)))
