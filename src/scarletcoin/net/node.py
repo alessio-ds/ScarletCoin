@@ -77,6 +77,10 @@ _RECONNECT_THRESHOLD = 10
 _RECONNECT_WINDOW = 60.0
 #: Maximum ban duration for a rapid-reconnecting IP.
 _MAX_RECONNECT_BAN = 3600.0
+#: If a peer has requested blocks but none arrive within this window,
+#: the connection is closed.  VPN tunnels with DPI/DAITA can silently
+#: drop large payloads while small control messages still pass.
+_BLOCK_REQUEST_TIMEOUT = 120.0
 #: If a peer at height 0 has been served this many blocks in a single
 #: maintenance cycle, the connection is closed.
 _MAX_BLOCKS_PER_CYCLE_TO_ZERO = 5_000
@@ -730,6 +734,7 @@ class Node:
             return
         peer.requested_blocks.update(item.hash for item in batch)
         peer.send(protocol.GetData(tuple(batch)))
+        peer._last_getdata_at = time.time()
 
     def _on_getdata(self, peer: Peer, message: protocol.GetData) -> None:
         missing: list[InvItem] = []
@@ -1089,6 +1094,16 @@ class Node:
                         peer.send(protocol.Ping(peer.last_ping_nonce))
                     except PeerDisconnected:
                         continue
+                if (
+                    peer._last_getdata_at is not None
+                    and now - peer._last_getdata_at > _BLOCK_REQUEST_TIMEOUT
+                    and peer.requested_blocks
+                ):
+                    logger.warning(
+                        "%s has %d blocks pending for %.0f s — disconnecting",
+                        peer, len(peer.requested_blocks), now - peer._last_getdata_at,
+                    )
+                    peer.close()
             if (
                 self.peers
                 and now - self._last_block_at > self.stale_tip_seconds

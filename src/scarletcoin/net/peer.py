@@ -73,6 +73,7 @@ class Peer:
         self.syncing = False
         self.blocks_served = 0
         self._blocks_served_last_check = 0
+        self._last_getdata_at: float | None = None
 
     # ------------------------------------------------------------------ helpers
 
@@ -121,16 +122,21 @@ class Peer:
         """
         if self.closed:
             raise PeerDisconnected(f"{self} is closed")
+        command = message.command
         payload = message.encode()
         if self._cipher is not None:
             payload = self._cipher.encrypt(payload)
-        data = protocol.encode_payload(self.magic, message.command.encode("ascii"), payload)
+        data = protocol.encode_payload(self.magic, command.encode("ascii"), payload)
         try:
             with self._send_lock:
                 self.socket.sendall(data)
         except OSError as exc:
             self.close()
             raise PeerDisconnected(f"{self}: send failed: {exc}") from exc
+        logger.debug(
+            "%s: sent cmd=%s payload_len=%d total=%d",
+            self, command, len(payload), len(data),
+        )
 
     def _recv_exactly(self, length: int) -> bytes:
         buffer = bytearray()
