@@ -71,6 +71,19 @@ MEMPOOL_REANNOUNCE_INTERVAL = 120.0
 _PREMATURE_RETRY_INTERVAL = 60.0
 #: How often a pruning node trims the blocks that have fallen behind its horizon.
 _PRUNE_INTERVAL = 600.0
+#: An IP that connects this many times within the window is banned.
+_RECONNECT_THRESHOLD = 10
+#: The window in seconds for counting rapid reconnects.
+_RECONNECT_WINDOW = 60.0
+#: Maximum ban duration for a rapid-reconnecting IP.
+_MAX_RECONNECT_BAN = 3600.0
+#: Sleep between serving blocks to a syncing peer, to avoid saturating a CPU core.
+_SERVE_BLOCK_DELAY = 0.005
+#: If a peer has been served this many blocks while still reporting height 0,
+#: stop serving it and let the connection time out.
+_MAX_BLOCKS_SERVED_TO_ZERO_HEIGHT = 20_000
+#: Warn every N blocks when a peer at height 0 keeps requesting more.
+_BLOCKS_WARNING_INTERVAL = 500
 
 
 @dataclass
@@ -186,6 +199,9 @@ class Node:
         self._premature_blocks = 0
         self._premature_reason = ""
         self._premature_logged_at = 0.0
+
+        self._connect_history: dict[str, list[float]] = {}
+        """Timestamps of recent inbound connections, keyed by host IP."""
 
         self.ws_hub = WebSocketHub(port=config.ws_port)
         """Live-update WebSocket endpoint, started only when ``config.ws``."""
@@ -403,7 +419,11 @@ class Node:
                 if not self.stopping:  # pragma: no cover - transient accept errors
                     logger.debug("accept failed", exc_info=True)
                 return
-            if self.addrbook.is_banned(address[0]):
+            host = address[0]
+            if self._check_reconnect_ban(host):
+                client.close()
+                continue
+            if self.addrbook.is_banned(host):
                 client.close()
                 continue
             inbound = sum(1 for peer in self.peers if peer.inbound)
@@ -414,6 +434,29 @@ class Node:
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             peer = Peer(client, address, magic=self.params.magic, inbound=True)
             self._register(peer)
+
+    def _check_reconnect_ban(self, host: str) -> bool:
+        """Ban hosts that repeatedly connect and disconnect in a short window.
+
+        Returns ``True`` if the host should be banned right now.
+        """
+        now = time.time()
+        with self._lock:
+            history = self._connect_history.setdefault(host, [])
+            history.append(now)
+            self._connect_history[host] = [t for t in history if now - t < _RECONNECT_WINDOW]
+            recent = len(self._connect_history[host])
+            if recent < _RECONNECT_THRESHOLD:
+                return False
+        duration = min(_MAX_RECONNECT_BAN, 60.0 * (recent - _RECONNECT_THRESHOLD + 1))
+        logger.warning(
+            "banning %s for %d s after %d connects in %d s",
+            host, int(duration), recent, int(_RECONNECT_WINDOW),
+        )
+        self.addrbook.ban(host, duration)
+        with self._lock:
+            self._connect_history.pop(host, None)
+        return True
 
     def _connect_loop(self) -> None:
         """Keep the outbound peer slots filled from the address book."""
@@ -690,6 +733,7 @@ class Node:
 
     def _on_getdata(self, peer: Peer, message: protocol.GetData) -> None:
         missing: list[InvItem] = []
+        block_count = 0
         for item in message.items:
             if item.is_block:
                 block = self.chain.get_block(item.hash)
@@ -697,6 +741,10 @@ class Node:
                     missing.append(item)
                 else:
                     peer.send(protocol.BlockMessage(block))
+                    block_count += 1
+                    if block_count > 1 and block_count % 8 == 0:
+                        time.sleep(_SERVE_BLOCK_DELAY)
+                    peer.blocks_served += 1
             else:
                 transaction = self.mempool.get(item.hash)
                 if transaction is None:
@@ -708,6 +756,25 @@ class Node:
                     peer.send(protocol.TxMessage(transaction))
         if missing:
             peer.send(protocol.NotFound(tuple(missing)))
+        if (
+            peer.blocks_served > 0
+            and peer.blocks_served - getattr(peer, "_last_served_log", 0)
+            >= _BLOCKS_WARNING_INTERVAL
+        ):
+            logger.debug(
+                "served %d blocks to %s (reports height %d)",
+                peer.blocks_served, peer, peer.start_height,
+            )
+            peer._last_served_log = peer.blocks_served  # type: ignore[attr-defined]
+        if (
+            peer.start_height == 0
+            and peer.blocks_served > _MAX_BLOCKS_SERVED_TO_ZERO_HEIGHT
+        ):
+            logger.warning(
+                "peer %s at height 0 has been served %d blocks — closing connection",
+                peer, peer.blocks_served,
+            )
+            peer.close()
 
     def _on_getblocks(self, peer: Peer, message: protocol.GetBlocks) -> None:
         fork_height = self.chain.find_fork_height(message.locator)
@@ -1059,6 +1126,12 @@ class Node:
                 self.addrbook.prune()
                 self.addrbook.save()
                 last_save = now
+                for peer in self.peers:
+                    if peer.blocks_served > 0:
+                        logger.info(
+                            "%s: served %d blocks, reports height %d",
+                            peer, peer.blocks_served, peer.start_height,
+                        )
 
     # ----------------------------------------------------------------- reporting
 

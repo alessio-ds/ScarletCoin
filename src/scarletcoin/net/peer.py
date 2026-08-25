@@ -70,6 +70,7 @@ class Peer:
         self.pending_blocks: deque[bytes] = deque()
         self.requested_blocks: set[bytes] = set()
         self.syncing = False
+        self.blocks_served = 0
 
     # ------------------------------------------------------------------ helpers
 
