@@ -455,7 +455,10 @@ class Node:
         duration = min(_MAX_RECONNECT_BAN, 60.0 * (recent - _RECONNECT_THRESHOLD + 1))
         logger.warning(
             "banning %s for %d s after %d connects in %d s",
-            host, int(duration), recent, int(_RECONNECT_WINDOW),
+            host,
+            int(duration),
+            recent,
+            int(_RECONNECT_WINDOW),
         )
         self.addrbook.ban(host, duration)
         with self._lock:
@@ -734,7 +737,9 @@ class Node:
             return
         logger.debug(
             "%s: requesting %d blocks, %d already in flight",
-            peer, len(batch), len(peer.requested_blocks),
+            peer,
+            len(batch),
+            len(peer.requested_blocks),
         )
         peer.requested_blocks.update(item.hash for item in batch)
         peer.send(protocol.GetData(tuple(batch)))
@@ -772,7 +777,9 @@ class Node:
         ):
             logger.info(
                 "served %d blocks to %s (reports height %d)",
-                peer.blocks_served, peer, peer.start_height,
+                peer.blocks_served,
+                peer,
+                peer.start_height,
             )
             peer._last_served_log = peer.blocks_served  # type: ignore[attr-defined]
 
@@ -820,8 +827,11 @@ class Node:
                 accepted += 1
         logger.debug(
             "%s: processed %d headers (accepted %d), header_height=%d peer_height=%d",
-            peer, len(message.headers), accepted,
-            self.chain.header_height(), peer.start_height,
+            peer,
+            len(message.headers),
+            accepted,
+            self.chain.header_height(),
+            peer.start_height,
         )
         self._queue_missing_blocks()
         # Ask for more headers if the peer still looks ahead.
@@ -835,7 +845,8 @@ class Node:
         if not missing or not peers:
             logger.debug(
                 "_queue_missing_blocks: %d missing, %d peers — nothing to do",
-                len(missing or []), len(peers),
+                len(missing or []),
+                len(peers),
             )
             return
         for index, block_hash in enumerate(missing):
@@ -857,7 +868,9 @@ class Node:
         result = self.submit_block(block, source=peer)
         logger.debug(
             "block %s from %s: %s",
-            block.hash_hex(), peer, result.status.value,
+            block.hash_hex(),
+            peer,
+            result.status.value,
         )
         if result.status is BlockStatus.INVALID:
             self._misbehave(peer, 50, result.reason)
@@ -1112,7 +1125,9 @@ class Node:
                 ):
                     logger.warning(
                         "%s has %d blocks pending for %.0f s — disconnecting",
-                        peer, len(peer.requested_blocks), now - peer._last_getdata_at,
+                        peer,
+                        len(peer.requested_blocks),
+                        now - peer._last_getdata_at,
                     )
                     peer.close()
             if (
@@ -1156,12 +1171,13 @@ class Node:
                     if peer.blocks_served > 0:
                         logger.info(
                             "%s: served %d blocks, reports height %d",
-                            peer, peer.blocks_served, peer.start_height,
+                            peer,
+                            peer.blocks_served,
+                            peer.start_height,
                         )
                     if (
                         peer.start_height == 0
-                        and peer.blocks_served
-                        - peer._blocks_served_last_check
+                        and peer.blocks_served - peer._blocks_served_last_check
                         > _MAX_BLOCKS_PER_CYCLE_TO_ZERO
                     ):
                         logger.warning(

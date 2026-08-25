@@ -135,7 +135,10 @@ class Peer:
             raise PeerDisconnected(f"{self}: send failed: {exc}") from exc
         logger.debug(
             "%s: sent cmd=%s payload_len=%d total=%d",
-            self, command, len(payload), len(data),
+            self,
+            command,
+            len(payload),
+            len(data),
         )
 
     def _recv_exactly(self, length: int) -> bytes:
@@ -167,7 +170,9 @@ class Peer:
         command, length, checksum = protocol.parse_header(header, self.magic)
         logger.debug(
             "%s: received header cmd=%s payload_len=%d",
-            self, command, length,
+            self,
+            command,
+            length,
         )
         payload = self._recv_exactly(length) if length else b""
         self.last_message_at = time.time()
