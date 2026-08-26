@@ -82,7 +82,7 @@ from existing coins, so they never increase the supply.
 |---|---|
 | Consensus algorithm | Proof of work, **SHA-256d** (double SHA-256) |
 | Block time | **60 seconds** (target) |
-| Difficulty retarget | **every block** against a 60-block window, capped at **4× per block** |
+| Difficulty retarget | **every block** from the observed hashrate, capped at **4× harder per block** |
 | Chain selection | greatest cumulative proof of work |
 | Block size limit | **1 MB** (1,000,000 bytes) |
 | **Throughput (max TPS)** | **~80 tx/s sustained** — 1 MB of ~209-byte P2PKH transactions per 60 s block |
@@ -94,30 +94,35 @@ from existing coins, so they never increase the supply.
 
 ScarletCoin retargets its proof-of-work difficulty **every block** (starting in
 2.3.0), not once per retargeting period like Bitcoin. Each block's target is
-computed from the time between the start of the trailing `retarget_interval`
-window and the new block's **own** timestamp:
+computed directly from the hashrate observed over the trailing time window:
+the chainwork mined in the last `target_spacing · retarget_interval` seconds,
+divided by the time that work took:
 
 ```
-first    = ancestor at (height − retarget_interval)      (or genesis, for early blocks)
-observed = child.timestamp − first.timestamp             clamped to
-           [target_timespan / 4, target_timespan · 4]
-target   = min(parent_target · observed / target_timespan, pow_limit)
+work     = chainwork(tip) − chainwork(block at window start)
+observed = work / elapsed                                    hashes per second
+target   = 2^256 / (observed · target_spacing)               one block per target
 ```
 
-Because the measurement uses the child's timestamp, the very first block mined
-after a slowdown is already rewarded with an easier target — there is no lag
-while the gap "ages out" of a fixed window. If a block lands more than
-`max_future_time` (2 h) after its parent, the chain is considered stalled and the
-target collapses straight back to `pow_limit` (difficulty 1), so a hashrate
-collapse can never wedge the chain: it recovers immediately and then re-tightens
-one block at a time as the hashrate returns.
+Measuring the hashrate directly — instead of multiplying the previous target by
+a time ratio — keeps the difficulty from drifting upward under the normal
+variance of block times.
 
-This rule is symmetric — it also raises difficulty 4× per block when a burst of
-hashrate appears — so a miner who turns powerful hardware on and off to exploit
-the recovery gains nothing they would not have earned by mining honestly.
-The clamp keeps any single block from moving the target more than a factor of
-four in either direction, and the target is never allowed easier than
-`pow_limit`.
+The adjustment is clamped **asymmetrically**, because the two failure modes are
+not symmetric:
+
+* **Harder** is capped at `max_adjustment_factor` (4×) per block, so a burst of
+  hashrate — or a block with a deliberately low timestamp — cannot spike the
+  difficulty and stall the chain.
+* **Easier** is uncapped (down to `pow_limit`, difficulty 1), so a hashrate
+  collapse eases immediately in a single block rather than crawling down 4× at
+  a time.
+
+On top of that, a block that lands more than `max_future_time` (2 h) after its
+parent is treated as a stalled chain and resets straight to `pow_limit`. The
+time-bounded window empties out a stall by itself: blocks mined before a long
+gap are simply older than the window and drop out, so the difficulty measures
+the miners that are active *now*, not the ones who left.
 
 ### Transactions & scripting
 

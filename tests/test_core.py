@@ -8,6 +8,7 @@ from scarletcoin.core.block import Block, BlockError, BlockHeader, merkle_root
 from scarletcoin.core.coinbase import build_coinbase, coinbase_height, encode_coinbase_data
 from scarletcoin.core.params import MAINNET, NETWORKS, REGTEST, TESTNET, get_params
 from scarletcoin.core.pow import (
+    bits_from_work,
     bits_to_target,
     block_work,
     check_proof_of_work,
@@ -130,6 +131,56 @@ class TestProofOfWork:
         assert (
             bits_to_target(next_bits(0x1E0FFFFF, 10**9, target_timespan=3600, pow_limit=limit))
             <= limit
+        )
+
+    def test_bits_from_work_sets_the_observed_hashrate(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        # A miner that does 1,000,000 hashes in 60 seconds should get difficulty 1.
+        # 2^256 hashes over 60 seconds at one block per 60s -> target = pow_limit.
+        work = (2**256) // (limit + 1)  # ~1M hashes, one difficulty-1 block
+        bits = bits_from_work(work, 60, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+        assert bits == 0x1E0FFFFF
+
+    def test_bits_from_work_tightens_when_the_hashrate_rises(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        # Double the work in the same time -> double the difficulty.
+        work = 2 * ((2**256) // (limit + 1))
+        bits = bits_from_work(work, 60, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+        target = bits_to_target(bits)
+        assert target < limit  # harder than the limit
+        assert difficulty(bits, pow_limit=limit) == pytest.approx(2.0, rel=0.05)
+
+    def test_bits_from_work_is_clamped_to_the_parent(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        work = 1000 * ((2**256) // (limit + 1))
+        bits = bits_from_work(work, 60, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+        assert difficulty(bits, pow_limit=limit) == pytest.approx(4.0, rel=0.05)
+
+    def test_bits_from_work_eases_freely_when_the_hashrate_falls(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        # A hard parent (difficulty 100) with a sudden collapse to a difficulty-1
+        # hashrate must ease all the way down in one block, not just a factor of
+        # four: the clamp only bounds the *hardening* direction.
+        parent_bits = target_to_bits(limit // 100)
+        work = (2**256) // (limit + 1)  # one difficulty-1 block's worth of hashes
+        bits = bits_from_work(work, 60, target_spacing=60, pow_limit=limit, parent_bits=parent_bits)
+        assert difficulty(bits, pow_limit=limit) == pytest.approx(1.0, rel=0.05)
+
+    def test_bits_from_work_never_exceeds_the_pow_limit(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        work = 1
+        bits = bits_from_work(work, 60, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+        assert bits_to_target(bits) <= limit
+
+    def test_bits_from_work_falls_back_when_unmeasured(self):
+        limit = bits_to_target(0x1E0FFFFF)
+        assert (
+            bits_from_work(0, 60, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+            == 0x1E0FFFFF
+        )
+        assert (
+            bits_from_work(100, 0, target_spacing=60, pow_limit=limit, parent_bits=0x1E0FFFFF)
+            == 0x1E0FFFFF
         )
 
 

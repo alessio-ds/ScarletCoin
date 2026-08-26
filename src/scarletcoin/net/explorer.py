@@ -345,13 +345,15 @@ def _overview(server: RpcServer) -> str:
             f"{_duration(stats['average_spacing'])} / block"
             f'<div class="sub">target {_duration(stats["target_spacing"])}</div>'
         )
-    change = stats["estimated_difficulty_change"]
-    retarget = (
-        f"in {stats['blocks_until_retarget']} blocks"
-        f'<div class="sub">height {stats["next_retarget_height"]}'
-        + ("" if change is None else f", estimated {'+' if change >= 0 else ''}{change:.1f}%")
-        + "</div>"
-    )
+    next_diff = stats["next_difficulty"]
+    change = stats["next_difficulty_change"]
+    if next_diff is None:
+        next_difficulty = "&mdash;"
+    else:
+        next_difficulty = f"{next_diff:.6g}"
+        if change is not None:
+            arrow = "+" if change >= 0 else ""
+            next_difficulty += f'<div class="sub">estimated {arrow}{change:.1f}%</div>'
 
     body = _cards(
         [
@@ -370,7 +372,7 @@ def _overview(server: RpcServer) -> str:
             ("Block rate", pace),
             ("Hash rate", _hash_rate(stats["hash_rate"])),
             ("Difficulty", f"{stats['difficulty']:.6g}"),
-            ("Next retarget", retarget),
+            ("Next difficulty", next_difficulty),
             ("Last block", f"{_duration(stats['seconds_since_last_block'])} ago"),
             ("Blocks last hour", str(stats["blocks_last_hour"])),
             ("Blocks last 24 h", str(stats["blocks_last_day"])),

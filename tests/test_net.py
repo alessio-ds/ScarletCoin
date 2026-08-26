@@ -702,7 +702,7 @@ class TestExplorer:
         client.call("generate", 5)
         status, body = self._get(server.url + "/")
         assert status == 200
-        for marker in ("Block rate", "Hash rate", "Next retarget", "Blocks last hour"):
+        for marker in ("Block rate", "Hash rate", "Next difficulty", "Blocks last hour"):
             assert marker in body
         assert "H/s" in body
         assert "Measured over the last" in body

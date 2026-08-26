@@ -598,6 +598,29 @@ class TestDifficulty:
         assert chain.add_block(solved).status is BlockStatus.CONNECTED
         chain.storage.close()
 
+    def test_per_block_retarget_eases_more_than_the_symmetric_clamp(self, key):
+        """A hashrate collapse must ease difficulty freely, not just 4x per block."""
+        from dataclasses import replace
+
+        from scarletcoin.core.pow import difficulty
+
+        params = replace(REGTEST, per_block_retarget=True, retarget_interval=60, target_spacing=10)
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        # Fast blocks (1s apart, against a 10s target) drive the difficulty up.
+        for index in range(8):
+            block = mine_block(chain, key, timestamp=base + index)
+            assert chain.add_block(block).status is BlockStatus.CONNECTED
+        hard = difficulty(chain.tip.bits, pow_limit=params.pow_limit)
+        assert hard > 4
+        # The miners leave; a gap shorter than the stall limit, but far longer
+        # than the block target, must collapse the difficulty far below the 4x
+        # floor the old symmetric clamp would have imposed.
+        relaxed = chain.next_bits(timestamp=base + 8 + 10_000)
+        eased = difficulty(relaxed, pow_limit=params.pow_limit)
+        assert eased < hard / 4
+        chain.storage.close()
+
 
 class TestUtxoOverlay:
     def test_overlay_hides_spent_coins(self, chain):

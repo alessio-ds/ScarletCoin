@@ -199,20 +199,31 @@ where `target_timespan = target_spacing · retarget_interval`. At every other
 height the target is the parent's.
 
 When `per_block_retarget` is on (mainnet and testnet), the target is recomputed
-for **every** block and measured against the child's own timestamp:
+for **every** block from the hashrate observed over a trailing *time* window of
+`target_spacing · retarget_interval` seconds.  The window is the set of blocks
+whose timestamp is within that span of the parent, so a long stall drops out of
+the measurement on its own:
 
 ```
-first    = ancestor at (height − min(height, retarget_interval))
-observed = child.timestamp − first.timestamp         clamped to
-           [window_timespan / 4, window_timespan · 4]
-target   = min(parent_target · observed / window_timespan, pow_limit)
+window_start = oldest ancestor with timestamp ≥ parent.timestamp − window
+work   = parent.chainwork − chainwork(block before window_start)
+target = (2^256 · (child.timestamp − window_start.timestamp))
+          / (work · target_spacing)
 ```
 
-where `window_timespan = target_spacing · min(height, retarget_interval)`. If
-`child.timestamp − parent.timestamp > max_future_time`, the chain is considered
-stalled and the target is set to `pow_limit` directly. Because the child's own
-timestamp enters the measurement, the first block after a slowdown already sees
-an easier target, and a hashrate collapse cannot wedge the chain.
+The result is clamped asymmetrically:
+
+* `target` is at most `pow_limit` (never easier than difficulty 1); and
+* `target` is at least `parent_target / max_adjustment_factor` (never more than
+  4× harder per block), but may otherwise fall as far as the measurement says in
+  a single block, so a hashrate collapse eases immediately.
+
+If `child.timestamp − parent.timestamp > max_future_time`, the chain is
+considered stalled and the target is set to `pow_limit` directly.
+
+Measuring the hashrate directly — rather than multiplying the parent target by a
+time ratio — keeps the difficulty from drifting upward under the natural
+variance of block times.
 
 ## Money supply
 
@@ -385,7 +396,7 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `getdifficulty` | — | current difficulty |
 | `getsupply` | — | circulating supply and UTXO count |
 | `getchainsize` | — | how many bytes the chain occupies, and per-block average |
-| `getnetworkstats` | `window` | block rate, hash rate, difficulty, retarget estimate |
+| `getnetworkstats` | `window` | block rate, hash rate, difficulty, next-difficulty estimate |
 | `getpublicnodes` | — | base URLs of public nodes this one knows |
 | `getblockhash` | `height` | block hash |
 | `getblock` | `hash_or_height`, `verbose=true` | block with transactions |

@@ -32,7 +32,7 @@ from typing import Protocol
 from scarletcoin.core.block import Block, BlockError, BlockHeader
 from scarletcoin.core.coinbase import coinbase_height
 from scarletcoin.core.params import ChainParams
-from scarletcoin.core.pow import block_work, difficulty, next_bits
+from scarletcoin.core.pow import bits_from_work, block_work, difficulty, next_bits
 from scarletcoin.core.storage import (
     BlockIndexEntry,
     PruneResult,
@@ -281,13 +281,14 @@ class Blockchain:
         When :attr:`ChainParams.per_block_retarget` is off, the target is only
         recomputed once per retargeting period, using the parent's timestamp.
 
-        When it is on, the target is recomputed for every block and, crucially,
-        measured against the *child's* own timestamp.  A block mined after a long
-        stall therefore sees an easier target at once instead of waiting for the
-        gap to age out of the window.  If the child lands more than
-        ``max_future_time`` after its parent the chain is assumed to have stalled
-        and the target falls straight back to the pow limit, so a hashrate
-        collapse cannot permanently wedge the chain.
+        When it is on, the target is recomputed for every block from the hashrate
+        actually observed over the trailing window: the chainwork mined divided by
+        the time it took.  That direct measurement — rather than multiplying the
+        parent target by a time ratio — keeps the difficulty stable instead of
+        drifting upward, and a block mined after a long stall immediately sees an
+        easier target because the gap drags the observed hashrate down.  A child
+        landing more than ``max_future_time`` after its parent is treated as a
+        stalled chain and resets straight to the pow limit.
         """
         height = parent.height + 1
         interval = self.params.retarget_interval
@@ -308,17 +309,40 @@ class Blockchain:
         child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
         if child_timestamp - parent.timestamp > self.params.max_future_time:
             return self.params.pow_limit_bits
-        lookback = min(height, interval)
-        first = self.ancestor_at(parent, height - lookback)
-        if first is None:  # pragma: no cover - the chain always reaches genesis
-            return parent.bits
-        return next_bits(
-            parent.bits,
-            child_timestamp - first.timestamp,
-            target_timespan=self.params.target_spacing * lookback,
+        return self._next_bits_from_work(parent, child_timestamp)
+
+    def _next_bits_from_work(self, parent: BlockIndexEntry, child_timestamp: int) -> int:
+        """Per-block target from the hashrate observed over the trailing window.
+
+        The window is bounded by *time*, not by a fixed block count: it takes the
+        blocks mined in the last ``target_spacing · retarget_interval`` seconds.
+        A time window empties out a stall by itself — blocks mined before a long
+        gap are simply older than the window and drop out — so the difficulty
+        measures the miners that are active *now*, not the ones who left.
+        """
+        work, elapsed = self._window_work(parent, child_timestamp)
+        return bits_from_work(
+            work,
+            elapsed,
+            target_spacing=self.params.target_spacing,
             pow_limit=self.params.pow_limit,
+            parent_bits=parent.bits,
             max_adjustment_factor=self.params.max_adjustment_factor,
         )
+
+    def _window_work(self, parent: BlockIndexEntry, child_timestamp: int) -> tuple[int, int]:
+        """Return ``(chainwork, elapsed)`` for the blocks mined in the trailing window."""
+        duration = self.params.target_spacing * self.params.retarget_interval
+        cutoff = parent.timestamp - duration
+        start = parent
+        while start.height > 0:
+            prev = self.ancestor_at(start, start.height - 1)
+            if prev is None or prev.timestamp < cutoff:  # pragma: no cover - genesis
+                break
+            start = prev
+        before = self.ancestor_at(start, start.height - 1)
+        work = parent.chainwork - (before.chainwork if before is not None else 0)
+        return work, child_timestamp - start.timestamp
 
     def next_bits(self, *, timestamp: int | None = None) -> int:
         """Return the compact target the next block on the active chain must meet."""
@@ -443,15 +467,22 @@ class Blockchain:
         child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
         if child_timestamp - parent.timestamp > self.params.max_future_time:
             return self.params.pow_limit_bits
-        lookback = min(height, interval)
-        first = self._node_at_height(parent.prev_hash, height - lookback)
-        if first is None:  # pragma: no cover - the chain always reaches genesis
-            return parent.bits
-        return next_bits(
-            parent.bits,
-            child_timestamp - first.timestamp,
-            target_timespan=self.params.target_spacing * lookback,
+        duration = self.params.target_spacing * interval
+        cutoff = parent.timestamp - duration
+        start = parent
+        while start.height > 0:
+            prev = self._node(start.prev_hash)
+            if prev is None or prev.timestamp < cutoff:  # pragma: no cover - genesis
+                break
+            start = prev
+        before = self._node(start.prev_hash)
+        window_work = parent.chainwork - (before.chainwork if before is not None else 0)
+        return bits_from_work(
+            window_work,
+            child_timestamp - start.timestamp,
+            target_spacing=self.params.target_spacing,
             pow_limit=self.params.pow_limit,
+            parent_bits=parent.bits,
             max_adjustment_factor=self.params.max_adjustment_factor,
         )
 
@@ -958,22 +989,27 @@ class Blockchain:
             spacing = seconds / blocks
             hash_rate = (tip.chainwork - first.chainwork) / seconds
 
-        interval = params.retarget_interval
-        next_retarget = (tip.height // interval + 1) * interval
-        estimated_bits = tip.bits
-        if spacing is not None:
-            # If the observed pace held for a whole period, this is where the
-            # target would land.
-            estimated_bits = next_bits(
-                tip.bits,
-                int(spacing * interval),
-                target_timespan=params.target_timespan,
+        current_difficulty = difficulty(tip.bits, pow_limit=params.pow_limit)
+
+        # With per-block retargeting the difficulty changes every block, so there
+        # is no "next retarget height" to count down to.  Instead we estimate the
+        # difficulty of the very next block: the same measured hashrate applied to
+        # the current target, clamped exactly as the consensus rule clamps it.
+        next_difficulty: float | None = None
+        next_difficulty_change: float | None = None
+        if first is not None and spacing is not None and hash_rate and hash_rate > 0:
+            estimated_bits = bits_from_work(
+                tip.chainwork - first.chainwork,
+                seconds,
+                target_spacing=params.target_spacing,
                 pow_limit=params.pow_limit,
+                parent_bits=tip.bits,
                 max_adjustment_factor=params.max_adjustment_factor,
             )
+            next_difficulty = difficulty(estimated_bits, pow_limit=params.pow_limit)
+            if current_difficulty:
+                next_difficulty_change = round((next_difficulty / current_difficulty - 1) * 100, 2)
 
-        current_difficulty = difficulty(tip.bits, pow_limit=params.pow_limit)
-        estimated_difficulty = difficulty(estimated_bits, pow_limit=params.pow_limit)
         return {
             "height": tip.height,
             "window": blocks,
@@ -982,19 +1018,12 @@ class Blockchain:
             "average_spacing": None if spacing is None else round(spacing, 2),
             "hash_rate": None if hash_rate is None else round(hash_rate, 2),
             "difficulty": current_difficulty,
+            "next_difficulty": next_difficulty,
+            "next_difficulty_change": next_difficulty_change,
             "blocks_last_hour": self.storage.count_blocks_since(now - 3600),
             "blocks_last_day": self.storage.count_blocks_since(now - 86400),
             "seconds_since_last_block": max(0, now - tip.timestamp),
             "median_time": self.median_time_past(tip),
-            "next_retarget_height": next_retarget,
-            "blocks_until_retarget": next_retarget - tip.height,
-            "estimated_next_bits": f"{estimated_bits:#010x}",
-            "estimated_next_difficulty": estimated_difficulty,
-            "estimated_difficulty_change": (
-                None
-                if not current_difficulty
-                else round((estimated_difficulty / current_difficulty - 1) * 100, 2)
-            ),
         }
 
     def hashrate_history(self, window: int | None = None, points: int = 240) -> list[dict]:

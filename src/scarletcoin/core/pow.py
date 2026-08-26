@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __all__ = [
     "MAX_TARGET_LIMIT",
+    "bits_from_work",
     "bits_to_target",
     "block_work",
     "check_proof_of_work",
@@ -115,3 +116,44 @@ def next_bits(
     clamped = min(max(actual_timespan, low), high)
     target = bits_to_target(current_bits) * clamped // target_timespan
     return target_to_bits(min(target, pow_limit))
+
+
+def bits_from_work(
+    work: int,
+    elapsed: int,
+    *,
+    target_spacing: int,
+    pow_limit: int,
+    parent_bits: int,
+    max_adjustment_factor: int = 4,
+) -> int:
+    """Compute the compact target that makes the observed hashrate hit the spacing.
+
+    ``work`` is the total chainwork (expected hashes) mined over ``elapsed``
+    seconds — measured directly from the chain, not inferred from the current
+    target.  The target is set so that a miner working at that observed pace
+    would expect one block every ``target_spacing`` seconds:
+
+    ``target = 2^256 · elapsed / (work · target_spacing)``
+
+    Computing the target from the measured hashrate — rather than multiplying the
+    previous target by a time ratio — keeps the difficulty from drifting upward
+    under the natural variance of block times.
+
+    The adjustment is clamped asymmetrically, so the two failure modes are both
+    contained:
+
+    * the target is never allowed *harder* than ``max_adjustment_factor`` times
+      the parent, so a burst of hashrate (or a maliciously low timestamp) cannot
+      spike the difficulty and stall the chain; and
+    * the target is never allowed *easier* than ``pow_limit``, but may otherwise
+      fall as far as the measurement says in a single block, so a hashrate
+      collapse eases immediately instead of taking several retarget periods.
+    """
+    if work <= 0 or elapsed <= 0:
+        return parent_bits
+    target = (MAX_TARGET_LIMIT + 1) * elapsed // (work * target_spacing)
+    target = min(target, pow_limit)
+    parent_target = bits_to_target(parent_bits)
+    hardest = parent_target // max_adjustment_factor
+    return target_to_bits(max(target, hardest))
