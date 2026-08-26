@@ -184,7 +184,9 @@ less than or equal to `target`, and `target` is not easier than the network's
 `pow_limit`. A block's work is `2^256 / (target + 1)`; a chain's work is the sum
 over its blocks.
 
-**Retargeting.** At every height that is a multiple of `retarget_interval`:
+**Retargeting.** When `per_block_retarget` is off (regtest), the target changes
+only at heights that are a multiple of `retarget_interval`, using the parent's
+timestamp:
 
 ```
 first    = ancestor at (height − retarget_interval)
@@ -195,6 +197,22 @@ target   = min(parent_target · observed / target_timespan, pow_limit)
 
 where `target_timespan = target_spacing · retarget_interval`. At every other
 height the target is the parent's.
+
+When `per_block_retarget` is on (mainnet and testnet), the target is recomputed
+for **every** block and measured against the child's own timestamp:
+
+```
+first    = ancestor at (height − min(height, retarget_interval))
+observed = child.timestamp − first.timestamp         clamped to
+           [window_timespan / 4, window_timespan · 4]
+target   = min(parent_target · observed / window_timespan, pow_limit)
+```
+
+where `window_timespan = target_spacing · min(height, retarget_interval)`. If
+`child.timestamp − parent.timestamp > max_future_time`, the chain is considered
+stalled and the target is set to `pow_limit` directly. Because the child's own
+timestamp enters the measurement, the first block after a slowdown already sees
+an easier target, and a hashrate collapse cannot wedge the chain.
 
 ## Money supply
 
@@ -274,6 +292,7 @@ longer valid are dropped.
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | `target_spacing` | 60 s | 60 s | 10 s |
 | `retarget_interval` | 60 | 60 | 20 |
+| `per_block_retarget` | true | true | false |
 | `pow_limit_bits` | `0x1e0fffff` | `0x1e0fffff` | `0x207fffff` |
 | `coinbase_maturity` | 100 | 20 | 2 |
 | `halving_interval` | 210 000 | 210 000 | 210 000 |

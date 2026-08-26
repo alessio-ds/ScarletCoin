@@ -547,8 +547,8 @@ uv run scarlet-miner --network mainnet S...your-address...
 ```
 
 The first blocks come at the easiest allowed difficulty (`0x1e0fffff`, about a
-million hashes each); after 60 blocks the difficulty starts tracking the real
-hash rate towards one block per minute.
+million hashes each); the difficulty then tracks the real hash rate towards one
+block per minute, adjusting every block.
 
 ### 6. Tell everyone else
 

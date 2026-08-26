@@ -525,6 +525,79 @@ class TestDifficulty:
         assert chain.next_bits() == params.pow_limit_bits
         chain.storage.close()
 
+    def test_per_block_retarget_makes_fast_blocks_harder(self, key):
+        from dataclasses import replace
+
+        from scarletcoin.core.pow import bits_to_target
+
+        params = replace(REGTEST, per_block_retarget=True, retarget_interval=4, target_spacing=10)
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        for index in range(4):
+            block = mine_block(chain, key, timestamp=base + index)
+            assert chain.add_block(block).status is BlockStatus.CONNECTED
+        # With per-block retargeting the target tightens on every block, not just
+        # at period boundaries.
+        next_bits = chain.next_bits(timestamp=base + 4)
+        assert bits_to_target(next_bits) < bits_to_target(chain.tip.bits)
+        chain.storage.close()
+
+    def test_per_block_retarget_a_stall_makes_the_target_easier(self, key):
+        from dataclasses import replace
+
+        from scarletcoin.core.pow import bits_to_target
+
+        params = replace(REGTEST, per_block_retarget=True, retarget_interval=4, target_spacing=10)
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        for index in range(4):
+            block = mine_block(chain, key, timestamp=base + index)
+            assert chain.add_block(block).status is BlockStatus.CONNECTED
+        stalled = bits_to_target(chain.tip.bits)
+        # The next block is mined long after the run, so its own timestamp makes
+        # the target easier immediately.
+        next_bits = chain.next_bits(timestamp=base + 4 + 60)
+        assert bits_to_target(next_bits) > stalled
+        chain.storage.close()
+
+    def test_per_block_retarget_a_long_stall_resets_to_the_pow_limit(self, key):
+        from dataclasses import replace
+
+        params = replace(REGTEST, per_block_retarget=True, retarget_interval=4, target_spacing=10)
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        block = mine_block(chain, key, timestamp=base)
+        assert chain.add_block(block).status is BlockStatus.CONNECTED
+        # A stall longer than max_future_time collapses the target to the limit.
+        stalled = base + params.max_future_time + 1
+        assert chain.next_bits(timestamp=stalled) == params.pow_limit_bits
+        chain.storage.close()
+
+    def test_per_block_retarget_block_mined_from_a_template_is_accepted(self, key):
+        from dataclasses import replace
+
+        from scarletcoin.core.template import create_block_template
+        from scarletcoin.miner.solver import solve_block
+
+        params = replace(REGTEST, per_block_retarget=True, retarget_interval=4, target_spacing=10)
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        for index in range(4):
+            block = mine_block(chain, key, timestamp=base + index)
+            assert chain.add_block(block).status is BlockStatus.CONNECTED
+
+        # The real miner builds its block from the template's own timestamp, not
+        # a fresh clock reading. If the two disagree, the block's bits would not
+        # match its timestamp and the node would reject it.
+        stamp = base + 5
+        template = create_block_template(chain, timestamp=stamp)
+        candidate = template.build_block(pubkey_hash=key.public_key().hash160(), extra=b"miner")
+        solved = solve_block(candidate)
+        assert solved is not None
+        assert solved.header.timestamp == template.current_time
+        assert chain.add_block(solved).status is BlockStatus.CONNECTED
+        chain.storage.close()
+
 
 class TestUtxoOverlay:
     def test_overlay_hides_spent_coins(self, chain):

@@ -218,7 +218,7 @@ class Miner:
         candidate = template.build_block(
             pubkey_hash=self._pubkey_hash,
             extra=self._extra_nonce(),
-            timestamp=int(time.time()),
+            timestamp=None,
         )
         header = candidate.header.serialize()
         target = template.target

@@ -11,18 +11,18 @@ retargeting, halvings, a hard supply cap — with faster blocks and a modern
 feature set (BIP-39/32/44 wallets, P2SH multisig, replace-by-fee, encrypted
 P2P links).
 
-**Version 2.2.10 · Mainnet is live and mined · MIT licensed**
+**Version 2.3.0 · Mainnet is live and mined · MIT licensed**
 
 <div align="center">
 
-[![Download for Windows (64-bit)](https://img.shields.io/badge/Download-Windows_64--bit-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-2.2.10-win64.zip)
-[![Windows installer](https://img.shields.io/badge/Windows_Installer-.exe-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-Setup-2.2.10.exe)
+[![Download for Windows (64-bit)](https://img.shields.io/badge/Download-Windows_64--bit-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-2.3.0-win64.zip)
+[![Windows installer](https://img.shields.io/badge/Windows_Installer-.exe-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-Setup-2.3.0.exe)
 
-[![Download for Ubuntu](https://img.shields.io/badge/Download-Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-2.2.10-linux-x86_64.tar.gz)
-[![Download for Fedora](https://img.shields.io/badge/Download-Fedora-51A2DA?style=for-the-badge&logo=fedora&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-2.2.10-linux-fc44-x86_64.tar.gz)
+[![Download for Ubuntu](https://img.shields.io/badge/Download-Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-2.3.0-linux-x86_64.tar.gz)
+[![Download for Fedora](https://img.shields.io/badge/Download-Fedora-51A2DA?style=for-the-badge&logo=fedora&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-2.3.0-linux-fc44-x86_64.tar.gz)
 
-[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-2.2.10-macos-arm64.tar.gz)
-[![Download for macOS (Intel)](https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.2.10/ScarletCoin-2.2.10-macos-x86_64.tar.gz)
+[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-2.3.0-macos-arm64.tar.gz)
+[![Download for macOS (Intel)](https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/alessio-ds/ScarletCoin/releases/download/v2.3.0/ScarletCoin-2.3.0-macos-x86_64.tar.gz)
 
 **No Python. No dependencies. Download, extract, run.**
 
@@ -82,13 +82,42 @@ from existing coins, so they never increase the supply.
 |---|---|
 | Consensus algorithm | Proof of work, **SHA-256d** (double SHA-256) |
 | Block time | **60 seconds** (target) |
-| Difficulty retarget | every **60 blocks** (~1 hour), capped at **4× per retarget** |
+| Difficulty retarget | **every block** against a 60-block window, capped at **4× per block** |
 | Chain selection | greatest cumulative proof of work |
 | Block size limit | **1 MB** (1,000,000 bytes) |
 | **Throughput (max TPS)** | **~80 tx/s sustained** — 1 MB of ~209-byte P2PKH transactions per 60 s block |
 | Timestamp rules | median-time-past of 11 blocks; max 2 h ahead of local clock |
 | Reorg protection | difficulty + published checkpoints |
 | Networks | mainnet, testnet, regtest (trivial-PoW local network) |
+
+### Difficulty adjustment
+
+ScarletCoin retargets its proof-of-work difficulty **every block** (starting in
+2.3.0), not once per retargeting period like Bitcoin. Each block's target is
+computed from the time between the start of the trailing `retarget_interval`
+window and the new block's **own** timestamp:
+
+```
+first    = ancestor at (height − retarget_interval)      (or genesis, for early blocks)
+observed = child.timestamp − first.timestamp             clamped to
+           [target_timespan / 4, target_timespan · 4]
+target   = min(parent_target · observed / target_timespan, pow_limit)
+```
+
+Because the measurement uses the child's timestamp, the very first block mined
+after a slowdown is already rewarded with an easier target — there is no lag
+while the gap "ages out" of a fixed window. If a block lands more than
+`max_future_time` (2 h) after its parent, the chain is considered stalled and the
+target collapses straight back to `pow_limit` (difficulty 1), so a hashrate
+collapse can never wedge the chain: it recovers immediately and then re-tightens
+one block at a time as the hashrate returns.
+
+This rule is symmetric — it also raises difficulty 4× per block when a burst of
+hashrate appears — so a miner who turns powerful hardware on and off to exploit
+the recovery gains nothing they would not have earned by mining honestly.
+The clamp keeps any single block from moving the target more than a factor of
+four in either direction, and the target is never allowed easier than
+`pow_limit`.
 
 ### Transactions & scripting
 
@@ -200,7 +229,7 @@ generate 5` mines instantly.
 | P2SH address prefix | `M` | `T` | `T` |
 | P2P / RPC port | 20333 / 20332 | 30333 / 30332 | 40333 / 40332 |
 | Target spacing | 60 s | 60 s | 10 s |
-| Retarget every | 60 blocks | 60 blocks | 20 blocks |
+| Retarget every | 1 block | 1 block | 20 blocks |
 | Coinbase maturity | 100 blocks | 20 blocks | 2 blocks |
 | Easiest target | `0x1e0fffff` | `0x1e0fffff` | `0x207fffff` |
 

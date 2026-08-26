@@ -111,9 +111,10 @@ def create_block_template(
     params = chain.params
     tip = chain.tip
     height = tip.height + 1
-    bits = chain.next_bits()
     min_time = chain.median_time_past(tip)
     now = int(time.time()) if timestamp is None else timestamp
+    current_time = max(now, min_time + 1)
+    bits = chain.next_bits(timestamp=current_time)
 
     transactions: list[Transaction] = []
     fees = 0
@@ -126,7 +127,7 @@ def create_block_template(
         prev_hash=tip.hash,
         bits=bits,
         min_time=min_time,
-        current_time=max(now, min_time + 1),
+        current_time=current_time,
         coinbase_value=params.subsidy(height) + fees,
         transactions=tuple(transactions),
     )

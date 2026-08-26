@@ -273,26 +273,56 @@ class Blockchain:
             walker = self.storage.get_entry(walker.prev_hash)
         return walker
 
-    def next_bits_after(self, parent: BlockIndexEntry) -> int:
-        """Return the compact target required for the child of ``parent``."""
+    def next_bits_after(
+        self, parent: BlockIndexEntry, *, child_timestamp: int | None = None
+    ) -> int:
+        """Return the compact target required for a child of ``parent``.
+
+        When :attr:`ChainParams.per_block_retarget` is off, the target is only
+        recomputed once per retargeting period, using the parent's timestamp.
+
+        When it is on, the target is recomputed for every block and, crucially,
+        measured against the *child's* own timestamp.  A block mined after a long
+        stall therefore sees an easier target at once instead of waiting for the
+        gap to age out of the window.  If the child lands more than
+        ``max_future_time`` after its parent the chain is assumed to have stalled
+        and the target falls straight back to the pow limit, so a hashrate
+        collapse cannot permanently wedge the chain.
+        """
         height = parent.height + 1
         interval = self.params.retarget_interval
-        if height % interval != 0:
-            return parent.bits
-        first = self.ancestor_at(parent, height - interval)
+        if not self.params.per_block_retarget:
+            if height % interval != 0:
+                return parent.bits
+            first = self.ancestor_at(parent, height - interval)
+            if first is None:  # pragma: no cover - the chain always reaches genesis
+                return parent.bits
+            return next_bits(
+                parent.bits,
+                parent.timestamp - first.timestamp,
+                target_timespan=self.params.target_timespan,
+                pow_limit=self.params.pow_limit,
+                max_adjustment_factor=self.params.max_adjustment_factor,
+            )
+
+        child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
+        if child_timestamp - parent.timestamp > self.params.max_future_time:
+            return self.params.pow_limit_bits
+        lookback = min(height, interval)
+        first = self.ancestor_at(parent, height - lookback)
         if first is None:  # pragma: no cover - the chain always reaches genesis
             return parent.bits
         return next_bits(
             parent.bits,
-            parent.timestamp - first.timestamp,
-            target_timespan=self.params.target_timespan,
+            child_timestamp - first.timestamp,
+            target_timespan=self.params.target_spacing * lookback,
             pow_limit=self.params.pow_limit,
             max_adjustment_factor=self.params.max_adjustment_factor,
         )
 
-    def next_bits(self) -> int:
+    def next_bits(self, *, timestamp: int | None = None) -> int:
         """Return the compact target the next block on the active chain must meet."""
-        return self.next_bits_after(self._tip)
+        return self.next_bits_after(self._tip, child_timestamp=timestamp)
 
     def difficulty(self) -> float:
         """Current difficulty, relative to the easiest allowed target."""
@@ -381,7 +411,7 @@ class Blockchain:
             if parent is None:
                 return None  # orphan header; retried when its parent arrives
             height = parent.height + 1
-            expected = self._next_bits_for_node(parent, height)
+            expected = self._next_bits_for_node(parent, height, child_timestamp=header.timestamp)
             if header.bits != expected:
                 return (
                     f"wrong difficulty: header says {header.bits:#010x}, expected {expected:#010x}"
@@ -391,18 +421,36 @@ class Blockchain:
             )
             return None
 
-    def _next_bits_for_node(self, parent: _ChainNode, height: int) -> int:
+    def _next_bits_for_node(
+        self, parent: _ChainNode, height: int, *, child_timestamp: int | None = None
+    ) -> int:
         """The compact target required for a child of ``parent`` at ``height``."""
         interval = self.params.retarget_interval
-        if height % interval != 0:
-            return parent.bits
-        first = self._node_at_height(parent.prev_hash, height - interval)
+        if not self.params.per_block_retarget:
+            if height % interval != 0:
+                return parent.bits
+            first = self._node_at_height(parent.prev_hash, height - interval)
+            if first is None:  # pragma: no cover - the chain always reaches genesis
+                return parent.bits
+            return next_bits(
+                parent.bits,
+                parent.timestamp - first.timestamp,
+                target_timespan=self.params.target_timespan,
+                pow_limit=self.params.pow_limit,
+                max_adjustment_factor=self.params.max_adjustment_factor,
+            )
+
+        child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
+        if child_timestamp - parent.timestamp > self.params.max_future_time:
+            return self.params.pow_limit_bits
+        lookback = min(height, interval)
+        first = self._node_at_height(parent.prev_hash, height - lookback)
         if first is None:  # pragma: no cover - the chain always reaches genesis
             return parent.bits
         return next_bits(
             parent.bits,
-            parent.timestamp - first.timestamp,
-            target_timespan=self.params.target_timespan,
+            child_timestamp - first.timestamp,
+            target_timespan=self.params.target_spacing * lookback,
             pow_limit=self.params.pow_limit,
             max_adjustment_factor=self.params.max_adjustment_factor,
         )
@@ -600,7 +648,7 @@ class Blockchain:
 
     def _check_context(self, block: Block, parent: BlockIndexEntry, height: int) -> None:
         """Validate a block against its parent (difficulty, time, height)."""
-        expected = self.next_bits_after(parent)
+        expected = self.next_bits_after(parent, child_timestamp=block.header.timestamp)
         if block.header.bits != expected:
             raise ValidationError(
                 f"wrong difficulty: header says {block.header.bits:#010x},"

@@ -55,6 +55,14 @@ class ChainParams:
     """Compact form of the easiest target the network will ever accept."""
     max_adjustment_factor: int = 4
     """Largest difficulty change a single retarget may apply."""
+    per_block_retarget: bool = False
+    """Recalculate the target every block (rather than once per period).
+
+    When enabled, the target is measured against the *next* block's own
+    timestamp, so a chain that stalls for more than ``max_future_time`` falls
+    back to the pow limit and recovers immediately instead of dying after a
+    hashrate collapse.
+    """
 
     # Money
     initial_subsidy: int = 50 * COIN
@@ -177,6 +185,7 @@ MAINNET = ChainParams(
     target_spacing=60,
     retarget_interval=60,
     pow_limit_bits=0x1E0FFFFF,
+    per_block_retarget=True,
     genesis_timestamp=1_700_000_000,
     genesis_bits=0x1E0FFFFF,
     genesis_nonce=816_317,
@@ -205,6 +214,7 @@ TESTNET = ChainParams(
     target_spacing=60,
     retarget_interval=60,
     pow_limit_bits=0x1E0FFFFF,
+    per_block_retarget=True,
     coinbase_maturity=20,
     bip44_coin_type=1,
     genesis_timestamp=1_700_000_001,
