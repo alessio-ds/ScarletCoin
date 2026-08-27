@@ -621,6 +621,48 @@ class TestDifficulty:
         assert eased < hard / 4
         chain.storage.close()
 
+    def test_retarget_fork_keeps_the_periodic_rule_below_the_fork(self, key):
+        """Blocks below the retarget fork keep the periodic rule.
+
+        A network that upgraded from periodic to per-block retargeting must keep
+        accepting its pre-fork blocks, whose target only changed once per period.
+        Fast pre-fork blocks therefore do not tighten the target block by block.
+        """
+        from dataclasses import replace
+
+        from scarletcoin.core.pow import bits_to_target
+
+        params = replace(
+            REGTEST,
+            per_block_retarget=True,
+            retarget_fork_height=3,
+            retarget_measure_fork_height=7,
+            retarget_interval=4,
+            target_spacing=10,
+        )
+        chain = make_chain(params=params)
+        base = REGTEST.genesis_timestamp + 1
+        genesis_target = bits_to_target(REGTEST.genesis_bits)
+        # Blocks 1..2 are below the fork: the periodic rule applies, so the
+        # target is inherited, no matter how fast they are mined.
+        for index in range(2):
+            block = mine_block(chain, key, timestamp=base + index)
+            assert chain.add_block(block).status is BlockStatus.CONNECTED
+        assert bits_to_target(chain.tip.bits) == genesis_target
+        # Block 3 is at the fork: per-block retargeting now tightens the target.
+        block = mine_block(chain, key, timestamp=base + 2)
+        assert chain.add_block(block).status is BlockStatus.CONNECTED
+        assert bits_to_target(chain.tip.bits) < genesis_target
+        chain.storage.close()
+
+    def test_mainnet_records_the_retarget_fork_heights(self):
+        """The mainnet fork heights are explicit, so old blocks still validate."""
+        from scarletcoin.core.params import MAINNET
+
+        assert MAINNET.per_block_retarget
+        assert MAINNET.retarget_fork_height > 1
+        assert MAINNET.retarget_measure_fork_height > MAINNET.retarget_fork_height
+
 
 class TestUtxoOverlay:
     def test_overlay_hides_spent_coins(self, chain):

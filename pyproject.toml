@@ -1,6 +1,6 @@
 [project]
 name = "scarletcoin"
-version = "2.3.0"
+version = "2.3.1"
 description = "ScarletCoin: a small but complete proof-of-work cryptocurrency with a real blockchain, peer-to-peer nodes, wallet and miner."
 readme = "README.md"
 license = { file = "LICENSE" }

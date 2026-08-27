@@ -63,6 +63,22 @@ class ChainParams:
     back to the pow limit and recovers immediately instead of dying after a
     hashrate collapse.
     """
+    retarget_fork_height: int = 0
+    """First height at which per-block retargeting applies.
+
+    Below this height the periodic rule is used, so a network that upgraded
+    from periodic to per-block retargeting keeps validating its pre-fork
+    history instead of rejecting it.  ``0`` means per-block retargeting applies
+    from genesis.
+    """
+    retarget_measure_fork_height: int = 0
+    """First height at which the target is measured directly from the hashrate.
+
+    Between :attr:`retarget_fork_height` and this height the target is adjusted
+    by a time ratio; from this height on it is computed from the chainwork
+    actually mined in the trailing window.  ``0`` means the direct measurement
+    applies from :attr:`retarget_fork_height`.
+    """
 
     # Money
     initial_subsidy: int = 50 * COIN
@@ -186,6 +202,8 @@ MAINNET = ChainParams(
     retarget_interval=60,
     pow_limit_bits=0x1E0FFFFF,
     per_block_retarget=True,
+    retarget_fork_height=10496,
+    retarget_measure_fork_height=10563,
     genesis_timestamp=1_700_000_000,
     genesis_bits=0x1E0FFFFF,
     genesis_nonce=816_317,

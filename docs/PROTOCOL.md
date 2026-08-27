@@ -199,10 +199,24 @@ where `target_timespan = target_spacing · retarget_interval`. At every other
 height the target is the parent's.
 
 When `per_block_retarget` is on (mainnet and testnet), the target is recomputed
-for **every** block from the hashrate observed over a trailing *time* window of
-`target_spacing · retarget_interval` seconds.  The window is the set of blocks
-whose timestamp is within that span of the parent, so a long stall drops out of
-the measurement on its own:
+for **every** block from `retarget_fork_height` onwards.  Mainnet adopted this
+rule at height 10496, so its earlier blocks still follow the periodic rule
+above.  Between `retarget_fork_height` and `retarget_measure_fork_height`
+(mainnet: 10563) the target was adjusted by a time ratio against a fixed
+lookback:
+
+```
+lookback   = min(height, retarget_interval)
+first      = ancestor at (height − lookback)
+observed   = child.timestamp − first.timestamp      clamped to
+             [target_timespan / 4, target_timespan · 4]
+target     = min(parent_target · observed / target_timespan, pow_limit)
+```
+
+From `retarget_measure_fork_height` on, the target is computed from the hashrate
+observed over a trailing *time* window of `target_spacing · retarget_interval`
+seconds.  The window is the set of blocks whose timestamp is within that span of
+the parent, so a long stall drops out of the measurement on its own:
 
 ```
 window_start = oldest ancestor with timestamp ≥ parent.timestamp − window
@@ -304,6 +318,8 @@ longer valid are dropped.
 | `target_spacing` | 60 s | 60 s | 10 s |
 | `retarget_interval` | 60 | 60 | 20 |
 | `per_block_retarget` | true | true | false |
+| `retarget_fork_height` | 10496 | 0 | 0 |
+| `retarget_measure_fork_height` | 10563 | 0 | 0 |
 | `pow_limit_bits` | `0x1e0fffff` | `0x1e0fffff` | `0x207fffff` |
 | `coinbase_maturity` | 100 | 20 | 2 |
 | `halving_interval` | 210 000 | 210 000 | 210 000 |

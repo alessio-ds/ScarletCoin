@@ -93,10 +93,12 @@ from existing coins, so they never increase the supply.
 ### Difficulty adjustment
 
 ScarletCoin retargets its proof-of-work difficulty **every block** (starting in
-2.3.0), not once per retargeting period like Bitcoin. Each block's target is
-computed directly from the hashrate observed over the trailing time window:
-the chainwork mined in the last `target_spacing · retarget_interval` seconds,
-divided by the time that work took:
+2.3.0), not once per retargeting period like Bitcoin. Mainnet adopted per-block
+retargeting at height **10496**; blocks before that follow the periodic rule, so
+a node re-validating the whole chain still accepts the pre-fork history. Each
+block's target is computed directly from the hashrate observed over the trailing
+time window: the chainwork mined in the last
+`target_spacing · retarget_interval` seconds, divided by the time that work took:
 
 ```
 work     = chainwork(tip) − chainwork(block at window start)

@@ -278,21 +278,21 @@ class Blockchain:
     ) -> int:
         """Return the compact target required for a child of ``parent``.
 
-        When :attr:`ChainParams.per_block_retarget` is off, the target is only
-        recomputed once per retargeting period, using the parent's timestamp.
+        Before :attr:`ChainParams.retarget_fork_height` the target is only
+        recomputed once per retargeting period, using the parent's timestamp
+        (the rule the network used before it adopted per-block retargeting).
 
-        When it is on, the target is recomputed for every block from the hashrate
-        actually observed over the trailing window: the chainwork mined divided by
-        the time it took.  That direct measurement — rather than multiplying the
-        parent target by a time ratio — keeps the difficulty stable instead of
-        drifting upward, and a block mined after a long stall immediately sees an
-        easier target because the gap drags the observed hashrate down.  A child
+        After the fork the target is recomputed for every block.  Up to
+        :attr:`ChainParams.retarget_measure_fork_height` it is adjusted by a
+        time ratio against a fixed lookback; from there on it is measured
+        directly from the chainwork mined in the trailing window, which keeps
+        the difficulty stable instead of drifting.  In both cases a child
         landing more than ``max_future_time`` after its parent is treated as a
         stalled chain and resets straight to the pow limit.
         """
         height = parent.height + 1
         interval = self.params.retarget_interval
-        if not self.params.per_block_retarget:
+        if not self.params.per_block_retarget or height < self.params.retarget_fork_height:
             if height % interval != 0:
                 return parent.bits
             first = self.ancestor_at(parent, height - interval)
@@ -309,7 +309,33 @@ class Blockchain:
         child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
         if child_timestamp - parent.timestamp > self.params.max_future_time:
             return self.params.pow_limit_bits
+        if height < self.params.retarget_measure_fork_height:
+            return self._next_bits_time_ratio(parent, height, child_timestamp)
         return self._next_bits_from_work(parent, child_timestamp)
+
+    def _next_bits_time_ratio(
+        self, parent: BlockIndexEntry, height: int, child_timestamp: int
+    ) -> int:
+        """Per-block target from a time ratio against a fixed lookback.
+
+        This is the adjustment used between the two retargeting forks: the
+        target is scaled by the time the last ``retarget_interval`` blocks took
+        relative to the expected time.  It eases immediately after a stall but
+        overshoots under variance, which is why it was later replaced by the
+        direct measurement in :meth:`_next_bits_from_work`.
+        """
+        interval = self.params.retarget_interval
+        lookback = min(height, interval)
+        first = self.ancestor_at(parent, height - lookback)
+        if first is None:  # pragma: no cover - the chain always reaches genesis
+            return parent.bits
+        return next_bits(
+            parent.bits,
+            child_timestamp - first.timestamp,
+            target_timespan=self.params.target_spacing * lookback,
+            pow_limit=self.params.pow_limit,
+            max_adjustment_factor=self.params.max_adjustment_factor,
+        )
 
     def _next_bits_from_work(self, parent: BlockIndexEntry, child_timestamp: int) -> int:
         """Per-block target from the hashrate observed over the trailing window.
@@ -450,7 +476,7 @@ class Blockchain:
     ) -> int:
         """The compact target required for a child of ``parent`` at ``height``."""
         interval = self.params.retarget_interval
-        if not self.params.per_block_retarget:
+        if not self.params.per_block_retarget or height < self.params.retarget_fork_height:
             if height % interval != 0:
                 return parent.bits
             first = self._node_at_height(parent.prev_hash, height - interval)
@@ -467,6 +493,8 @@ class Blockchain:
         child_timestamp = int(time.time()) if child_timestamp is None else child_timestamp
         if child_timestamp - parent.timestamp > self.params.max_future_time:
             return self.params.pow_limit_bits
+        if height < self.params.retarget_measure_fork_height:
+            return self._next_bits_for_node_time_ratio(parent, height, child_timestamp)
         duration = self.params.target_spacing * interval
         cutoff = parent.timestamp - duration
         start = parent
@@ -483,6 +511,23 @@ class Blockchain:
             target_spacing=self.params.target_spacing,
             pow_limit=self.params.pow_limit,
             parent_bits=parent.bits,
+            max_adjustment_factor=self.params.max_adjustment_factor,
+        )
+
+    def _next_bits_for_node_time_ratio(
+        self, parent: _ChainNode, height: int, child_timestamp: int
+    ) -> int:
+        """The time-ratio per-block target for a child of ``parent`` (header path)."""
+        interval = self.params.retarget_interval
+        lookback = min(height, interval)
+        first = self._node_at_height(parent.prev_hash, height - lookback)
+        if first is None:  # pragma: no cover - the chain always reaches genesis
+            return parent.bits
+        return next_bits(
+            parent.bits,
+            child_timestamp - first.timestamp,
+            target_timespan=self.params.target_spacing * lookback,
+            pow_limit=self.params.pow_limit,
             max_adjustment_factor=self.params.max_adjustment_factor,
         )
 
