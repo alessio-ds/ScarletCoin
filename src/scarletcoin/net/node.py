@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import random
 import socket
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -726,13 +727,29 @@ class Node:
         self._request_blocks(peer)
 
     def _request_blocks(self, peer: Peer) -> None:
-        """Ask ``peer`` for the next batch of announced blocks."""
+        """Ask ``peer`` for the next batch of announced blocks.
+
+        Blocks are requested in dependency order: one is only requested once its
+        parent is on disk or already in flight from this same peer.  That stops a
+        block from arriving before the block it builds on, which would flood the
+        orphan pool with an out-of-order chain and stall the sync.
+        """
         batch: list[InvItem] = []
-        while peer.pending_blocks and len(peer.requested_blocks) + len(batch) < BLOCKS_IN_FLIGHT:
-            block_hash = peer.pending_blocks.popleft()
+        queued = set(peer.requested_blocks)
+        while peer.pending_blocks and len(queued) < BLOCKS_IN_FLIGHT:
+            block_hash = peer.pending_blocks[0]
+            parent_hash = self._block_parent(block_hash)
+            if (
+                parent_hash is not None
+                and not self.chain.has_block(parent_hash)
+                and parent_hash not in queued
+            ):
+                break  # the parent has not been downloaded yet
+            peer.pending_blocks.popleft()
             if self.chain.has_block(block_hash):
                 continue
             batch.append(InvItem(InvType.BLOCK, block_hash))
+            queued.add(block_hash)
         if not batch:
             return
         logger.debug(
@@ -744,6 +761,16 @@ class Node:
         peer.requested_blocks.update(item.hash for item in batch)
         peer.send(protocol.GetData(tuple(batch)))
         peer._last_getdata_at = time.time()
+
+    def _block_parent(self, block_hash: bytes) -> bytes | None:
+        """Return the hash of the block ``block_hash`` builds on, if it is known."""
+        header = self.chain.storage.header_entry(block_hash)
+        if header is not None:
+            return header.header.prev_hash
+        entry = self.chain.get_entry(block_hash)
+        if entry is not None:
+            return entry.prev_hash
+        return None
 
     def _on_getdata(self, peer: Peer, message: protocol.GetData) -> None:
         missing: list[InvItem] = []
@@ -839,7 +866,16 @@ class Node:
             self._maybe_sync(peer, force=True)
 
     def _queue_missing_blocks(self) -> None:
-        """Hand the header chain's missing bodies to the connected peers."""
+        """Hand the header chain's missing bodies to the connected peers.
+
+        The missing blocks are handed out in ascending order, split into
+        contiguous runs (one per peer), and each peer's queue is rebuilt from
+        that run on every call.  A block therefore goes to the same peer as the
+        block it builds on, so it can never arrive before its parent.  The old
+        round-robin handed block N to one peer and N+1 to the next, so almost
+        every block arrived before its parent, flooded the orphan pool, and left
+        the sync permanently stuck.
+        """
         missing = self.chain.headers_to_download(2_000)
         peers = [p for p in self.peers if p.handshake_done.is_set()]
         if not missing or not peers:
@@ -849,15 +885,23 @@ class Node:
                 len(peers),
             )
             return
-        for index, block_hash in enumerate(missing):
-            peer = peers[index % len(peers)]
-            if (
-                self.chain.has_block(block_hash)
-                or block_hash in peer.pending_blocks
-                or block_hash in peer.requested_blocks
-            ):
-                continue
-            peer.pending_blocks.append(block_hash)
+        missing_set = set(missing)
+        width = math.ceil(len(missing) / len(peers))
+        for index, peer in enumerate(peers):
+            # Blocks a peer announced whose headers are not synced yet are kept
+            # after the header-derived run, so a relayed block is not dropped
+            # mid-sync.
+            announced = deque(
+                block_hash
+                for block_hash in peer.pending_blocks
+                if block_hash not in missing_set and block_hash not in peer.requested_blocks
+            )
+            peer.pending_blocks = deque()
+            for block_hash in missing[index * width : (index + 1) * width]:
+                if block_hash in peer.requested_blocks:
+                    continue
+                peer.pending_blocks.append(block_hash)
+            peer.pending_blocks.extend(announced)
         for peer in peers:
             self._request_blocks(peer)
 
@@ -1268,6 +1312,10 @@ class Node:
         """Return a summary of the node, used by the ``getinfo`` RPC."""
         peers = self.peers
         data = self.chain.stats()
+        height = data["height"]
+        header_height = self.chain.header_height()
+        best_peer = max((peer.start_height for peer in peers), default=height)
+        target = max(height, header_height, best_peer)
         data.update(
             {
                 "version": __version__,
@@ -1287,6 +1335,13 @@ class Node:
                 "orphan_blocks": len(self._orphans),
                 "premature_blocks": self._premature_blocks,
                 "warnings": self.warnings(),
+                # Where the chain is headed, so a wallet or miner can tell the
+                # user it is still catching up instead of showing a shorter chain
+                # as though it were final.
+                "header_height": header_height,
+                "syncing": target > height,
+                "syncing_to": target if target > height else height,
+                "sync_progress": (height / target) if target else 1.0,
                 # What a wallet needs to know before it trusts this node with
                 # anything: whether it may call without a token, whether it will
                 # hand out mining work, and whether it still has the old blocks.

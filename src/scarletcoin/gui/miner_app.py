@@ -228,12 +228,19 @@ class MinerWindow(QtWidgets.QMainWindow):
             )
             return
         chain = info.get("chain_size") or ""
-        self.status.showMessage(
-            f"{info['network']}  ·  height {info['height']}"
-            f"  ·  difficulty {info['difficulty']:.6g}"
-            f"  ·  supply {format_amount(info['supply'])} SCT"
-            + (f"  ·  chain {chain}" if chain else "")
-        )
+        if info.get("syncing"):
+            message = (
+                f"{info['network']}  ·  syncing: height {info['height']:,} of "
+                f"{info['syncing_to']:,} ({round(100 * info['sync_progress'])}%)"
+            )
+        else:
+            message = (
+                f"{info['network']}  ·  height {info['height']}"
+                f"  ·  difficulty {info['difficulty']:.6g}"
+                f"  ·  supply {format_amount(info['supply'])} SCT"
+                + (f"  ·  chain {chain}" if chain else "")
+            )
+        self.status.showMessage(message)
 
     def _toggle(self) -> None:
         if self._bridge is None:

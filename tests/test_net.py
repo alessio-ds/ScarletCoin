@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from scarletcoin import __version__
+from scarletcoin.core.block import BlockHeader
 from scarletcoin.core.chain import BlockStatus
 from scarletcoin.core.params import REGTEST
 from scarletcoin.net import protocol
@@ -21,7 +22,7 @@ from scarletcoin.net.node import Node, NodeConfig
 from scarletcoin.net.protocol import InvItem, InvType, ProtocolError
 from scarletcoin.net.rpc import RpcServer
 from tests.conftest import wait_until
-from tests.helpers import mine_block, spend
+from tests.helpers import make_chain, mine_block, spend
 
 
 class TestProtocol:
@@ -1148,6 +1149,120 @@ class TestPeerToPeer:
                 second.stop()
         finally:
             first.stop()
+
+    def test_a_node_syncing_from_two_peers_does_not_stall(self, tmp_path, key):
+        """Consecutive blocks must not be split across peers.
+
+        Round-robin handed block N to one peer and N+1 to the other, so each block
+        arrived before its parent and the orphan pool overflowed, stalling the sync
+        forever.  The blocks must be downloaded in order, whichever peers serve them.
+        """
+        first = self._node(tmp_path, "a")
+        relay = self._node(tmp_path, "b")
+        try:
+            for index in range(300):
+                first.chain.add_block(
+                    mine_block(
+                        first.chain,
+                        key,
+                        timestamp=REGTEST.genesis_timestamp + 1 + index * 10,
+                    )
+                )
+            assert first.chain.height == 300
+            relay.connect_peer("127.0.0.1", first.p2p_port)
+            assert wait_until(lambda: relay.chain.height == 300, timeout=60)
+
+            syncing = self._node(
+                tmp_path,
+                "c",
+                connect=(f"127.0.0.1:{first.p2p_port}", f"127.0.0.1:{relay.p2p_port}"),
+            )
+            try:
+                assert wait_until(lambda: syncing.chain.height == 300, timeout=60)
+                assert syncing.chain.tip_hash == first.chain.tip_hash
+            finally:
+                syncing.stop()
+        finally:
+            relay.stop()
+            first.stop()
+
+    def test_info_reports_syncing_until_the_chain_is_caught_up(self, tmp_path, key):
+        source = make_chain()
+        headers = []
+        for index in range(4):
+            source.add_block(
+                mine_block(source, key, timestamp=REGTEST.genesis_timestamp + 1 + index)
+            )
+            headers.append(source.tip.header.serialize())
+        source.storage.close()
+
+        node = self._node(tmp_path, "sync")
+        try:
+            for raw in headers:
+                node.chain.add_header(BlockHeader.deserialize(raw))
+            info = node.info()
+            assert info["height"] == 0
+            assert info["header_height"] == 4
+            assert info["syncing"] is True
+            assert info["syncing_to"] >= 4
+            assert 0.0 <= info["sync_progress"] < 1.0
+        finally:
+            node.stop()
+
+    def test_missing_blocks_are_handed_out_contiguously(self, tmp_path, key):
+        """Blocks must be handed to peers in order, never round-robin.
+
+        Splitting consecutive blocks across peers made each one arrive before its
+        parent, flooding the orphan pool. Each peer must instead get a contiguous
+        run, and a peer must not start its run before the previous run's last block
+        is on disk.
+        """
+        source = make_chain()
+        headers = []
+        for index in range(20):
+            source.add_block(
+                mine_block(source, key, timestamp=REGTEST.genesis_timestamp + 1 + index * 10)
+            )
+            headers.append(source.tip.header.serialize())
+        hashes = [BlockHeader.deserialize(raw).hash() for raw in headers]
+        source.storage.close()
+
+        node = Node(
+            NodeConfig(
+                network="regtest",
+                datadir=tmp_path / "order",
+                p2p_port=0,
+                rpc=False,
+                use_seeds=False,
+            )
+        )
+        try:
+            for raw in headers:
+                node.chain.add_header(BlockHeader.deserialize(raw))
+
+            sent: list[object] = []
+
+            def make_peer() -> SimpleNamespace:
+                return SimpleNamespace(
+                    send=sent.append,
+                    close=lambda: None,
+                    handshake_done=SimpleNamespace(is_set=lambda: True),
+                    requested_blocks=set(),
+                    pending_blocks=deque(),
+                )
+
+            peers = [make_peer(), make_peer()]
+            node._peers = dict(enumerate(peers))  # type: ignore[attr-defined]
+
+            node._queue_missing_blocks()
+
+            # The first peer gets the first half and requests it; the second gets
+            # the second half but must wait for the first half's last block.
+            assert peers[0].requested_blocks == set(hashes[:10])
+            assert list(peers[1].pending_blocks) == hashes[10:]
+            assert peers[1].requested_blocks == set()
+        finally:
+            node.stop()
 
     def test_a_pruned_node_still_relays_what_it_receives(self, tmp_path, key):
         """Pruning costs the ability to serve history, not to take part."""

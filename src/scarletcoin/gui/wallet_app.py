@@ -296,10 +296,16 @@ class WalletWindow(QtWidgets.QMainWindow):
         elif info.get("chain_bytes") is not None:
             chain = f"  ·  chain {format_bytes(info['chain_bytes'])}"
         # A node that cannot reach the network looks just like a healthy empty one.
-        # Say so here rather than leaving it in the log.
+        # Say so here rather than leaving it in the log.  A node that is still
+        # syncing is shown as such, so a short chain is not mistaken for final.
         notes = info.get("warnings") or []
         if notes:
             self.status.showMessage(f"{info['network']}  ·  height {info['height']}  ·  {notes[0]}")
+        elif info.get("syncing"):
+            self.status.showMessage(
+                f"{info['network']}  ·  syncing: height {info['height']:,} of "
+                f"{info['syncing_to']:,} ({round(100 * info['sync_progress'])}%)"
+            )
         else:
             self.status.showMessage(
                 f"{info['network']}  ·  height {info['height']}  ·  {info['peers']} peers"
