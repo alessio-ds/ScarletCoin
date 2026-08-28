@@ -63,6 +63,11 @@ __all__ = [
 _MAX_CANDIDATES = 64
 _MAX_REMEMBERED_INVALID = 5_000
 
+#: How long :meth:`Blockchain.stats` may reuse its last measurement. The RPC
+#: interface is polled every few seconds by wallets and the explorer auto-reloads
+#: on each block, so a short cache absorbs bursts without making the numbers stale.
+STATS_CACHE_SECONDS = 2.0
+
 
 @dataclass(frozen=True, slots=True)
 class _ChainNode:
@@ -154,6 +159,8 @@ class Blockchain:
         self._listeners: list[ChainListener] = []
         self._invalid: dict[bytes, str] = {}
         self._tip = self._load_or_create_genesis()
+        self._stats_cache: dict | None = None
+        self._stats_at = 0.0
 
     # --------------------------------------------------------------- lifecycle
 
@@ -768,6 +775,7 @@ class Blockchain:
                 self._invalidate(exc.block_hash, str(exc))
                 continue
             self._tip = new_tip
+            self._stats_cache = None
             if any(kind == "disconnect" for kind, _, _ in events):
                 reorganised = True
             self._notify(events)
@@ -1102,22 +1110,29 @@ class Blockchain:
             return []
 
         step = max(1, (tip.height - window) // points)
+        heights: set[int] = set()
+        height = window + 1
+        while True:
+            heights.add(height)
+            heights.add(height - window)
+            if height >= tip.height:
+                break
+            height = min(tip.height, height + step)
+        samples = self.storage.chain_samples(heights)
+
         history: list[dict] = []
         height = window + 1
-        while height <= tip.height:
-            entry = self.storage.get_chain_entry(height)
-            first = self.storage.get_chain_entry(height - window)
-            if entry is not None and first is not None and entry.timestamp > first.timestamp:
+        while True:
+            entry = samples.get(height)
+            first = samples.get(height - window)
+            if entry is not None and first is not None and entry[1] > first[1]:
+                work, entry_time, bits = entry
                 history.append(
                     {
                         "height": height,
-                        "time": entry.timestamp,
-                        "hash_rate": round(
-                            (entry.chainwork - first.chainwork)
-                            / (entry.timestamp - first.timestamp),
-                            2,
-                        ),
-                        "difficulty": difficulty(entry.bits, pow_limit=params.pow_limit),
+                        "time": entry_time,
+                        "hash_rate": round((work - first[0]) / (entry_time - first[1]), 2),
+                        "difficulty": difficulty(bits, pow_limit=params.pow_limit),
                     }
                 )
             if height >= tip.height:
@@ -1127,9 +1142,16 @@ class Blockchain:
 
     def stats(self) -> dict:
         """Return a summary of the chain, for RPC and the explorer."""
+        with self._lock:
+            fresh = self._stats_cache is not None and (
+                time.time() - self._stats_at < STATS_CACHE_SECONDS
+            )
+            if fresh:
+                assert self._stats_cache is not None
+                return dict(self._stats_cache)
         utxo_count, supply = self.storage.utxo_stats()
         sizes = self.storage.size_stats()
-        return {
+        result = {
             "network": self.params.name,
             "height": self.height,
             "tip": self._tip.hash[::-1].hex(),
@@ -1154,6 +1176,10 @@ class Blockchain:
             "pruned_blocks": sizes["pruned_blocks"],
             "prune_height": sizes["prune_height"],
         }
+        with self._lock:
+            self._stats_cache = result
+            self._stats_at = time.time()
+        return dict(result)
 
 
 def prune_database(

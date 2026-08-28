@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -547,12 +547,16 @@ class Storage:
             ).fetchone()
             if row is None or row["pruned"]:
                 return None
-            block = Block.deserialize(bytes(row["raw"]))
+            raw = bytes(row["raw"])
+        # Deserialising is the expensive part; do it without holding the lock so
+        # serving blocks to a syncing peer does not stall every other reader.
+        block = Block.deserialize(raw)
+        with self._lock:
             self._block_cache[block_hash] = block
             self._block_cache.move_to_end(block_hash)
             while len(self._block_cache) > BLOCK_CACHE_SIZE:
                 self._block_cache.popitem(last=False)
-            return block
+        return block
 
     def set_in_chain(self, block_hash: bytes, in_chain: bool) -> None:
         """Mark a block as being on (or off) the active chain."""
@@ -569,6 +573,30 @@ class Storage:
             (height,),
         )
         return None if row is None else self._entry(row)
+
+    def chain_samples(self, heights: Iterable[int]) -> dict[int, tuple[int, int, int]]:
+        """Return ``(chainwork, timestamp, bits)`` for active-chain blocks at ``heights``.
+
+        One query for any number of heights, so a chart or stats page can sample
+        the chain without one round trip per sample.
+        """
+        wanted = set(heights)
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        rows = self._query(
+            f"SELECT height, chainwork, timestamp, raw FROM blocks"
+            f" WHERE in_chain = 1 AND height IN ({placeholders})",
+            tuple(sorted(wanted)),
+        )
+        return {
+            int(row["height"]): (
+                _blob_to_work(bytes(row["chainwork"])),
+                int(row["timestamp"]),
+                BlockHeader.deserialize(bytes(row["raw"])[:80]).bits,
+            )
+            for row in rows
+        }
 
     def children_of(self, block_hash: bytes) -> list[BlockIndexEntry]:
         """Return every stored block whose parent is ``block_hash``."""
