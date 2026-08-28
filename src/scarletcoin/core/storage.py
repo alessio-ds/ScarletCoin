@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blocks_prev ON blocks (prev_hash);
 CREATE INDEX IF NOT EXISTS blocks_chain ON blocks (in_chain, height);
+CREATE INDEX IF NOT EXISTS blocks_time ON blocks (in_chain, timestamp);
 CREATE INDEX IF NOT EXISTS blocks_work ON blocks (chainwork DESC);
 
 CREATE TABLE IF NOT EXISTS utxo (
