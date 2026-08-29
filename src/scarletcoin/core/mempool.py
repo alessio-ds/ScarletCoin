@@ -241,12 +241,12 @@ class Mempool:
 
     def minimum_fee(self, size: int) -> int:
         """Return the smallest fee the node will relay for a transaction of ``size``.
-        
+
         Calculated as ``ceil(size * min_relay_fee_per_kb / 1000)``, clamped to at
         least 1 scar so every transaction pays something.
         """
         from math import ceil
-        
+
         return max(1, ceil(size * self.params.min_relay_fee_per_kb / 1000))
 
     def estimate_fee_rate(self, blocks: int = 1) -> int:

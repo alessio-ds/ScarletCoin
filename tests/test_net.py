@@ -946,6 +946,7 @@ class TestWrongClock:
             send=sent.append,
             note_inventory=lambda _hash: None,
             requested_blocks=set(),
+            _block_requested_at={},
             pending_blocks=deque(),
         )
         node._on_inv(peer, protocol.Inv((InvItem(InvType.BLOCK, block.hash()),)))  # type: ignore[arg-type]
@@ -1248,6 +1249,7 @@ class TestPeerToPeer:
                     close=lambda: None,
                     handshake_done=SimpleNamespace(is_set=lambda: True),
                     requested_blocks=set(),
+                    _block_requested_at={},
                     pending_blocks=deque(),
                 )
 

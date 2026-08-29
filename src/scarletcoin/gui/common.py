@@ -1077,7 +1077,7 @@ def resolve_startup(
         latest = None
     if latest is not None:
         from scarletcoin import __version__ as current
-        
+
         logging.getLogger(__name__).warning(
             "ScarletCoin %s is available (you are running %s)."
             " Upgrade with: pip install --upgrade scarletcoin",

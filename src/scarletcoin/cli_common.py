@@ -236,12 +236,12 @@ def make_client(args: argparse.Namespace) -> RpcClient:
 
 def maybe_check_version(datadir: str | Path) -> None:
     """Log a warning when a newer ScarletCoin release is on PyPI.
-    
+
     Called once at start-up by every CLI tool.  The check is cached for a day
     and never blocks — a slow or unreachable PyPI is silently ignored.
     """
     import logging
-    
+
     logger = logging.getLogger(__name__)
     try:
         latest = check_version(datadir)
@@ -249,7 +249,7 @@ def maybe_check_version(datadir: str | Path) -> None:
         return
     if latest is not None:
         from scarletcoin import __version__ as current
-        
+
         logger.warning(
             "ScarletCoin %s is available (you are running %s)."
             " Upgrade with: pip install --upgrade scarletcoin",
