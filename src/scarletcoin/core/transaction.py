@@ -225,8 +225,12 @@ class Transaction:
         """Sum of all output values."""
         return sum(output.value for output in self.outputs)
 
-    def check_sanity(self) -> None:
+    def check_sanity(self, *, min_output_value: int = 0) -> None:
         """Validate everything that can be checked without the chain state.
+
+        Args:
+            min_output_value: Smallest output value the network allows (0 disables
+                the check, used by the genesis block).
 
         Raises:
             TransactionError: if the transaction is malformed.
@@ -237,6 +241,12 @@ class Transaction:
             raise TransactionError("transaction has no outputs")
         if self.total_output() > MAX_MONEY:
             raise TransactionError("total output value exceeds the maximum money supply")
+        for index, txout in enumerate(self.outputs):
+            if txout.value < min_output_value:
+                raise TransactionError(
+                    f"output {index} value {txout.value} is below the"
+                    f" {min_output_value} scar minimum"
+                )
 
         if self.is_coinbase:
             if len(self.coinbase_data) > MAX_COINBASE_DATA:

@@ -70,6 +70,7 @@ class Peer:
         self.known_inventory: set[bytes] = set()
         self.pending_blocks: deque[bytes] = deque()
         self.requested_blocks: set[bytes] = set()
+        self._block_requested_at: dict[bytes, float] = {}
         self.syncing = False
         self.blocks_served = 0
         self._blocks_served_last_check = 0

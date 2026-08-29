@@ -13,6 +13,7 @@ from scarletcoin.cli_common import (
     add_network_arguments,
     add_node_choice_arguments,
     die,
+    maybe_check_version,
     setup_logging,
 )
 from scarletcoin.net.chooser import NodeChoiceError, resolve_client
@@ -400,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``scarlet-wallet``."""
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level)
+    maybe_check_version(args.datadir / args.network)
     handler = _COMMANDS[args.command]
     try:
         return handler(args)

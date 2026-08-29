@@ -172,7 +172,7 @@ class Mempool:
             if txid in self._by_txid:
                 raise MempoolError("transaction is already in the mempool")
             try:
-                transaction.check_sanity()
+                transaction.check_sanity(min_output_value=self.params.min_output_value)
             except TransactionError as exc:
                 raise MempoolError(str(exc)) from exc
             if transaction.is_coinbase:
@@ -240,8 +240,14 @@ class Mempool:
             self.remove(txid)
 
     def minimum_fee(self, size: int) -> int:
-        """Return the smallest fee the node will relay for a transaction of ``size``."""
-        return max(1, (size * self.params.min_relay_fee_per_kb + 999) // 1000)
+        """Return the smallest fee the node will relay for a transaction of ``size``.
+        
+        Calculated as ``ceil(size * min_relay_fee_per_kb / 1000)``, clamped to at
+        least 1 scar so every transaction pays something.
+        """
+        from math import ceil
+        
+        return max(1, ceil(size * self.params.min_relay_fee_per_kb / 1000))
 
     def estimate_fee_rate(self, blocks: int = 1) -> int:
         """Roughly estimate the fee rate (scar/kB) needed to confirm in ``blocks``.

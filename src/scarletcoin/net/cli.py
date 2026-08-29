@@ -15,6 +15,7 @@ from scarletcoin.cli_common import (
     die,
     generate_rpc_token,
     make_client,
+    maybe_check_version,
     setup_logging,
     write_rpc_token,
 )
@@ -388,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments or (arguments[0].startswith("-") and arguments[0] not in _OWN_OPTIONS):
         arguments.insert(0, "run")
     args = parser.parse_args(arguments)
+    maybe_check_version(args.datadir / args.network)
     if args.command == "rpc":
         return _rpc(args)
     if args.command == "info":

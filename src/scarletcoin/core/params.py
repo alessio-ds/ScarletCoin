@@ -94,6 +94,14 @@ class ChainParams:
     """Window used for the "greater than the median of the last N" timestamp rule."""
     min_relay_fee_per_kb: int = 1_000
     """Cheapest fee rate a node will relay or mine, in scar per kilobyte."""
+    min_output_value: int = 1
+    """Smallest output value the network will relay and mine, in scar.
+    
+    Outputs below this value are rejected by the mempool and by block validation,
+    which prevents an attacker from filling the UTXO set with millions of
+    sub-dust outputs.  The default of ``1`` (the smallest indivisible unit) keeps
+    every valid transaction spendable while closing the obvious spam vector.
+    """
 
     # BIP-0044
     bip44_coin_type: int = 0

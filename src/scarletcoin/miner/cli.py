@@ -15,6 +15,7 @@ from scarletcoin.cli_common import (
     add_network_arguments,
     add_node_choice_arguments,
     die,
+    maybe_check_version,
     setup_logging,
 )
 from scarletcoin.miner.miner import Miner, MiningError
@@ -72,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``scarlet-miner``."""
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level)
+    maybe_check_version(args.datadir / args.network)
     # The command line reports mined blocks itself, so keep the library quiet --
     # but only when a person is watching. Under a service supervisor the log file
     # is the only record, so leave the logger audible there.

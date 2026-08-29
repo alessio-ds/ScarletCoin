@@ -14,6 +14,7 @@ from pathlib import Path
 
 from scarletcoin.core.params import get_params, network_names
 from scarletcoin.net.client import RpcClient
+from scarletcoin.version_check import check_version
 
 __all__ = [
     "DEFAULT_DATADIR",
@@ -26,6 +27,7 @@ __all__ = [
     "load_connection",
     "local_url",
     "make_client",
+    "maybe_check_version",
     "read_rpc_token",
     "save_connection",
     "setup_logging",
@@ -230,3 +232,27 @@ def make_client(args: argparse.Namespace) -> RpcClient:
     url = args.rpc_url or local_url(args.network)
     token = args.rpc_token or read_rpc_token(args.datadir, args.network)
     return RpcClient(url, token=token, timeout=args.timeout)
+
+
+def maybe_check_version(datadir: str | Path) -> None:
+    """Log a warning when a newer ScarletCoin release is on PyPI.
+    
+    Called once at start-up by every CLI tool.  The check is cached for a day
+    and never blocks — a slow or unreachable PyPI is silently ignored.
+    """
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    try:
+        latest = check_version(datadir)
+    except Exception:
+        return
+    if latest is not None:
+        from scarletcoin import __version__ as current
+        
+        logger.warning(
+            "ScarletCoin %s is available (you are running %s)."
+            " Upgrade with: pip install --upgrade scarletcoin",
+            latest,
+            current,
+        )

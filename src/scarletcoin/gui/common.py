@@ -28,6 +28,7 @@ from scarletcoin.net.client import RpcClient, RpcClientError
 from scarletcoin.net.launcher import LocalNode, LocalNodeError, already_running
 from scarletcoin.net.node import NodeConfig
 from scarletcoin.units import format_bytes
+from scarletcoin.version_check import check_version
 
 __all__ = [
     "STYLESHEET",
@@ -1070,6 +1071,19 @@ def resolve_startup(
     """
     network = args.network
     datadir = Path(args.datadir)
+    try:
+        latest = check_version(datadir / network)
+    except Exception:
+        latest = None
+    if latest is not None:
+        from scarletcoin import __version__ as current
+        
+        logging.getLogger(__name__).warning(
+            "ScarletCoin %s is available (you are running %s)."
+            " Upgrade with: pip install --upgrade scarletcoin",
+            latest,
+            current,
+        )
     settings = settings_from_args(args)
     requested = (getattr(args, "node", None) or "").strip()
     keyword = requested.lower() if requested.lower() in ("local", "public", "ask", "auto") else ""

@@ -24,6 +24,7 @@ from scarletcoin.crypto.hashing import hash256
 
 __all__ = [
     "MAX_PUBKEYS",
+    "MAX_SCRIPT_OPS",
     "MAX_SCRIPT_SIZE",
     "OP_CHECKMULTISIG",
     "OP_CHECKSIG",
@@ -48,6 +49,14 @@ MAX_PUBKEYS = 15
 
 MAX_STACK_ITEMS = 20
 """Largest stack a script may build."""
+
+MAX_SCRIPT_OPS = 200
+"""Most operations a single script execution may perform.
+
+Together with :data:`MAX_SCRIPT_SIZE` this bounds the worst-case cost of
+evaluating a redeem script.  Even a script built entirely of single-byte
+push operations cannot exceed this limit.
+"""
 
 OP_0 = 0x00
 OP_PUSHBYTES_MAX = 0x4B
@@ -211,7 +220,9 @@ def evaluate_script(script: bytes, arguments: list[bytes], digest: bytes) -> boo
     """
     try:
         stack = list(arguments)
-        for opcode, data in decode_ops(script):
+        for index, (opcode, data) in enumerate(decode_ops(script), 1):
+            if index > MAX_SCRIPT_OPS:
+                return False
             if opcode <= OP_PUSHBYTES_MAX or opcode in (OP_PUSHDATA1, OP_PUSHDATA2):
                 stack.append(data)
             elif OP_1 <= opcode <= OP_16:

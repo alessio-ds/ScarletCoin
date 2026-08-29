@@ -7,6 +7,7 @@ search runs in-process, which keeps tests and the GUI simple.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -240,10 +241,17 @@ class Miner:
                     (header, target, nonce + index * chunk, chunk) for index in range(self.workers)
                 ]
                 nonce += chunk * self.workers
-                for candidate_nonce, count in pool.imap_unordered(_scan_task, jobs):
-                    hashes += count
-                    if candidate_nonce is not None and found is None:
-                        found = candidate_nonce
+                try:
+                    for candidate_nonce, count in pool.imap_unordered(_scan_task, jobs):
+                        hashes += count
+                        if candidate_nonce is not None and found is None:
+                            found = candidate_nonce
+                except Exception as exc:
+                    logger.warning("mining worker crashed: %s; restarting worker pool", exc)
+                    with contextlib.suppress(Exception):
+                        pool.terminate()
+                    pool = multiprocessing.Pool(self.workers)
+                    continue
 
             seconds = time.perf_counter() - began
             self.stats.hashes += hashes

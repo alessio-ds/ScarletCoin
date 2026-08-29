@@ -58,6 +58,11 @@ SIZE_CACHE_SECONDS = 5.0
 #: Blocks are immutable, so this is only a read cache; it is dropped on pruning.
 BLOCK_CACHE_SIZE = 1024
 
+#: Maximum total bytes the block cache may hold before the oldest entries are
+#: evicted.  A full-size (1 MB) block at the default entry count would take
+#: 1 GB of memory, so the byte limit is the stricter bound in practice.
+BLOCK_CACHE_MAX_BYTES = 128 * 1024 * 1024  # 128 MB
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -293,6 +298,7 @@ class Storage:
         self._size_cache: dict | None = None
         self._size_measured_at = 0.0
         self._block_cache: OrderedDict[bytes, Block] = OrderedDict()
+        self._block_cache_bytes = 0
         self._connection = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None, timeout=30.0
         )
@@ -555,8 +561,13 @@ class Storage:
         with self._lock:
             self._block_cache[block_hash] = block
             self._block_cache.move_to_end(block_hash)
-            while len(self._block_cache) > BLOCK_CACHE_SIZE:
-                self._block_cache.popitem(last=False)
+            self._block_cache_bytes += len(raw)
+            while (
+                len(self._block_cache) > BLOCK_CACHE_SIZE
+                or self._block_cache_bytes > BLOCK_CACHE_MAX_BYTES
+            ):
+                _, old = self._block_cache.popitem(last=False)
+                self._block_cache_bytes -= old.size()
         return block
 
     def set_in_chain(self, block_hash: bytes, in_chain: bool) -> None:
@@ -829,6 +840,7 @@ class Storage:
             self.set_meta("prune_height", str(marker).encode())
             self._forget_sizes()
             self._block_cache.clear()
+            self._block_cache_bytes = 0
         return PruneResult(
             blocks=len(candidates),
             transactions=transactions,

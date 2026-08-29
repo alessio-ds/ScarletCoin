@@ -216,7 +216,9 @@ class Block:
         """Serialised size in bytes."""
         return len(self.serialize())
 
-    def check_sanity(self, *, pow_limit: int, max_block_size: int) -> None:
+    def check_sanity(
+        self, *, pow_limit: int, max_block_size: int, min_output_value: int = 0
+    ) -> None:
         """Validate the block without consulting the chain.
 
         Checks proof of work, size, the Merkle root, that exactly one coinbase is
@@ -238,7 +240,7 @@ class Block:
             if tx.is_coinbase:
                 raise BlockError("block contains more than one coinbase transaction")
         for tx in self.transactions:
-            tx.check_sanity()
+            tx.check_sanity(min_output_value=min_output_value)
         txids = self.txids()
         if len(set(txids)) != len(txids):
             raise BlockError("block contains duplicate transactions")

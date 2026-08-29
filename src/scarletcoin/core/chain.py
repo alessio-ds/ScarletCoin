@@ -23,6 +23,7 @@ from __future__ import annotations
 import statistics
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -157,7 +158,7 @@ class Blockchain:
         self.params = params
         self._lock = threading.RLock()
         self._listeners: list[ChainListener] = []
-        self._invalid: dict[bytes, str] = {}
+        self._invalid: OrderedDict[bytes, str] = OrderedDict()
         self._tip = self._load_or_create_genesis()
         self._stats_cache: dict | None = None
         self._stats_at = 0.0
@@ -179,7 +180,9 @@ class Blockchain:
 
         genesis = self.params.genesis_block
         genesis.check_sanity(
-            pow_limit=self.params.pow_limit, max_block_size=self.params.max_block_size
+            pow_limit=self.params.pow_limit,
+            max_block_size=self.params.max_block_size,
+            min_output_value=0,
         )
         with self.storage.write():
             entry = self.storage.put_block(
@@ -678,7 +681,9 @@ class Blockchain:
 
             try:
                 block.check_sanity(
-                    pow_limit=self.params.pow_limit, max_block_size=self.params.max_block_size
+                    pow_limit=self.params.pow_limit,
+                    max_block_size=self.params.max_block_size,
+                    min_output_value=self.params.min_output_value,
                 )
             except (BlockError, TransactionError) as exc:
                 self._invalid[block_hash] = str(exc)
@@ -791,9 +796,14 @@ class Blockchain:
         return None
 
     def _invalidate(self, block_hash: bytes, reason: str) -> None:
-        """Mark a block and everything built on top of it as unusable."""
-        if len(self._invalid) > _MAX_REMEMBERED_INVALID:
-            self._invalid.clear()
+        """Mark a block and everything built on top of it as unusable.
+
+        When the cache fills up the oldest entries are evicted one at a time
+        rather than all at once, so an attacker who floods 5001 distinct
+        invalid blocks cannot flush the entire cache and force re-validation.
+        """
+        while len(self._invalid) >= _MAX_REMEMBERED_INVALID:
+            self._invalid.popitem(last=False)
         pending = [(block_hash, reason)]
         while pending:
             current, why = pending.pop()

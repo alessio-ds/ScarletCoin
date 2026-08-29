@@ -78,10 +78,19 @@ _RECONNECT_THRESHOLD = 10
 _RECONNECT_WINDOW = 60.0
 #: Maximum ban duration for a rapid-reconnecting IP.
 _MAX_RECONNECT_BAN = 3600.0
+#: Duration of a ban triggered by misbehaviour (24 hours), after which the
+#: peer may reconnect.  Bans from rapid reconnects use their own duration
+#: calculated from the reconnect count.
+_MISBEHAVIOUR_BAN_DURATION = 86400.0
 #: If a peer has requested blocks but none arrive within this window,
 #: the connection is closed.  VPN tunnels with DPI/DAITA can silently
 #: drop large payloads while small control messages still pass.
 _BLOCK_REQUEST_TIMEOUT = 120.0
+#: If a specific block has been requested but not received within this
+#: time, the request is forgotten so another peer may pick it up.  Shorter
+#: than _BLOCK_REQUEST_TIMEOUT because a single stalled block should not
+#: block the sync when other peers are ready.
+_BLOCK_STALL_TIMEOUT = 30.0
 #: If a peer at height 0 has been served this many blocks in a single
 #: maintenance cycle, the connection is closed.
 _MAX_BLOCKS_PER_CYCLE_TO_ZERO = 5_000
@@ -579,8 +588,8 @@ class Node:
         if reason:
             logger.debug("%s misbehaviour +%d: %s", peer, points, reason)
         if peer.misbehaviour >= BAN_THRESHOLD:
-            logger.info("banning %s", peer.host)
-            self.addrbook.ban(peer.host)
+            logger.info("banning %s for %d s", peer.host, int(_MISBEHAVIOUR_BAN_DURATION))
+            self.addrbook.ban(peer.host, _MISBEHAVIOUR_BAN_DURATION)
             peer.close()
 
     # ---------------------------------------------------------- message handling
@@ -614,6 +623,7 @@ class Node:
         elif isinstance(message, protocol.NotFound):
             for item in message.items:
                 peer.requested_blocks.discard(item.hash)
+                peer._block_requested_at.pop(item.hash, None)
         elif isinstance(message, protocol.GetBlocks):
             self._on_getblocks(peer, message)
         elif isinstance(message, protocol.GetHeaders):
@@ -759,6 +769,9 @@ class Node:
             len(peer.requested_blocks),
         )
         peer.requested_blocks.update(item.hash for item in batch)
+        now = time.time()
+        for item in batch:
+            peer._block_requested_at[item.hash] = now
         peer.send(protocol.GetData(tuple(batch)))
         peer._last_getdata_at = time.time()
 
@@ -875,7 +888,12 @@ class Node:
         round-robin handed block N to one peer and N+1 to the next, so almost
         every block arrived before its parent, flooded the orphan pool, and left
         the sync permanently stuck.
+
+        Blocks that a peer has not delivered within _BLOCK_STALL_TIMEOUT are
+        released so another peer can pick them up; a single slow peer cannot
+        stall the entire sync.
         """
+        now = time.time()
         missing = self.chain.headers_to_download(2_000)
         peers = [p for p in self.peers if p.handshake_done.is_set()]
         if not missing or not peers:
@@ -885,6 +903,17 @@ class Node:
                 len(peers),
             )
             return
+        # Release blocks that have been in flight from a peer for too long.
+        for peer in peers:
+            stale = [
+                block_hash
+                for block_hash, requested_at in peer._block_requested_at.items()
+                if now - requested_at > _BLOCK_STALL_TIMEOUT
+            ]
+            for block_hash in stale:
+                peer.requested_blocks.discard(block_hash)
+                peer._block_requested_at.pop(block_hash, None)
+                peer.pending_blocks.append(block_hash)
         missing_set = set(missing)
         width = math.ceil(len(missing) / len(peers))
         for index, peer in enumerate(peers):
@@ -908,6 +937,7 @@ class Node:
     def _on_block(self, peer: Peer, block: Block) -> None:
         block_hash = block.hash()
         peer.requested_blocks.discard(block_hash)
+        peer._block_requested_at.pop(block_hash, None)
         peer.note_inventory(block_hash)
         result = self.submit_block(block, source=peer)
         logger.debug(
