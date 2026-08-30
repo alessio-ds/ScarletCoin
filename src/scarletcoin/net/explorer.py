@@ -651,6 +651,8 @@ def _block_page(server: RpcServer, identifier: str) -> str:
         return _page(server, f"Block {entry.height}", body)
 
     total_out = sum(tx.total_output() for tx in block.transactions)
+    proof_label = "AuxPoW (merged-mined)" if block.has_auxpow else "Native PoW"
+    proof_tag = _tag("auxpow", "ok") if block.has_auxpow else _tag("native", "ok")
     body = _cards(
         [
             ("Height", str(entry.height)),
@@ -660,6 +662,7 @@ def _block_page(server: RpcServer, identifier: str) -> str:
             ("Size", escape(format_bytes(block.size()))),
             ("Difficulty target", escape(f"{entry.bits:#010x}")),
             ("Nonce", str(block.header.nonce)),
+            ("Proof", f"{proof_tag} {proof_label}"),
             ("Value moved", _amount(total_out)),
         ]
     )
@@ -696,6 +699,26 @@ def _block_page(server: RpcServer, identifier: str) -> str:
     body += "<h2>Transactions</h2>" + _rows(
         ["Transaction id", "Type", "#Inputs", "#Outputs", "#Value"], rows
     )
+    # Show AuxPoW details when present.
+    if block.has_auxpow:
+        auxpow = block.auxpow
+        aux_rows = [
+            [_text("Parent block hash"), _html(_hash_span(auxpow.parent_header.hash_hex()))],
+            [_text("Parent block version"), _text(str(auxpow.parent_header.version))],
+            [
+                _text("Parent Merkle root"),
+                _html(_hash_span(auxpow.parent_header.merkle_root[::-1].hex())),
+            ],
+            [_text("Parent timestamp"), _text(escape(_when(auxpow.parent_header.timestamp)))],
+            [_text("Parent bits"), _text(f"{auxpow.parent_header.bits:#010x}")],
+            [_text("Parent nonce"), _text(str(auxpow.parent_header.nonce))],
+            [_text("Coinbase txid"), _html(_hash_span(auxpow.coinbase_hash[::-1].hex()))],
+            [_text("Coinbase index"), _text(str(auxpow.coinbase_index))],
+            [_text("Coinbase branch length"), _text(str(len(auxpow.coinbase_merkle_branch)))],
+            [_text("Aux chain index"), _text(str(auxpow.aux_chain_index))],
+            [_text("Aux branch length"), _text(str(len(auxpow.aux_merkle_branch)))],
+        ]
+        body += "<h2>AuxPoW (merged mining proof)</h2>" + _rows(["Field", "Value"], aux_rows)
     return _page(server, f"Block {entry.height}", body)
 
 

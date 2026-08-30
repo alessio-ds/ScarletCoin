@@ -107,6 +107,14 @@ class ChainParams:
     bip44_coin_type: int = 0
     """Coin type used in BIP-0044 derivation paths (m/44'/coin'/...)."""
 
+    # AuxPoW (merged mining)
+    auxpow_chain_id: int = 0
+    """Non-zero chain ID for AuxPoW slot calculation. 0 means AuxPoW is not
+    configured for this network. Mainnet and testnet should use distinct values."""
+    auxpow_activation_height: int | None = None
+    """First height at which AuxPoW blocks are accepted. ``None`` means AuxPoW is
+    never accepted; ``0`` means it is accepted from genesis (useful for regtest)."""
+
     # Checkpoints
     checkpoints: dict[int, str] = field(default_factory=dict)
     """Known-good block hashes by height, in display (big-endian) hex.
@@ -227,6 +235,8 @@ MAINNET = ChainParams(
     # first is asked for the others, so this list only has to get a client
     # started, not stay complete.
     public_nodes=("https://scarletcoin.remotewire.net",),
+    auxpow_chain_id=1,
+    auxpow_activation_height=None,  # Not yet activated on mainnet
 )
 
 TESTNET = ChainParams(
@@ -248,6 +258,8 @@ TESTNET = ChainParams(
     genesis_nonce=154_650,
     genesis_message=_GENESIS_MESSAGE + b" (testnet)",
     seeds=(),
+    auxpow_chain_id=2,
+    auxpow_activation_height=None,  # Not yet activated on testnet
 )
 
 REGTEST = ChainParams(
@@ -269,6 +281,8 @@ REGTEST = ChainParams(
     genesis_nonce=5,
     genesis_message=_GENESIS_MESSAGE + b" (regtest)",
     seeds=(),
+    auxpow_chain_id=3,
+    auxpow_activation_height=0,  # Activated from genesis on regtest for testing
 )
 
 #: Every known network, by name.

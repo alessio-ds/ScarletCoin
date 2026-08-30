@@ -26,7 +26,7 @@ from scarletcoin import __version__
 from scarletcoin.core.block import Block
 from scarletcoin.core.chain import BlockStatus
 from scarletcoin.core.serialize import SerializationError
-from scarletcoin.core.template import create_block_template
+from scarletcoin.core.template import create_aux_block, create_block_template
 from scarletcoin.core.transaction import Transaction
 from scarletcoin.core.validation import ValidationError
 from scarletcoin.crypto.keys import Address, InvalidKeyError
@@ -85,7 +85,7 @@ PUBLIC_METHODS = frozenset(
 #: node is by definition asked by strangers, so this is a separate decision from
 #: serving the read-only set.  A miner needs both of these or none of them, which
 #: is why they travel together.
-MINING_METHODS = frozenset({"getblocktemplate", "submitblock"})
+MINING_METHODS = frozenset({"getblocktemplate", "submitblock", "createauxblock", "submitauxblock"})
 
 MAX_BODY = 8 * 1024 * 1024
 
@@ -422,6 +422,72 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
             "reorganised": result.reorganised,
         }
 
+    def createauxblock(address: str) -> dict:
+        """Create a frozen AuxPoW candidate for merged mining.
+
+        Returns enough information for a Bitcoin pool/proxy to construct the
+        parent coinbase with the correct ScarletCoin commitment.
+
+        Args:
+            address: The ScarletCoin address that will receive the block reward.
+        """
+        if params.auxpow_chain_id == 0:
+            raise RpcError("AuxPoW is not configured for this network")
+        pubkey_hash = address_hash(str(address))
+        try:
+            candidate = create_aux_block(chain, node.mempool, pubkey_hash=pubkey_hash)
+        except ValueError as exc:
+            raise RpcError(str(exc)) from exc
+        # Store the candidate so submitauxblock can find it.
+        node.store_aux_candidate(candidate)
+        return candidate.to_dict()
+
+    def submitauxblock(hash: str, auxpow_hex: str) -> dict:
+        """Submit a complete AuxPoW proof for a previously-created candidate.
+
+        Args:
+            hash: The ``hash`` returned by ``createauxblock``.
+            auxpow_hex: The serialised AuxPoW structure, hex-encoded.
+        """
+        from scarletcoin.core.auxpow import AuxPoW, AuxPoWError
+
+        try:
+            aux_block_hash = bytes.fromhex(str(hash).strip())[::-1]
+        except (ValueError, IndexError) as exc:
+            raise RpcError(f"invalid aux block hash: {exc}", INVALID_PARAMS) from exc
+        if len(aux_block_hash) != 32:
+            raise RpcError("aux block hash must be 32 bytes", INVALID_PARAMS)
+
+        # Look up the candidate.
+        candidate = node.find_aux_candidate(aux_block_hash)
+        if candidate is None:
+            raise RpcError(
+                "no AuxPoW candidate with that hash; it may have expired or"
+                " the tip has advanced. Call createauxblock again."
+            )
+
+        # Decode AuxPoW.
+        try:
+            auxpow = AuxPoW.deserialize(bytes.fromhex(str(auxpow_hex).strip()))
+        except (ValueError, SerializationError, AuxPoWError) as exc:
+            raise RpcError(f"cannot decode AuxPoW: {exc}", INVALID_PARAMS) from exc
+
+        # Reconstruct the full ScarletCoin block from the candidate and attach
+        # the AuxPoW proof.
+        block = candidate.build_block()
+        block = block.with_auxpow(auxpow)
+
+        # Submit through the normal block-acceptance path.
+        result = node.submit_block(block)
+        if result.status is BlockStatus.INVALID:
+            raise RpcError(f"block rejected: {result.reason}")
+        return {
+            "status": result.status.value,
+            "hash": block.hash_hex(),
+            "height": result.height,
+            "reorganised": result.reorganised,
+        }
+
     # ---------------------------------------------------------------- networking
 
     def getpeers() -> list[dict]:
@@ -491,6 +557,8 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getrichlist": getrichlist,
         "getblocktemplate": getblocktemplate,
         "submitblock": submitblock,
+        "createauxblock": createauxblock,
+        "submitauxblock": submitauxblock,
         "getpeers": getpeers,
         "addpeer": addpeer,
         "getaddresses": getaddresses,

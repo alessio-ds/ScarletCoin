@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from scarletcoin.core.pow import check_proof_of_work, hash_to_int
 from scarletcoin.core.serialize import Reader, SerializationError, Writer
 from scarletcoin.core.transaction import Transaction
 from scarletcoin.crypto.hashing import hash256
 
-__all__ = ["BLOCK_HEADER_SIZE", "Block", "BlockError", "BlockHeader", "merkle_root"]
+if TYPE_CHECKING:  # pragma: no cover - avoids circular import at type-check time
+    from scarletcoin.core.auxpow import AuxPoW
+
+__all__ = [
+    "BLOCK_HEADER_SIZE",
+    "Block",
+    "BlockError",
+    "BlockHeader",
+    "merkle_root",
+]
 
 BLOCK_HEADER_SIZE = 80
 
@@ -126,10 +136,18 @@ class BlockHeader:
 
 @dataclass(frozen=True, slots=True)
 class Block:
-    """A block header together with its transactions."""
+    """A block header together with its transactions.
+
+    May optionally carry an :class:`~scarletcoin.core.auxpow.AuxPoW` payload for
+    merged-mined blocks.  The AuxPoW is stored separately from the header so that
+    the ScarletCoin block hash is not affected by it.
+    """
 
     header: BlockHeader
     transactions: tuple[Transaction, ...] = field(default_factory=tuple)
+    auxpow: object | None = field(default=None)
+    """An optional :class:`~scarletcoin.core.auxpow.AuxPoW` proof for merged mining.
+    ``None`` for native-PoW blocks."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "transactions", tuple(self.transactions))
@@ -144,6 +162,7 @@ class Block:
         timestamp: int | None = None,
         version: int = 1,
         nonce: int = 0,
+        auxpow: object | None = None,
     ) -> Block:
         """Assemble a block, computing its Merkle root from ``transactions``."""
         if not transactions:
@@ -156,7 +175,7 @@ class Block:
             bits=bits,
             nonce=nonce,
         )
-        return cls(header, tuple(transactions))
+        return cls(header, tuple(transactions), auxpow=auxpow)
 
     # ---------------------------------------------------------------- helpers
 
@@ -167,6 +186,11 @@ class Block:
     def hash_hex(self) -> str:
         """Return the block hash in display order."""
         return self.header.hash_hex()
+
+    @property
+    def has_auxpow(self) -> bool:
+        """``True`` if this block carries a merged-mining AuxPoW proof."""
+        return self.auxpow is not None
 
     @property
     def coinbase(self) -> Transaction:
@@ -187,15 +211,35 @@ class Block:
         """Return a copy of the block carrying a different header."""
         return replace(self, header=header)
 
+    def with_auxpow(self, auxpow: object) -> Block:
+        """Return a copy of the block carrying an AuxPoW proof."""
+        return replace(self, auxpow=auxpow)
+
     # ---------------------------------------------------------- serialisation
 
     def serialize(self) -> bytes:
-        """Return the canonical encoding of the whole block."""
+        """Return the canonical encoding of the whole block.
+
+        Layout::
+
+            [ScarletCoin header  (80 bytes)]
+            [transaction count  (varint)]
+            [transactions …]
+            [AuxPoW marker]         0x00 = no AuxPoW, 0x01 = AuxPoW follows
+            [AuxPoW payload]        only present when marker is 0x01
+        """
         writer = Writer()
         writer.raw(self.header.serialize())
         writer.varint(len(self.transactions))
         for tx in self.transactions:
             writer.raw(tx.serialize())
+        if self.auxpow is not None:
+            auxpow: AuxPoW = self.auxpow  # type: ignore[no-redef]
+            writer.uint8(0x01)
+            aux_data = auxpow.serialize()
+            writer.varbytes(aux_data)
+        else:
+            writer.uint8(0x00)
         return writer.getvalue()
 
     @classmethod
@@ -209,20 +253,41 @@ class Block:
         if count > reader.remaining:
             raise SerializationError("transaction count is larger than the remaining data")
         transactions = tuple(Transaction.read(reader) for _ in range(count))
+        # Check for AuxPoW marker if any bytes remain
+        auxpow = None
+        if reader.remaining > 0:
+            marker = reader.uint8()
+            if marker == 0x01:
+                from scarletcoin.core.auxpow import AuxPoW
+
+                aux_data = reader.varbytes()
+                auxpow = AuxPoW.deserialize(aux_data)
+            elif marker != 0x00:
+                raise SerializationError(f"unknown AuxPoW marker: {marker:#04x}")
         reader.expect_end()
-        return cls(header, transactions)
+        return cls(header, transactions, auxpow=auxpow)
 
     def size(self) -> int:
         """Serialised size in bytes."""
         return len(self.serialize())
 
     def check_sanity(
-        self, *, pow_limit: int, max_block_size: int, min_output_value: int = 0
+        self,
+        *,
+        pow_limit: int,
+        max_block_size: int,
+        min_output_value: int = 0,
+        is_auxpow_active: bool = False,
     ) -> None:
         """Validate the block without consulting the chain.
 
-        Checks proof of work, size, the Merkle root, that exactly one coinbase is
-        present and in first position, and that every transaction is well formed.
+        Checks proof of work (native or AuxPoW-aware), size, the Merkle root, that
+        exactly one coinbase is present and in first position, and that every
+        transaction is well formed.
+
+        ``is_auxpow_active`` allows blocks carrying a valid AuxPoW to bypass the
+        native header PoW check; the actual AuxPoW validation is done later by the
+        chain so that it has the block hash and target already computed.
 
         Raises:
             BlockError: if any of those checks fails.
@@ -232,7 +297,11 @@ class Block:
         size = self.size()
         if size > max_block_size:
             raise BlockError(f"block is too large: {size} > {max_block_size} bytes")
-        if not self.header.check_proof_of_work(pow_limit=pow_limit):
+        # For AuxPoW blocks the native header PoW is skipped — the parent Bitcoin
+        # PoW is verified later by the chain with the full context.
+        if (not is_auxpow_active or not self.has_auxpow) and not self.header.check_proof_of_work(
+            pow_limit=pow_limit
+        ):
             raise BlockError("block hash does not meet its proof-of-work target")
         if not self.transactions[0].is_coinbase:
             raise BlockError("first transaction in a block must be the coinbase")
@@ -252,8 +321,12 @@ class Block:
         data = self.header.to_dict()
         data["size"] = self.size()
         data["transaction_count"] = len(self.transactions)
+        data["proof_type"] = "auxpow" if self.has_auxpow else "native"
         if verbose:
             data["transactions"] = [tx.to_dict(address_version) for tx in self.transactions]
         else:
             data["transactions"] = [tx.txid_hex() for tx in self.transactions]
+        if self.has_auxpow:
+            auxpow: AuxPoW = self.auxpow  # type: ignore[no-redef]
+            data["auxpow"] = auxpow.to_dict()
         return data

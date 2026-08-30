@@ -33,7 +33,7 @@ from typing import Protocol
 from scarletcoin.core.block import Block, BlockError, BlockHeader
 from scarletcoin.core.coinbase import coinbase_height
 from scarletcoin.core.params import ChainParams
-from scarletcoin.core.pow import bits_from_work, block_work, difficulty, next_bits
+from scarletcoin.core.pow import bits_from_work, bits_to_target, block_work, difficulty, next_bits
 from scarletcoin.core.storage import (
     BlockIndexEntry,
     PruneResult,
@@ -460,17 +460,32 @@ class Blockchain:
         itself arrives. Returns an error string on failure, or ``None`` when the
         header is stored (or already known, or its parent is unknown so it cannot
         be judged yet).
+
+        After AuxPoW activation, headers that fail native PoW are still accepted
+        because the actual proof may come from the parent Bitcoin block.  The
+        AuxPoW proof is validated when the full block is submitted.
         """
         with self._lock:
             block_hash = header.hash()
             if self.has_block(block_hash) or self.storage.has_header(block_hash):
                 return None
-            if not header.check_proof_of_work(pow_limit=self.params.pow_limit):
-                return "header proof of work is invalid"
+
+            # Check if this header is at or above AuxPoW activation.
             parent = self._node(header.prev_hash)
+            height = parent.height + 1 if parent is not None else None
+            auxpow_active = self._auxpow_active_at(height) if height is not None else False
+
+            if not auxpow_active and not header.check_proof_of_work(
+                pow_limit=self.params.pow_limit
+            ):
+                return "header proof of work is invalid"
+            # When AuxPoW is active, we skip the native PoW check for the header
+            # alone.  The full block's PoW (native or AuxPoW) is checked when the
+            # block body arrives.
+
             if parent is None:
                 return None  # orphan header; retried when its parent arrives
-            height = parent.height + 1
+            assert height is not None
             expected = self._next_bits_for_node(parent, height, child_timestamp=header.timestamp)
             if header.bits != expected:
                 return (
@@ -679,27 +694,42 @@ class Blockchain:
                 height = None if entry is None else entry.height
                 return AddBlockResult(BlockStatus.DUPLICATE, block_hash, height)
 
-            try:
-                block.check_sanity(
-                    pow_limit=self.params.pow_limit,
-                    max_block_size=self.params.max_block_size,
-                    min_output_value=self.params.min_output_value,
-                )
-            except (BlockError, TransactionError) as exc:
-                self._invalid[block_hash] = str(exc)
-                return AddBlockResult(BlockStatus.INVALID, block_hash, reason=str(exc))
-
+            # Determine whether AuxPoW is active for this block's height.
+            # We need the parent to know the height; if the parent is not yet known
+            # we cannot decide, so the block is treated as an orphan and rejudged
+            # once the parent arrives (which also means we do not cache it as
+            # invalid).  Pre-activation AuxPoW is rejected outright.
             parent = self.storage.get_entry(block.header.prev_hash)
             if parent is None:
                 return AddBlockResult(
                     BlockStatus.ORPHAN, block_hash, reason="parent block is unknown"
                 )
+
+            height = parent.height + 1
+            auxpow_active = self._auxpow_active_at(height)
+
+            # Reject AuxPoW blocks before activation.
+            if block.has_auxpow and not auxpow_active:
+                reason = f"AuxPoW is not active at height {height}"
+                self._invalid[block_hash] = reason
+                return AddBlockResult(BlockStatus.INVALID, block_hash, height, reason=reason)
+
+            try:
+                block.check_sanity(
+                    pow_limit=self.params.pow_limit,
+                    max_block_size=self.params.max_block_size,
+                    min_output_value=self.params.min_output_value,
+                    is_auxpow_active=auxpow_active,
+                )
+            except (BlockError, TransactionError) as exc:
+                self._invalid[block_hash] = str(exc)
+                return AddBlockResult(BlockStatus.INVALID, block_hash, reason=str(exc))
+
             if parent.hash in self._invalid:
                 reason = "the parent block is invalid"
                 self._invalid[block_hash] = reason
                 return AddBlockResult(BlockStatus.INVALID, block_hash, reason=reason)
 
-            height = parent.height + 1
             checkpoint = self.params.checkpoints.get(height)
             if checkpoint is not None and block.hash_hex() != checkpoint:
                 reason = f"block does not match the checkpoint at height {height}"
@@ -716,6 +746,14 @@ class Blockchain:
             except ValidationError as exc:
                 self._invalid[block_hash] = str(exc)
                 return AddBlockResult(BlockStatus.INVALID, block_hash, height, reason=str(exc))
+
+            # Validate AuxPoW when present.
+            if block.has_auxpow:
+                try:
+                    self._validate_block_auxpow(block, height)
+                except ValidationError as exc:
+                    self._invalid[block_hash] = str(exc)
+                    return AddBlockResult(BlockStatus.INVALID, block_hash, height, reason=str(exc))
 
             chainwork = parent.chainwork + block_work(block.header.bits)
             with self.storage.write():
@@ -763,6 +801,42 @@ class Blockchain:
             raise ValidationError(
                 f"coinbase claims height {claimed} but the block is at height {height}"
             )
+
+    def _auxpow_active_at(self, height: int) -> bool:
+        """Return ``True`` if AuxPoW is active at ``height``."""
+        activation = self.params.auxpow_activation_height
+        chain_id = self.params.auxpow_chain_id
+        if chain_id == 0:
+            return False
+        if activation is None:
+            return False
+        return height >= activation
+
+    def _validate_block_auxpow(self, block: Block, height: int) -> None:
+        """Validate the AuxPoW proof of a merged-mined block.
+
+        The block is assumed to have passed normal sanity and context checks
+        (i.e. header, Merkle root, transactions, difficulty, timestamps).
+        This method only validates the AuxPoW cryptographic proof.
+
+        Raises:
+            ValidationError: if the AuxPoW proof is invalid.
+        """
+        from scarletcoin.core.auxpow import AuxPoW, AuxPoWError, validate_auxpow
+
+        auxpow: AuxPoW = block.auxpow  # type: ignore[assignment]
+        aux_block_hash = block.header.hash()
+        aux_target = bits_to_target(block.header.bits)
+
+        try:
+            validate_auxpow(
+                auxpow,
+                aux_block_hash,
+                aux_target,
+                chain_id=self.params.auxpow_chain_id,
+            )
+        except AuxPoWError as exc:
+            raise ValidationError(f"AuxPoW invalid: {exc}") from exc
 
     # ------------------------------------------------------ chain reorganisation
 

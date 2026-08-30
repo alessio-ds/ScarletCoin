@@ -136,24 +136,26 @@ class TestHeaderSync:
         target.storage.close()
 
     def test_a_bad_header_is_rejected(self, key):
+        """After AuxPoW activation the native PoW check is relaxed at the header
+        level (the full block validation handles it).  But we can still test:
+        a header below activation height must be rejected."""
+        from dataclasses import replace
+
         from scarletcoin.core.pow import check_proof_of_work
 
-        source = make_chain()
-        raw_headers = self._headers(source, key, 2)
-        source.storage.close()
-
-        target = make_chain()
-        assert target.add_header(BlockHeader.deserialize(raw_headers[0])) is None
-        header = BlockHeader.deserialize(raw_headers[1])
+        # Use a chain where AuxPoW is NOT active so headers still check PoW.
+        no_aux = make_chain(params=replace(REGTEST, auxpow_activation_height=None))
+        raw_header = BlockHeader.deserialize(mine_block(no_aux, key).header.serialize())
+        header = BlockHeader.deserialize(raw_header.serialize())
         nonce = header.nonce
-        while True:  # regtest's target is easy, so find a hash that misses it
+        while True:
             nonce += 1
             broken = header.with_nonce(nonce)
             if not check_proof_of_work(broken.hash(), broken.bits, pow_limit=REGTEST.pow_limit):
                 break
-        assert target.add_header(broken) is not None
-        assert target.header_height() == 1
-        target.storage.close()
+        assert no_aux.add_header(broken) is not None
+        assert no_aux.header_height() == 0
+        no_aux.storage.close()
 
     def test_an_orphan_header_is_held_until_its_parent_arrives(self, key):
         source = make_chain()

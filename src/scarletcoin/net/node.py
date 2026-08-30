@@ -214,6 +214,14 @@ class Node:
         self._premature_reason = ""
         self._premature_logged_at = 0.0
 
+        # AuxPoW candidate tracking (for merged mining)
+        from scarletcoin.core.template import AuxBlockCandidate
+
+        self._aux_candidates: OrderedDict[bytes, AuxBlockCandidate] = OrderedDict()
+        """Active AuxPoW candidates keyed by aux block hash.  Bounded to a
+        small number; old ones are evicted when the limit is reached."""
+        self._aux_candidates_lock = threading.Lock()
+
         self._connect_history: dict[str, list[float]] = {}
         """Timestamps of recent inbound connections, keyed by host IP."""
 
@@ -1052,6 +1060,42 @@ class Node:
         self._relay(InvItem(InvType.BLOCK, block.hash()), source=source)
         self._connect_orphans_of(block.hash())
         return result
+
+    # ---------------------------------------------------------- aux candidates
+
+    _MAX_AUX_CANDIDATES = 64
+
+    def store_aux_candidate(self, candidate) -> None:
+        """Remember an AuxPoW candidate so :meth:`find_aux_candidate` can find it.
+
+        Candidates are keyed by their ``aux_block_hash``.  When the cache fills
+        up the oldest candidate is evicted.
+        """
+        from scarletcoin.core.template import AuxBlockCandidate
+
+        candidate: AuxBlockCandidate = candidate
+        with self._aux_candidates_lock:
+            if len(self._aux_candidates) >= self._MAX_AUX_CANDIDATES:
+                self._aux_candidates.popitem(last=False)
+            self._aux_candidates[candidate.aux_block_hash] = candidate
+
+    def find_aux_candidate(self, aux_block_hash: bytes):
+        """Return the stored candidate for ``aux_block_hash``, or ``None``.
+
+        A candidate becomes stale (``None``) when the underlying ScarletCoin tip
+        has moved on, or when it was never stored.
+        """
+        with self._aux_candidates_lock:
+            candidate = self._aux_candidates.get(aux_block_hash)
+            if candidate is None:
+                return None
+            # The candidate is stale if the chain tip's hash no longer matches
+            # the candidate's previous block.
+            if self.chain.tip_hash != candidate.prev_hash:
+                # Remove it so stale candidates do not linger.
+                self._aux_candidates.pop(aux_block_hash, None)
+                return None
+            return candidate
 
     def submit_transaction(
         self, transaction: Transaction, *, source: Peer | None = None

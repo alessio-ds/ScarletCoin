@@ -239,7 +239,7 @@ class TestPublicRpcSurface:
         info = client.getinfo()
         for field in ("chain_bytes", "chain_size", "disk_bytes", "disk_size", "prune_height"):
             assert field in info
-        assert info["chain_size"] == "218 B"
+        assert info["chain_size"] == "219 B"
 
     def test_estimatefee_is_public_and_has_a_floor(self, rpc):
         node, _, client = rpc
