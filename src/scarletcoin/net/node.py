@@ -222,6 +222,12 @@ class Node:
         small number; old ones are evicted when the limit is reached."""
         self._aux_candidates_lock = threading.Lock()
 
+        # AuxPoW metrics counters
+        self.auxpow_blocks_total: int = 0
+        self.auxpow_rejections_total: int = 0
+        self.auxpow_submissions_total: int = 0
+        self.auxpow_templates_created_total: int = 0
+
         self._connect_history: dict[str, list[float]] = {}
         """Timestamps of recent inbound connections, keyed by host IP."""
 
@@ -1047,10 +1053,14 @@ class Node:
             self._defer_premature(block)
             return result
         if result.status is BlockStatus.INVALID:
+            if block.has_auxpow:
+                self.auxpow_rejections_total += 1
             logger.info("rejected block %s: %s", block.hash_hex(), result.reason)
             return result
         if result.status is BlockStatus.CONNECTED:
             self._last_block_at = time.time()
+            if block.has_auxpow:
+                self.auxpow_blocks_total += 1
             logger.info(
                 "block %s accepted at height %d%s",
                 block.hash_hex(),
@@ -1074,6 +1084,8 @@ class Node:
         from scarletcoin.core.template import AuxBlockCandidate
 
         candidate: AuxBlockCandidate = candidate
+        self.auxpow_templates_created_total += 1
+        self.auxpow_submissions_total += 1  # createauxblock counts as a submission intent
         with self._aux_candidates_lock:
             if len(self._aux_candidates) >= self._MAX_AUX_CANDIDATES:
                 self._aux_candidates.popitem(last=False)

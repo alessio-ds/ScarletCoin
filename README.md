@@ -288,6 +288,29 @@ tests/       437 tests: two-node networking, reorganisations, pruning, TPS load
 docs/        protocol and consensus reference, network operator's guide
 ```
 
+## Mine ScarletCoin with Bitcoin ASICs
+
+ScarletCoin supports **merged mining (AuxPoW)** — standard Bitcoin SHA-256d ASICs
+can mine ScarletCoin at **zero extra hashing cost** as a by-product of Bitcoin
+mining.  No custom firmware required.
+
+```text
+Your Antminer / Whatsminer
+        │
+        │ Stratum V1
+        ▼
+  Merged-mining pool
+        │
+   +----+----+
+   │         │
+   ▼         ▼
+  BTC       SCT
+```
+
+* [docs/MERGED-MINING.md](docs/MERGED-MINING.md) — how to mine SCT with existing ASICs
+* [docs/AUXPOW.md](docs/AUXPOW.md) — consensus-level AuxPoW specification
+* [docs/ACTIVATION.md](docs/ACTIVATION.md) — activation plan and mainnet timeline
+
 ## Development
 
 ```sh
@@ -302,6 +325,9 @@ uv run python tools/tps_test.py init --network mainnet   # measure real-world TP
   the peer-to-peer messages and the RPC methods.
 * [docs/RUNNING-A-NETWORK.md](docs/RUNNING-A-NETWORK.md) — run a public node and
   let others discover it.
+* [docs/AUXPOW.md](docs/AUXPOW.md) — AuxPoW consensus and block format.
+* [docs/MERGED-MINING.md](docs/MERGED-MINING.md) — BTC→SCT mining operator guide.
+* [docs/ACTIVATION.md](docs/ACTIVATION.md) — AuxPoW mainnet activation plan.
 * [docs/CHANGES-V2.md](docs/CHANGES-V2.md) / [docs/CHANGES-V2.2.md](docs/CHANGES-V2.2.md) — release history.
 
 ## License

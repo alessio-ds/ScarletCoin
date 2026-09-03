@@ -900,5 +900,18 @@ def metrics_text(node: Node) -> str:
         "# HELP scarletcoin_uptime_seconds Process uptime.",
         "# TYPE scarletcoin_uptime_seconds gauge",
         f"scarletcoin_uptime_seconds {time.time() - node.started_at:.1f}",
+        # AuxPoW merged-mining metrics
+        "# HELP scarletcoin_auxpow_blocks_total AuxPoW blocks accepted.",
+        "# TYPE scarletcoin_auxpow_blocks_total counter",
+        f"scarletcoin_auxpow_blocks_total {node.auxpow_blocks_total}",
+        "# HELP scarletcoin_auxpow_rejections_total AuxPoW blocks rejected.",
+        "# TYPE scarletcoin_auxpow_rejections_total counter",
+        f"scarletcoin_auxpow_rejections_total {node.auxpow_rejections_total}",
+        "# HELP scarletcoin_auxpow_submissions_total AuxPoW candidates created.",
+        "# TYPE scarletcoin_auxpow_submissions_total counter",
+        f"scarletcoin_auxpow_submissions_total {node.auxpow_submissions_total}",
+        "# HELP scarletcoin_auxpow_templates_created_total AuxPoW templates served.",
+        "# TYPE scarletcoin_auxpow_templates_created_total counter",
+        f"scarletcoin_auxpow_templates_created_total {node.auxpow_templates_created_total}",
     ]
     return "\n".join(lines) + "\n"
