@@ -422,9 +422,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     server = create_server(
         scarlet_url=args.scarlet_url,
         scarlet_token=args.scarlet_token,

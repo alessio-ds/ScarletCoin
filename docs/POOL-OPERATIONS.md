@@ -17,111 +17,125 @@ Internet
 │ (port 3333)  │    │ (port 20332 RPC)│
 └──────────────┘    └─────────────────┘
    │                         │
-   │ localhost RPC           │ P2P gossip
+   │ localhost RPC           │ :443 (Caddy)
    │ (createauxblock,        │
-   │  submitauxblock)        │
-   ▼                         ▼
-                   scarletcoin.remotewire.com
-                   (explorer on :80/:443)
+   │  submitauxblock)        ▼
+   ▼                 scarletcoin.remotewire.net
+                     (explorer / public RPC)
 ```
 
-The bridge runs as a separate process, talks to the ScarletCoin node over
-localhost RPC, and exposes a Stratum V1 TCP port for ASIC miners.
+The bridge runs as a separate OpenRC service, talks to the ScarletCoin node
+over localhost RPC, and exposes a Stratum V1 TCP port for ASIC miners.
 
-## Prerequisites
+The node itself is already behind Caddy (HTTPS) for the explorer and
+read-only public RPC; the bridge goes **directly to localhost:20332** with the
+node's RPC token since `createauxblock`/`submitauxblock` are mining methods.
 
-- **Python 3.10+** and **uv** installed
-- **ScarletCoin node** already running with RPC enabled
-- **Port 3333** open to the internet (TCP)
-- (Optional) **Bitcoin Core** for real BTC+SCT dual mining
+## Deployment on scarletcoin.remotewire.net (Alpine Linux)
 
-## Server Setup
+The reference node is an Alpine server at `45.126.126.139`.  The full node
+setup is documented in [RUNNING-A-NETWORK.md](RUNNING-A-NETWORK.md); this
+section adds the Stratum bridge on top of that existing installation.
 
-### 1. Clone and sync
+### 1. Pull the latest code
 
-```bash
-cd /home/scarletcoin
+```sh
+cd /opt/scarletcoin
 git pull origin main
-uv sync
+chmod -R a+rX /opt/scarletcoin
+# The virtualenv is already built against Alpine's Python.
+# If new dependencies were added (none were this release), re-run:
+#   UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3
 ```
 
-### 2. Enable mining RPC on the node
+### 2. Find the RPC token
 
-`createauxblock` and `submitauxblock` are `MINING_METHODS` — they require
-the RPC token unless you start the node with `--rpc-public-mining`.
+The node auto-generates a token on first start:
 
-**Option A (safer):** Use the node's existing RPC token.
-```bash
-# The token lives in the node's config or is auto-generated.
-# Check the node's startup logs for "RPC token: ..."
-cat /home/scarletcoin/.scarletcoin/mainnet/rpc-token
+```sh
+cat /var/lib/scarletcoin/mainnet/rpc.token
 ```
 
-**Option B (convenient):** Make mining public.
-```bash
-scarletcoin node mainnet --rpc --rpc-public-mining
+If that file doesn't exist, look in the node's startup log:
+
+```sh
+grep -i token /var/log/scarletcoin/node.log | tail -1
 ```
-This lets anyone call `createauxblock`/`submitauxblock` without a token.
-Only do this if the RPC port (20332) is NOT exposed to the internet.
 
 ### 3. Test the bridge manually
 
-```bash
-uv run python -m pool.scarlet_pool.server \
+```sh
+su -s /bin/sh scarlet -c \
+  'cd /opt/scarletcoin && /opt/scarletcoin/.venv/bin/python -m pool.scarlet_pool.server \
     --scarlet-url http://127.0.0.1:20332 \
-    --scarlet-token YOUR_RPC_TOKEN \
+    --scarlet-token YOUR_TOKEN_HERE \
     --payout-address Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
-    --chain-id 1 \
-    --port 3333
+    --chain-id 1'
 ```
 
-Verify it starts without errors:
+It should print:
 ```
-INFO Stratum server listening on 0.0.0.0:3333
-```
-
-### 4. Install the systemd unit
-
-```bash
-sudo cp packaging/scarletcoin-stratum.service /etc/systemd/system/
-sudo nano /etc/systemd/system/scarletcoin-stratum.service
-# Edit the ExecStart line with your actual RPC token and payout address
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now scarletcoin-stratum
-sudo systemctl status scarletcoin-stratum
+Stratum server starting on 0.0.0.0:3333
+ScarletCoin node: http://127.0.0.1:20332
+Payout address: Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Chain ID: 1
 ```
 
-### 5. Open the firewall
+Press Ctrl-C once you've confirmed it starts.  If it exits with
+`"AuxPoW is not configured"` you used the wrong `--chain-id` (mainnet = 1).
 
-```bash
-# ufw
-sudo ufw allow 3333/tcp
+### 4. Install as an OpenRC service
 
-# or firewalld
-sudo firewall-cmd --add-port=3333/tcp --permanent
-sudo firewall-cmd --reload
+```sh
+# Copy the init script
+cp /opt/scarletcoin/packaging/scarletcoin-stratum.openrc /etc/init.d/scarletcoin-stratum
+chmod +x /etc/init.d/scarletcoin-stratum
+
+# Create the config file with your real values
+cat > /etc/conf.d/scarletcoin-stratum <<'EOF'
+payout_address="Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+scarlet_token="YOUR_TOKEN_HERE"
+scarlet_url="http://127.0.0.1:20332"
+chain_id="1"
+port="3333"
+host="0.0.0.0"
+EOF
+
+# Enable and start
+rc-update add scarletcoin-stratum default
+rc-service scarletcoin-stratum start
 ```
 
-### 6. Verify it's working
+### 5. Open the Stratum port
 
-From any machine with netcat or a Stratum client:
-
-```bash
-# Test TCP connectivity
-nc -v scarletcoin.remotewire.com 3333
-
-# Test Stratum subscribe (type this, press Enter)
-{"id": 1, "method": "mining.subscribe", "params": ["cpuminer/test"]}
-# Should respond with subscription details + set_difficulty notification
+```sh
+iptables -A INPUT -p tcp --dport 3333 -j ACCEPT
+rc-service iptables save
 ```
+
+If your VPS provider has its own firewall / security group, open TCP 3333 there too.
+
+### 6. Verify
+
+```sh
+# Check the service is running
+rc-service scarletcoin-stratum status
+tail -f /var/log/scarletcoin/stratum.log
+
+# From your local machine, test Stratum connectivity
+echo '{"id":1,"method":"mining.subscribe","params":["cpuminer/test"]}' \
+  | nc -w3 scarletcoin.remotewire.net 3333
+```
+
+You should get back a JSON response with subscription details and a
+`mining.set_difficulty` notification.
 
 ## Miner instructions
 
 Give miners this info:
 
 ```
-URL:    stratum+tcp://scarletcoin.remotewire.com:3333
+URL:    stratum+tcp://scarletcoin.remotewire.net:3333
 Worker: Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  (your SCT payout address)
 Pass:   x  (ignored)
 ```
@@ -135,7 +149,7 @@ The current reference bridge uses `SimulatedParentChain` — it generates fake
 solveable parent headers so miners earn SCT only. To add real BTC dual-mining:
 
 1. Run **Bitcoin Core** on the same server:
-   ```bash
+   ```sh
    bitcoind -rpcuser=pool -rpcpassword=securepassword
    ```
 
@@ -151,13 +165,13 @@ solveable parent headers so miners earn SCT only. To add real BTC dual-mining:
 
 ## Monitoring
 
-- **Prometheus metrics** at `https://scarletcoin.remotewire.com/metrics`:
+- **Prometheus metrics** at `https://scarletcoin.remotewire.net/metrics`:
   - `scarletcoin_auxpow_blocks_total`
   - `scarletcoin_auxpow_rejections_total`
   - `scarletcoin_auxpow_submissions_total`
   - `scarletcoin_auxpow_templates_created_total`
 
-- **Bridge logs:** `sudo journalctl -u scarletcoin-stratum -f`
+- **Bridge logs:** `tail -f /var/log/scarletcoin/stratum.log`
 
 - **Explorer:** AuxPoW blocks show "Proof: AuxPoW (merged-mined)" with full
   parent Bitcoin header details.
@@ -166,15 +180,16 @@ solveable parent headers so miners earn SCT only. To add real BTC dual-mining:
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Bridge exits immediately | Wrong RPC token | Check `--scarlet-token` matches node |
-| "AuxPoW is not configured" | Wrong chain-id | Use `--chain-id 1` for mainnet |
-| Miners connect but get no jobs | RPC connection lost | Check `--scarlet-url` is reachable |
-| SCT blocks not accepted | Stale candidate | Bridge refreshes every 30s; check logs |
-| "no AuxPoW candidate with that hash" | Tip advanced | Normal under high hashpower; bridge retries |
+| Bridge exits immediately | Wrong RPC token | Check `/var/lib/scarletcoin/mainnet/rpc.token` |
+| "AuxPoW is not configured" | Wrong chain-id | Use `chain_id="1"` for mainnet |
+| "payout_address is still placeholder" | Not configured | Edit `/etc/conf.d/scarletcoin-stratum` |
+| Miners connect but get no jobs | RPC connection lost | Check `scarlet_url` is reachable from localhost |
+| Port 3333 closed | Firewall | `iptables -A INPUT -p tcp --dport 3333 -j ACCEPT` |
 
 ## Security notes
 
-- **Never expose the RPC port (20332) to the internet** without a token
-- The bridge's `--scarlet-token` should be a dedicated token, not your wallet passphrase
-- Run the bridge as a non-root user (`scarletcoin`)
-- The systemd unit uses `ProtectSystem=strict` and `NoNewPrivileges=yes`
+- **The RPC port (20332) is NOT exposed to the internet** — only Caddy (443) and localhost can reach it.  This is already the setup on the reference server.
+- The bridge talks to the node directly on `127.0.0.1:20332` with the RPC token — it does not go through Caddy.
+- `createauxblock` and `submitauxblock` require the token because they are MINING_METHODS, even though the node runs `--rpc-public`.
+- The bridge runs as the unprivileged `scarlet` user.
+- The OpenRC service uses `supervise-daemon` — it restarts automatically if it ever dies.

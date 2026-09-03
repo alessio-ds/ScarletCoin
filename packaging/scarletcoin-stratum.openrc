@@ -1,0 +1,52 @@
+#!/sbin/openrc-run
+
+name="scarletcoin-stratum"
+description="ScarletCoin merged-mining Stratum bridge"
+
+# -- You MUST set these before starting --------------------------------
+# The SCT address that receives block rewards.
+: ${payout_address:=Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
+# The node's RPC token.  Find it with:
+#   cat /var/lib/scarletcoin/mainnet/rpc.token
+: ${scarlet_token:=}
+: ${scarlet_url:=http://127.0.0.1:20332}
+: ${chain_id:=1}
+: ${port:=3333}
+: ${host:=0.0.0.0}
+# ---------------------------------------------------------------------
+
+command="/opt/scarletcoin/.venv/bin/python"
+command_args="-m pool.scarlet_pool.server
+    --scarlet-url ${scarlet_url}
+    --scarlet-token ${scarlet_token}
+    --payout-address ${payout_address}
+    --chain-id ${chain_id}
+    --host ${host}
+    --port ${port}
+    --job-interval 30"
+command_user="scarlet:scarlet"
+
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/scarletcoin/stratum.log"
+error_log="/var/log/scarletcoin/stratum.log"
+
+depend() {
+    need net scarlet-node
+    after firewall chronyd
+}
+
+start_pre() {
+    checkpath -d -o scarlet:scarlet -m 0750 /var/log/scarletcoin
+    if [ -z "${scarlet_token}" ]; then
+        eerror "scarlet_token is not set."
+        eerror "Find it at: /var/lib/scarletcoin/mainnet/rpc.token"
+        return 1
+    fi
+    if [ "${payout_address}" = "Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ]; then
+        eerror "payout_address is still the placeholder."
+        eerror "Set it to your actual SCT address in /etc/conf.d/scarletcoin-stratum"
+        return 1
+    fi
+}
