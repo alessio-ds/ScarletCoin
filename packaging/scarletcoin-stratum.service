@@ -1,0 +1,47 @@
+# ScarletCoin Stratum bridge service
+# Place at: /etc/systemd/system/scarletcoin-stratum.service
+# Then:     sudo systemctl daemon-reload
+#           sudo systemctl enable --now scarletcoin-stratum
+
+[Unit]
+Description=ScarletCoin merged-mining Stratum bridge
+After=network.target
+
+[Service]
+Type=simple
+User=scarletcoin
+WorkingDirectory=/home/scarletcoin/ScarletCoin
+
+# -- Point at your local ScarletCoin node RPC --
+# If the node listens on 127.0.0.1:20332 with a token, use:
+#   ExecStart=... --scarlet-url http://127.0.0.1:20332 --scarlet-token YOUR_RPC_TOKEN --payout-address S...
+#
+# For the public node (scarletcoin.remotewire.com), the RPC is on localhost
+# and the public node serves read-only methods without a token.  createauxblock
+# and submitauxblock are MINING_METHODS though, so either:
+#   a) start the node with --rpc-public-mining, or
+#   b) use the node's RPC token.
+#
+# Option (b) is safer — keep mining methods behind the token.
+Environment="RUST_LOG=info"
+ExecStart=/home/scarletcoin/.local/bin/uv run python -m pool.scarlet_pool.server \
+    --scarlet-url http://127.0.0.1:20332 \
+    --scarlet-token YOUR_RPC_TOKEN_HERE \
+    --payout-address YOUR_SCT_PAYOUT_ADDRESS_HERE \
+    --host 0.0.0.0 \
+    --port 3333 \
+    --chain-id 1
+
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/scarletcoin/ScarletCoin
+ReadOnlyPaths=/
+
+[Install]
+WantedBy=multi-user.target

@@ -352,6 +352,7 @@ class StratumServer:
 def create_server(
     *,
     scarlet_url: str = "http://127.0.0.1:40332",
+    scarlet_token: str | None = None,
     scarlet_address: str = "",
     host: str = "0.0.0.0",
     port: int = 3333,
@@ -363,7 +364,7 @@ def create_server(
     Uses :class:`SimulatedParentChain` for the parent Bitcoin side;
     swap with a real ``bitcoind`` RPC client for production.
     """
-    scarlet = RpcClient(scarlet_url, timeout=30.0)
+    scarlet = RpcClient(scarlet_url, token=scarlet_token, timeout=30.0)
     parent: ParentChainClient = SimulatedParentChain()
 
     manager = JobManager(
@@ -378,14 +379,64 @@ def create_server(
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    import sys
+    import argparse
 
-    scarlet_url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:40332"
-    address = sys.argv[2] if len(sys.argv) > 2 else ""
+    parser = argparse.ArgumentParser(description="ScarletCoin merged-mining Stratum bridge")
+    parser.add_argument(
+        "--scarlet-url",
+        default="http://127.0.0.1:20332",
+        help="ScarletCoin node RPC URL (default: http://127.0.0.1:20332)",
+    )
+    parser.add_argument(
+        "--scarlet-token",
+        default=None,
+        help="ScarletCoin RPC bearer token (omit if node runs without one)",
+    )
+    parser.add_argument(
+        "--payout-address",
+        default="",
+        help="SCT address that receives block rewards",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Stratum listen address (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3333,
+        help="Stratum listen port (default: 3333)",
+    )
+    parser.add_argument(
+        "--chain-id",
+        type=int,
+        default=1,
+        help="AuxPoW chain ID (1=mainnet, 2=testnet, 3=regtest; default: 1)",
+    )
+    parser.add_argument(
+        "--job-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between template refresh / new job broadcast (default: 30)",
+    )
+    args = parser.parse_args()
 
-    server = create_server(scarlet_url=scarlet_url, scarlet_address=address)
-    print(f"Stratum server starting on port {server._port}...")
-    print(f"ScarletCoin node: {scarlet_url}")
-    print("Connect your ASIC to stratum+tcp://127.0.0.1:3333")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    server = create_server(
+        scarlet_url=args.scarlet_url,
+        scarlet_token=args.scarlet_token,
+        scarlet_address=args.payout_address,
+        host=args.host,
+        port=args.port,
+        chain_id=args.chain_id,
+        job_interval=args.job_interval,
+    )
+    print(f"Stratum server starting on {args.host}:{args.port}")
+    print(f"ScarletCoin node: {args.scarlet_url}")
+    print(f"Payout address: {args.payout_address or '(none - rewards burned)'}")
+    print(f"Chain ID: {args.chain_id}")
+    print(f"Connect your ASIC miners to stratum+tcp://<this-host>:{args.port}")
     asyncio.run(server.serve_forever())
