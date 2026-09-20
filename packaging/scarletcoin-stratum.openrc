@@ -36,6 +36,9 @@ command_args="-m pool.scarlet_pool.server
     --host ${host}
     --port ${port}
     --job-interval ${job_interval}"
+# The bridge is not an installed package, so it has to run from the checkout
+# for ``python -m pool.scarlet_pool.server`` to resolve.
+directory="/opt/scarletcoin"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
