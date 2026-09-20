@@ -1,29 +1,45 @@
-# AuxPoW — Bitcoin Merged Mining for ScarletCoin
+# AuxPoW — Merged Mining for ScarletCoin
 
-ScarletCoin supports **Namecoin-style AuxPoW** so that existing Bitcoin SHA-256 ASIC miners can also produce ScarletCoin blocks **with zero additional hashing**.
+ScarletCoin supports **Namecoin-style AuxPoW**, so an existing SHA-256 ASIC
+miner can produce ScarletCoin blocks while hashing the 80-byte headers it
+already knows how to hash.
 
 ## How it works
 
 ```
           SHA-256d ASIC
                │
-               │ normal Bitcoin Stratum job
+               │ standard Stratum V1 job
                ▼
-       Bitcoin mining pool
+        merged-mining pool
                │
-       +-------+-------+
-       │               │
-       ▼               ▼
-  BTC block       SCT AuxPoW proof
-  (if hash ≤     (if same hash ≤
-   BTC target)    SCT target)
+               │ same nonce, two targets
+               ▼
+   SCT AuxPoW proof  (when hash ≤ SCT target)
 ```
 
-The ASIC continues doing exactly what it always does — hashing an 80-byte Bitcoin-style header. The pool embeds a ScarletCoin **commitment** into the Bitcoin coinbase before giving the header to the ASIC. When the ASIC finds a nonce whose hash meets the ScarletCoin target, the pool assembles an **AuxPoW proof** and submits it to a ScarletCoin node.
+The ASIC does exactly what it always does — hashes an 80-byte header. The pool
+puts a ScarletCoin **commitment** into the parent coinbase before handing the
+job out, and when a nonce's hash meets the ScarletCoin target it assembles an
+**AuxPoW proof** and submits it to a ScarletCoin node.
+
+### What "parent" means here
+
+The parent coinbase is validated as an ordinary ScarletCoin
+:class:`~scarletcoin.core.transaction.Transaction`, and the commitment lives in
+that transaction's **`coinbase_data`** field. It is *not* a Bitcoin-format
+coinbase, so a block taken from a real Bitcoin node cannot be used as a parent
+proof by this implementation. The parent header is therefore supplied by the
+pool (a "simulated parent chain") — the ASIC cannot tell the difference, and
+ScarletCoin never inspects the parent chain's state, but no BTC is mined.
+
+Supporting a real Bitcoin parent would mean adding a Bitcoin-format coinbase
+parser to the validation path.
 
 ## Commitment format
 
-The commitment lives in the **parent Bitcoin coinbase's scriptSig**, following the Namecoin convention:
+The commitment lives in the parent coinbase's `coinbase_data` field, following
+the Namecoin convention:
 
 ```
 fa be 6d 6d          merged-mining magic marker (4 bytes)
@@ -32,10 +48,14 @@ fa be 6d 6d          merged-mining magic marker (4 bytes)
 ⟨nonce⟩              commitment nonce, uint32 LE (4 bytes)
 ```
 
+`coinbase_data` always begins with the block height as a uint32 LE, so in
+practice it looks like `height ‖ extranonces ‖ commitment`.
+
 For a single auxiliary chain (only ScarletCoin) the tree has one leaf, so:
+
 - `tree_size = 1`
 - `aux_merkle_branch = []` (empty)
-- `aux_chain_index = 0` (always 0 for height-0 tree)
+- `aux_chain_index = 0` (always 0 for a height-0 tree)
 
 ## Consensus validation
 
@@ -49,7 +69,12 @@ A ScarletCoin node validates an AuxPoW block by proving seven things:
 6. **Coinbase Merkle proof** — the parent coinbase's hash, passed through the coinbase Merkle branch, reaches the parent block's `merkle_root`
 7. **Parent PoW** — `SHA256d(parent_header) ≤ ScarletCoin target`
 
-The key rule: **the parent Bitcoin block hash IS the proof of work for ScarletCoin.** The ScarletCoin header's own `nonce` field is irrelevant for AuxPoW blocks.
+The key rule: **the parent header's hash is the proof of work for ScarletCoin.**
+The ScarletCoin header's own `nonce` field is irrelevant for AuxPoW blocks.
+
+Because the parent header is not checked against any parent-chain state, the
+parent coinbase's output is never spendable. Only the commitment inside it
+matters.
 
 ## Chain IDs
 

@@ -2,17 +2,31 @@
 
 ## Current state
 
-AuxPoW consensus is **implemented but not yet activated** on mainnet or testnet.
-
 | Network | `auxpow_chain_id` | `auxpow_activation_height` | Status |
 |---------|-------------------|---------------------------|--------|
-| mainnet | 1 | `None` | **Not activated** |
-| testnet | 2 | `None` | **Not activated** |
+| mainnet | 1 | `47_000` | **Scheduled** |
+| testnet | 2 | `None` | Not activated |
 | regtest | 3 | `0` | Active from genesis |
+
+Mainnet activates at a **fixed height of 47,000**. The chain was at height
+~46,900 when this was set, so activation is deliberately close but not instant:
+it gives every operator a definite cutover point to upgrade by.
+
+Activation is **inert until an AuxPoW block is actually mined**. Native blocks
+keep working exactly as before, so the existing CPU miner is unaffected whether
+or not anyone is merged mining. The only thing that changes is that from height
+47,000 a block carrying a valid AuxPoW proof is also accepted.
+
+> **Un-upgraded nodes will reject AuxPoW blocks.** A node older than this
+> release does not understand the trailing AuxPoW marker and will treat such a
+> block as invalid. Native blocks are byte-for-byte unchanged, so an old node
+> still relays and accepts those. Upgrade every node and wallet before pointing
+> merged-mining hardware at the chain.
 
 ## Activation mechanism
 
-AuxPoW uses a **fixed block height** for activation. This is the simplest mechanism suitable for a small network.
+AuxPoW uses a **fixed block height** for activation — the simplest mechanism
+suitable for a small network.
 
 The consensus parameter is:
 

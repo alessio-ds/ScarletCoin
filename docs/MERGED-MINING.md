@@ -1,141 +1,145 @@
-# Merged Mining: Mine ScarletCoin with Bitcoin ASICs
+# Mining ScarletCoin with Bitcoin ASICs
 
-ScarletCoin uses **merged mining (AuxPoW)** — Bitcoin SHA-256 ASICs can mine ScarletCoin **at zero additional hashing cost** as a by-product of normal Bitcoin mining.
-
-## No special hardware needed
+ScarletCoin speaks **Stratum V1**, the same protocol every Bitcoin ASIC already
+uses, so a stock Antminer / Whatsminer / Avalon can mine SCT **with no firmware
+change**. The miner hashes 80-byte SHA-256d headers exactly as it always does;
+the pool wraps that work in a ScarletCoin **AuxPoW** proof and submits the
+blocks.
 
 ```
 Your existing Antminer / Whatsminer / Avalon
         │
         │ standard Stratum V1
         ▼
-  Merged-mining pool
+  Merged-mining pool  ──── createauxblock / submitauxblock ────►  ScarletCoin node
         │
-        +─── Bitcoin reward  ───►  Your BTC address
-        │
-        +─── ScarletCoin reward ─► Your SCT address
+        └─── SCT block reward ──►  the pool's payout address
 ```
 
-The ASIC firmware **does not change**. The same nonce that solves a Bitcoin share can also produce a ScarletCoin block — the pool handles all the ScarletCoin-specific work.
+## What this does and does not do
+
+**It works today:** an ASIC pointed at the pool mines **ScarletCoin**, and SCT
+block rewards go to the pool's payout address. This is the useful part, and it
+needs no ASIC changes.
+
+**It does not produce real Bitcoin blocks.** ScarletCoin's consensus validates
+the parent coinbase as one of *its own* transactions (the commitment lives in
+that transaction's `coinbase_data` field — see
+[AUXPOW.md](AUXPOW.md)), so the pool synthesises the parent header rather than
+taking one from Bitcoin. The ASIC cannot tell the difference, but no BTC is
+mined and no BTC reward exists. Genuine BTC + SCT merged mining would require a
+Bitcoin-format coinbase parser in consensus; that is a future change, not
+something a configuration switch can turn on.
 
 ## For miners
 
-### 1. Get a ScarletCoin address
-```bash
-scarletcoin wallet new
+```
+URL:      stratum+tcp://<pool-host>:3333
+Worker:   <your-sct-address>
+Password: anything (ignored)
 ```
 
-### 2. Point your ASIC at a merged-mining pool
-```
-URL: stratum+tcp://<pool-host>:3333
-Worker: <your-sct-address>
-Password: anything
-```
-
-### 3. Earn SCT alongside BTC
-- Your hashrate earns both BTC (from the pool's Bitcoin parent chain) and SCT (from ScarletCoin)
-- SCT blocks are found when a share hash meets the ScarletCoin target
-- SCT payouts follow the pool's schedule after coinbase maturity (100 confirmations)
+The worker name is passed to the node as the payout address, so use a real SCT
+address. The pool operator sets the address that actually receives the block
+reward; check with them before pointing hardware at a pool.
 
 ## For pool operators
 
-See [`docs/POOL-OPERATIONS.md`](POOL-OPERATIONS.md) for the full setup guide.
+The full setup guide is [POOL-OPERATIONS.md](POOL-OPERATIONS.md). A deployment
+needs two things:
 
-A minimal pool deployment consists of:
+1. a **ScarletCoin node** with `--rpc-public-mining` (or an RPC token), and
+2. the **Stratum bridge**, `python -m pool.scarlet_pool.server`.
 
-1. **Bitcoin Core** — provides parent-chain block templates
-2. **ScarletCoin node** — validates blocks and provides AuxPoW work
-3. **Stratum bridge** (`pool/scarlet_pool/server.py`) — connects ASICs to both chains
-
-```bash
-# Terminal 1: Bitcoin Core (testnet/regtest for testing)
-bitcoind -testnet -rpcuser=pool -rpcpassword=pool
-
-# Terminal 2: ScarletCoin node
-scarletcoin node testnet --rpc
-
-# Terminal 3: Stratum bridge
-python -m pool.scarlet_pool.server http://127.0.0.1:30332 <pool-address>
+```sh
+scarletcoin node mainnet --rpc --rpc-public-mining
+python -m pool.scarlet_pool.server \
+    --scarlet-url http://127.0.0.1:20332 \
+    --payout-address S... \
+    --chain-id 1 \
+    --share-difficulty 1
 ```
 
-## Profitability
+### Share difficulty
 
-The expected SCT/day from a given hashrate:
+`--share-difficulty` is **not** the chain difficulty. It only controls how often
+a miner submits a share, i.e. how often the pool is allowed to submit a block.
+It is expressed in Bitcoin difficulty-1 units, so `1` means "a share must beat
+Bitcoin's difficulty-1 target".
+
+ScarletCoin's own difficulty is currently far below 1, which means every share
+that beats the share target *also* beats the ScarletCoin target — each accepted
+share becomes a block. Raise `--share-difficulty` to throttle submissions from a
+fast ASIC; lower it if a small miner never finds anything. Because the chain
+retargets per block, its difficulty climbs toward whatever hashrate is pointed
+at it, and once it passes the share difficulty the pool stops throttling and
+simply accepts everything that is a block.
+
+### Job flow
+
+1. `createauxblock` on the ScarletCoin node → a frozen candidate whose block
+   hash is committed into the parent coinbase.
+2. The pool builds the parent coinbase with the AuxPoW commitment in its
+   `coinbase_data` field and splits it into `coinbase1` / `coinbase2` around the
+   two Stratum extranonces.
+3. `mining.notify` hands the ASIC the coinbase halves, the Merkle branch, and an
+   easy parent header. `prevhash` and every branch entry are in internal byte
+   order, as stock firmware expects.
+4. The ASIC hashes headers and submits nonces.
+5. When a share beats the ScarletCoin target the pool assembles the AuxPoW proof
+   and calls `submitauxblock`.
+
+### Architecture
 
 ```
-SCT/day = hashrate / network_hashrate × 1440 × block_subsidy × (1 - pool_fee)
+                Pool Job Manager
+                       │
+        ┌──────────────┼───────────────┐
+        │              │               │
+  ScarletCoin RPC  Stratum Server   parent chain
+  createauxblock   (port 3333)      (simulated today,
+  submitauxblock        │            bitcoind later)
+        │          ASIC miners
+        │
+   ScarletCoin node
 ```
 
-Where:
-- `network_hashrate` = ScarletCoin's current difficulty expressed as H/s
-- `1440` = blocks per day (60s spacing)
-- `block_subsidy` = current subsidy (50 SCT, halving every 210,000 blocks)
-- `pool_fee` = pool operator's fee percentage
+## Economics
 
-Example with 1 TH/s at difficulty 1M and 0% pool fee:
-```
-SCT/day = 1,000,000,000,000 / 1,000,000 × 1,440 × 50 = ~72,000,000,000 scar/day = 720 SCT/day
-```
-
-Current network hashrate and difficulty are visible at:
-- Explorer: https://scarletcoin.remotewire.net/
-- RPC: `getnetworkstats`
-
-## Architecture
+Block rewards go to the pool's payout address, so the SCT/day for a given
+hashrate is:
 
 ```
-                    Bitcoin parent chain
-                           │
-                    Bitcoin Core RPC
-                           │
-                    ┌──────┴──────┐
-                    │  Pool Job   │
-                    │  Manager    │
-                    └──────┬──────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-    ScarletCoin RPC   Stratum Server    Bitcoin RPC
-   (createauxblock)   (port 3333)     (getblocktemplate)
-          │                │
-          │          ASIC miners
-          │
-    submitauxblock
-    (when SCT target met)
+SCT/day = hashrate / network_hashrate × 1440 × block_subsidy
 ```
 
-The pool:
-1. Calls `createauxblock` on ScarletCoin node → gets frozen candidate with target
-2. Calls `getblocktemplate` on Bitcoin Core → gets parent block template
-3. Builds a Bitcoin coinbase containing the ScarletCoin commitment (`fa be 6d 6d || ...`)
-4. Computes the Bitcoin Merkle root and builds a Stratum job
-5. ASICs hash the Bitcoin header normally
-6. When a share's hash ≤ ScarletCoin target → assemble AuxPoW → `submitauxblock`
-7. When a share's hash ≤ Bitcoin target → submit Bitcoin block normally
-
-## Consensus
-
-Full details in [`docs/AUXPOW.md`](AUXPOW.md).
-
-Key points:
-- ScarletCoin block hash is **always** the SHA-256d of its own 80-byte header
-- The AuxPoW proof is a **separate payload** appended after transactions
-- ScarletCoin chainwork is based on the **ScarletCoin target**, not Bitcoin difficulty
-- Both native PoW and AuxPoW blocks are valid after activation
+`1440` is the number of 60-second blocks in a day and the subsidy starts at
+50 SCT, halving every 210,000 blocks. At the time of writing the network
+difficulty is very low, so even a single CPU miner produces most blocks — an
+ASIC will dominate it. Treat any profitability estimate with suspicion until the
+difficulty has settled at the hashrate actually pointed at the chain.
 
 ## FAQ
 
-**Q: Do I need a separate ASIC for ScarletCoin?**  
-A: No. Any Bitcoin SHA-256 ASIC works. The same nonces count for both chains.
+**Q: Do I need special firmware or a modified ASIC?**
+A: No. Stock Stratum V1 firmware works.
 
-**Q: Will merged mining slow down my Bitcoin mining?**  
-A: No. The ASIC hashes exactly the same 80-byte Bitcoin header. Zero overhead.
+**Q: Do I earn BTC as well?**
+A: No. The pool mines ScarletCoin only; the parent header is synthetic. See
+"What this does and does not do" above.
 
-**Q: What happens if I find a ScarletCoin block but not a Bitcoin block?**  
-A: You earn SCT. The pool submits the AuxPoW proof to ScarletCoin. Your ASIC continues mining.
+**Q: Will this slow down my Bitcoin mining?**
+A: If you point the ASIC at this pool it is not mining Bitcoin at all. If a pool
+later adds a real Bitcoin parent, merged mining costs no extra hashing.
 
-**Q: What if I find both?**  
-A: You earn both BTC and SCT. The pool submits to both chains.
+**Q: The miner connects but every share is rejected.**
+A: Check the pool's `--chain-id` matches the node's network (1 = mainnet). The
+pool refuses to start against the wrong chain rather than silently building
+invalid proofs.
 
-**Q: How are SCT rewards distributed?**  
-A: The pool tracks shares, calculates each miner's contribution, and pays SCT to the address you provide when connecting.
+**Q: Nothing is found for a long time.**
+A: `--share-difficulty` is probably too high for the miner's hashrate. Lower it.
+
+**Q: How are rewards split between miners?**
+A: They are not, yet. Every block reward goes to the single pool payout address;
+there is no per-miner accounting or payout layer in this version.

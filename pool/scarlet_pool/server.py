@@ -1,14 +1,22 @@
 """Stratum V1 TCP server for merged-mining Bitcoin ASICs.
 
-Accepts connections from standard SHA-256 ASIC miners (Antminer, Whatsminer, …),
-hands out merged-mining jobs that include the ScarletCoin AuxPoW commitment, and
-detects when a submitted share also satisfies the ScarletCoin target.
+Accepts connections from standard SHA-256 ASIC miners (Antminer, Whatsminer,
+Avalon, …), hands out jobs whose parent coinbase carries the ScarletCoin
+AuxPoW commitment, and submits an AuxPoW proof whenever a share also meets the
+ScarletCoin target.
 
-Usage (regtest / local dev)::
+The wire protocol follows the de-facto Stratum V1 convention so stock firmware
+works unchanged:
 
-    python -m pool.scarlet_pool.server
+* ``mining.subscribe`` returns ``extranonce1`` and ``extranonce2_size``;
+* ``mining.notify`` sends ``prevhash`` and every Merkle branch entry in
+  **internal** byte order, which is how the miner writes them into the header;
+* the miner builds ``coinbase = coinbase1 || extranonce1 || extranonce2 ||
+  coinbase2`` and the pool rebuilds exactly that.
 
-Requires a ScarletCoin node and a Bitcoin parent-chain source.
+Usage::
+
+    python -m pool.scarlet_pool.server --payout-address S...
 """
 
 from __future__ import annotations
@@ -17,7 +25,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import time
 from collections.abc import Callable
 
 from scarletcoin.net.client import RpcClient
@@ -32,24 +39,42 @@ from .stratum import (
     read_message,
 )
 
-__all__ = ["StratumServer", "StratumSession", "create_server"]
+__all__ = ["SimulatedParentChain", "StratumServer", "StratumSession", "create_server"]
 
 logger = logging.getLogger(__name__)
 
+#: Default Stratum share difficulty.  This is *not* the chain difficulty: it
+#: only controls how often a miner submits.  Because ScarletCoin's difficulty
+#: is far below Bitcoin's difficulty 1, every share that beats this target also
+#: beats the ScarletCoin target, so each accepted share produces a block.
+DEFAULT_SHARE_DIFFICULTY = 1.0
 
-# ── simulated parent chain (regtest / testing) ───────────────────────────
+
+# ── simulated parent chain (SCT-only mining, testing) ────────────────────
 
 
 class SimulatedParentChain:
-    """A fake Bitcoin chain that generates solveable blocks for testing.
+    """A stand-in parent chain for mining ScarletCoin on its own.
 
-    Replace with :class:`BitcoinCoreClient` for production.
+    ScarletCoin never inspects the parent chain's state: an AuxPoW proof is
+    validated against the parent header's proof of work and the commitment in
+    its coinbase, not against a real Bitcoin block.  So a pool that only wants
+    to mine SCT can synthesise parent headers, solve them against the
+    ScarletCoin target, and discard the parent side entirely.
+
+    Swap in a ``BitcoinCoreClient`` to earn real BTC from the same hashing.
     """
 
-    def __init__(self) -> None:
-        self.height = 800_000
-        self.prev_hash = os.urandom(32)[::-1].hex()
-        self.nbits = 0x207FFFFF  # easy target
+    #: A generous target so the pool's *share* check is not what rejects work;
+    #: the ScarletCoin target is the one that matters.
+    _EASY_TARGET = 0x7FFFFF0000000000000000000000000000000000000000000000000000000000
+
+    def __init__(self, *, height: int = 800_000) -> None:
+        self.height = height
+        self.nbits = 0x207FFFFF  # an easy, always-valid compact target
+        # Internal byte order: this is what goes into the header and onto the
+        # wire, so the pool and the miner agree without any translation.
+        self.prev_hash = os.urandom(32).hex()
 
     def get_template(self) -> ParentTemplate:
         return ParentTemplate(
@@ -58,17 +83,18 @@ class SimulatedParentChain:
             nbits=self.nbits,
             height=self.height,
             coinbase_value=50 * 100_000_000,
-            transactions=[],  # no extra txns for simplicity
-            target=0x7FFFFF0000000000000000000000000000000000000000000000000000000000,
+            transactions=[],
+            target=self._EASY_TARGET,
         )
 
     def submit_block(self, raw_hex: str) -> str | None:
+        """Accept a solved parent block and advance the simulated chain."""
         from scarletcoin.crypto.hashing import hash256
 
-        blk_hash = hash256(bytes.fromhex(raw_hex))[::-1].hex()
-        self.prev_hash = blk_hash
+        block_hash = hash256(bytes.fromhex(raw_hex))[::-1].hex()
+        self.prev_hash = block_hash[::-1].hex()
         self.height += 1
-        return blk_hash
+        return block_hash
 
 
 # ── Stratum session (one per connected miner) ────────────────────────────
@@ -97,6 +123,8 @@ class StratumSession:
         self.extranonce2_size: int = 4
         self.subscription_id: str = ""
 
+    # ── lifecycle ──────────────────────────────────────────────────────
+
     async def run(self) -> None:
         """Read-submit loop for one miner."""
         try:
@@ -109,16 +137,14 @@ class StratumSession:
                     continue
                 await self._dispatch(req)
         except StratumError:
-            pass  # connection closed
+            pass  # connection closed or timed out
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
             self._on_disconnect(self)
-            try:
+            with contextlib.suppress(Exception):
                 self._writer.close()
                 await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
-            except Exception:
-                pass
 
     async def _dispatch(self, req: StratumRequest) -> None:
         method = req.method
@@ -128,13 +154,22 @@ class StratumSession:
             await self._handle_authorize(req)
         elif method == "mining.submit":
             await self._handle_submit(req)
-        elif method == "mining.suggest_target" or method == "mining.suggest_difficulty":
+        elif method in {
+            "mining.suggest_target",
+            "mining.suggest_difficulty",
+            "mining.extranonce.subscribe",
+        }:
+            await self._send_result(req.id, True)
+        elif method == "mining.configure":
+            # Advertise no optional extensions; miners fall back to V1 basics.
+            await self._send_result(req.id, {"version-rolling": False})
+        elif method in {"mining.multi_version", "client.get_version"}:
             await self._send_result(req.id, True)
         else:
             await self._send_error(req.id, -32601, f"unknown method {method!r}")
 
     async def send_job(self, clean: bool = False) -> None:
-        """Push a new mining job to this miner."""
+        """Push the current job to this miner."""
         job = self._manager.current
         if job is None:
             return
@@ -144,19 +179,22 @@ class StratumSession:
                 "method": "mining.notify",
                 "params": [
                     job.job_id,
-                    job.parent.prev_hash,
+                    job.parent.prev_hash,  # internal order
                     job.coinbase.coinbase1,
                     job.coinbase.coinbase2,
-                    job.merkle_branches,
+                    job.merkle_branches,  # internal order
                     f"{job.parent.version:08x}",
                     f"{job.parent.nbits:08x}",
-                    f"{int(time.time()):08x}",
+                    f"{job.ntime:08x}",
                     clean,
                 ],
             }
         )
+        await self._write(msg)
+
+    async def _write(self, payload: str) -> None:
         try:
-            self._writer.write(msg.encode())
+            self._writer.write(payload.encode())
             await asyncio.wait_for(self._writer.drain(), timeout=5.0)
         except Exception as exc:
             raise StratumError("write failed") from exc
@@ -165,33 +203,38 @@ class StratumSession:
 
     async def _handle_subscribe(self, req: StratumRequest) -> None:
         if len(req.params) >= 1:
-            user_agent = str(req.params[0])
-            logger.info("miner %s subscribed (agent=%s)", self.address, user_agent[:80])
+            logger.info("miner %s subscribed (agent=%s)", self.address, str(req.params[0])[:80])
 
         self.subscription_id = f"scarlet-{os.urandom(4).hex()}"
+        # One extranonce1 per connection, four bytes, returned to the miner.
+        # The pool never puts it into coinbase1: the miner inserts it itself.
         self.extranonce1 = os.urandom(4).hex()
         self.extranonce2_size = 4
         self.subscribed = True
 
-        # Stratum subscribe response
-        result = [
+        await self._send_result(
+            req.id,
             [
-                ["mining.set_difficulty", self.subscription_id],
-                ["mining.notify", self.subscription_id],
+                [
+                    ["mining.set_difficulty", self.subscription_id],
+                    ["mining.notify", self.subscription_id],
+                ],
+                self.extranonce1,
+                self.extranonce2_size,
             ],
-            self.extranonce1,
-            self.extranonce2_size,
-        ]
-        await self._send_result(req.id, result)
-        # Set initial difficulty
-        diff_msg = encode_message(
-            {
-                "id": None,
-                "method": "mining.set_difficulty",
-                "params": [256.0],
-            }
         )
-        self._writer.write(diff_msg.encode())
+        await self._set_difficulty(self._manager.share_difficulty)
+
+    async def _set_difficulty(self, difficulty: float) -> None:
+        await self._write(
+            encode_message(
+                {
+                    "id": None,
+                    "method": "mining.set_difficulty",
+                    "params": [difficulty],
+                }
+            )
+        )
 
     async def _handle_authorize(self, req: StratumRequest) -> None:
         if len(req.params) >= 1:
@@ -199,7 +242,6 @@ class StratumSession:
         self.authorized = True
         logger.info("worker %s authorized", self.worker_name)
         await self._send_result(req.id, True)
-        # Send the current job
         if self._manager.current is not None:
             await self.send_job(clean=True)
 
@@ -214,25 +256,27 @@ class StratumSession:
             worker = str(req.params[0])
             job_id = str(req.params[1])
             extranonce2 = str(req.params[2])
-            ntime = int(req.params[3], 16) if isinstance(req.params[3], str) else int(req.params[3])
-            nonce = int(req.params[4], 16) if isinstance(req.params[4], str) else int(req.params[4])
+            ntime = int(str(req.params[3]), 16)
+            nonce = int(str(req.params[4]), 16)
         except (ValueError, TypeError) as exc:
             await self._send_error(req.id, -32602, f"bad params: {exc}")
             return
 
-        share = self._manager.process_share(job_id, extranonce2, ntime, nonce)
+        share = self._manager.process_share(job_id, self.extranonce1, extranonce2, ntime, nonce)
         if not share.accepted:
+            logger.debug("share rejected from %s: %s", worker or self.address, share.reason)
             await self._send_result(req.id, False)
             return
 
-        # Check if this share meets the ScarletCoin target
         if share.meets_sct_target:
             logger.info(
-                "SCT block candidate from %s! hash=%s",
+                "SCT block candidate from %s! parent=%s",
                 worker or self.address,
                 share.hash_hex,
             )
-            result = self._manager.submit_sct_block(job_id, extranonce2, ntime, nonce)
+            result = self._manager.submit_sct_block(
+                job_id, self.extranonce1, extranonce2, ntime, nonce
+            )
             if result and result.get("status") == "connected":
                 logger.info("SCT block accepted: %s", result.get("hash"))
             else:
@@ -243,12 +287,10 @@ class StratumSession:
     # ── helpers ────────────────────────────────────────────────────────
 
     async def _send_result(self, req_id: int | None, result: object) -> None:
-        resp = StratumResponse(result=result, id=req_id)
-        self._writer.write(resp.encode().encode() + b"\n")
+        await self._write(StratumResponse(result=result, id=req_id).encode() + "\n")
 
     async def _send_error(self, req_id: int | None, code: int, message: str) -> None:
-        resp = StratumResponse(error=(code, message, None), id=req_id)
-        self._writer.write(resp.encode().encode() + b"\n")
+        await self._write(StratumResponse(error=(code, message, None), id=req_id).encode() + "\n")
 
 
 # ── server ──────────────────────────────────────────────────────────────
@@ -272,6 +314,7 @@ class StratumServer:
         self._sessions: set[StratumSession] = set()
         self._server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
+        self._refresh_task: asyncio.Task | None = None
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -279,13 +322,18 @@ class StratumServer:
     def sessions(self) -> int:
         return len(self._sessions)
 
+    @property
+    def port(self) -> int:
+        """The port actually bound (useful when 0 was requested)."""
+        if self._server is None or not self._server.sockets:
+            return self._port
+        return int(self._server.sockets[0].getsockname()[1])
+
     async def start(self) -> None:
-        """Start the Stratum server and job refresh loop."""
+        """Start the Stratum server and the job refresh loop."""
         self._server = await asyncio.start_server(self._handle_connection, self._host, self._port)
         addr = self._server.sockets[0].getsockname()
         logger.info("Stratum server listening on %s:%s", addr[0], addr[1])
-
-        # Run job refresh loop in background
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
     async def stop(self) -> None:
@@ -327,19 +375,17 @@ class StratumServer:
             try:
                 job = self._manager.refresh()
                 logger.debug(
-                    "new job %s (height=%s, target=%s)",
+                    "new job %s (sct height=%s, share target=%064x)",
                     job.job_id,
-                    job.parent.height,
-                    f"{job.scarlet.target:064x}"[:16],
+                    job.scarlet.height,
+                    self._manager.share_target,
                 )
-                # Push to all sessions
                 for session in list(self._sessions):
                     if session.authorized:
                         with contextlib.suppress(Exception):
                             await session.send_job(clean=True)
             except Exception as exc:
                 logger.error("job refresh failed: %s", exc)
-            # Sleep, checking stop periodically
             for _ in range(int(self._job_interval)):
                 if self._stop.is_set():
                     return
@@ -351,34 +397,36 @@ class StratumServer:
 
 def create_server(
     *,
-    scarlet_url: str = "http://127.0.0.1:40332",
+    scarlet_url: str = "http://127.0.0.1:20332",
     scarlet_token: str | None = None,
     scarlet_address: str = "",
     host: str = "0.0.0.0",
     port: int = 3333,
-    chain_id: int = 3,
     job_interval: float = 30.0,
+    share_difficulty: float = DEFAULT_SHARE_DIFFICULTY,
+    chain_id: int = 0,
+    parent: ParentChainClient | None = None,
 ) -> StratumServer:
-    """Factory: build a Stratum server wired to a ScarletCoin node.
+    """Build a Stratum server wired to a ScarletCoin node.
 
-    Uses :class:`SimulatedParentChain` for the parent Bitcoin side;
-    swap with a real ``bitcoind`` RPC client for production.
+    The parent chain defaults to :class:`SimulatedParentChain`, which mines
+    ScarletCoin on its own; pass a real ``BitcoinCoreClient`` for BTC merged
+    mining.  Set *chain_id* to refuse to start against the wrong network
+    (1 = mainnet, 2 = testnet, 3 = regtest); 0 disables the check.
     """
     scarlet = RpcClient(scarlet_url, token=scarlet_token, timeout=30.0)
-    parent: ParentChainClient = SimulatedParentChain()
-
     manager = JobManager(
-        bitcoin=parent,
+        bitcoin=parent if parent is not None else SimulatedParentChain(),
         scarlet=scarlet,
         payout_address=scarlet_address,
         chain_id=chain_id,
+        share_difficulty=share_difficulty,
         coinbase_builder=CoinbaseBuilder(),
     )
-
     return StratumServer(host=host, port=port, manager=manager, job_interval=job_interval)
 
 
-if __name__ == "__main__":
+def _main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="ScarletCoin merged-mining Stratum bridge")
@@ -390,51 +438,48 @@ if __name__ == "__main__":
     parser.add_argument(
         "--scarlet-token",
         default=None,
-        help="ScarletCoin RPC bearer token (omit if node runs without one)",
+        help="ScarletCoin RPC bearer token (omit when the node runs --rpc-public-mining)",
     )
+    parser.add_argument("--payout-address", default="", help="SCT address for block rewards")
+    parser.add_argument("--host", default="0.0.0.0", help="Stratum listen address")
+    parser.add_argument("--port", type=int, default=3333, help="Stratum listen port")
+    parser.add_argument("--job-interval", type=float, default=30.0, help="Seconds between new jobs")
     parser.add_argument(
-        "--payout-address",
-        default="",
-        help="SCT address that receives block rewards",
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Stratum listen address (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=3333,
-        help="Stratum listen port (default: 3333)",
+        "--share-difficulty",
+        type=float,
+        default=DEFAULT_SHARE_DIFFICULTY,
+        help="Stratum share difficulty (throttles miner submissions, default: 1.0)",
     )
     parser.add_argument(
         "--chain-id",
         type=int,
         default=1,
-        help="AuxPoW chain ID (1=mainnet, 2=testnet, 3=regtest; default: 1)",
-    )
-    parser.add_argument(
-        "--job-interval",
-        type=float,
-        default=30.0,
-        help="Seconds between template refresh / new job broadcast (default: 30)",
+        help="Expected AuxPoW chain id: 1=mainnet, 2=testnet, 3=regtest (0 disables the check)",
     )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if not args.payout_address:
+        parser.error("--payout-address is required: it receives every SCT block reward")
+
     server = create_server(
         scarlet_url=args.scarlet_url,
         scarlet_token=args.scarlet_token,
         scarlet_address=args.payout_address,
         host=args.host,
         port=args.port,
-        chain_id=args.chain_id,
         job_interval=args.job_interval,
+        share_difficulty=args.share_difficulty,
+        chain_id=args.chain_id,
     )
-    print(f"Stratum server starting on {args.host}:{args.port}")
-    print(f"ScarletCoin node: {args.scarlet_url}")
-    print(f"Payout address: {args.payout_address or '(none - rewards burned)'}")
-    print(f"Chain ID: {args.chain_id}")
-    print(f"Connect your ASIC miners to stratum+tcp://<this-host>:{args.port}")
+    logger.info("ScarletCoin node: %s", args.scarlet_url)
+    logger.info("Payout address: %s", args.payout_address)
+    logger.info("Share difficulty: %s", args.share_difficulty)
+    logger.info("Expected chain id: %s", args.chain_id)
+    logger.info("Miners connect to stratum+tcp://%s:%s", args.host, args.port)
     asyncio.run(server.serve_forever())
+
+
+if __name__ == "__main__":
+    _main()

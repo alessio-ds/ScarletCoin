@@ -235,11 +235,16 @@ class TestPublicRpcSurface:
         assert answer["disk_bytes"] >= answer["chain_bytes"]
 
     def test_getinfo_says_how_big_the_chain_is(self, rpc):
-        _, _, client = rpc
+        node, _, client = rpc
         info = client.getinfo()
         for field in ("chain_bytes", "chain_size", "disk_bytes", "disk_size", "prune_height"):
             assert field in info
-        assert info["chain_size"] == "219 B"
+        # At height 0 the chain is exactly the genesis block, serialised in the
+        # same wire format as every other block (no AuxPoW trailer on a native
+        # block).
+        genesis_bytes = len(node.params.genesis_block.serialize())
+        assert info["chain_bytes"] == genesis_bytes
+        assert info["chain_size"] == f"{genesis_bytes} B"
 
     def test_estimatefee_is_public_and_has_a_floor(self, rpc):
         node, _, client = rpc

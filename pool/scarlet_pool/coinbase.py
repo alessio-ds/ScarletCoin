@@ -1,76 +1,143 @@
-"""Parent (Bitcoin) coinbase construction with ScarletCoin AuxPoW commitment.
+"""Parent coinbase construction carrying a ScarletCoin AuxPoW commitment.
 
-The pool constructs a Bitcoin coinbase that:
-1. Follows standard Bitcoin coinbase layout
-2. Includes the ScarletCoin merged-mining commitment (fa be 6d 6d || aux_root || ...)
-3. Leaves room for the ASIC's extranonce1/extranonce2
+The "parent" coinbase in an AuxPoW proof is represented by the consensus code
+as an ordinary :class:`~scarletcoin.core.transaction.Transaction` whose
+``coinbase_data`` field holds the merged-mining commitment.  That is the format
+:class:`~scarletcoin.core.auxpow.AuxPoW` serialises and validates, so the pool
+must build the same thing — a real ``bitcoind`` coinbase would not parse.
 
-The coinbase is split into ``coinbase1`` (prefix) and ``coinbase2`` (suffix)
-for the Stratum protocol, where ``extranonce1 + extranonce2`` are inserted
-between them by the miner.
+The coinbase body looks like this::
+
+    uint32   version
+    varint   1                      (one input)
+    bytes32  null prevout hash
+    uint32   0xFFFFFFFF             (null prevout index)
+    uint32   0xFFFFFFFF             (final sequence)
+    varint   1                      (one output)
+    uint8    output type            (0 = P2PKH)
+    uint64   value
+    bytes20  payout hash
+    uint32   lock time
+    varbytes coinbase_data          = height (uint32 LE) || extranonces || commitment
+
+Stratum splits it so the miner can vary the two extranonces::
+
+    body = coinbase1 || extranonce1 || extranonce2 || coinbase2
+
+The transaction id — and therefore the Merkle leaf — is ``hash256(body)``, so
+the pool and the miner hash exactly the bytes between the two halves.
+
+All 32-byte hashes are in **internal** (little-endian) byte order, which is the
+order they occupy in a serialised header and the order Stratum puts on the
+wire.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
 from scarletcoin.core.serialize import Writer
-from scarletcoin.crypto.hashing import hash256
+from scarletcoin.core.transaction import (
+    MAX_COINBASE_DATA,
+    OUTPUT_P2PKH,
+    SEQUENCE_FINAL,
+    Transaction,
+)
+from scarletcoin.crypto.hashing import PUBKEY_HASH_LENGTH, hash256
 
-__all__ = ["CoinbaseBuilder", "ParentCoinbase", "compute_merkle_root"]
+__all__ = [
+    "CoinbaseBuilder",
+    "ParentCoinbase",
+    "coinbase_merkle_branch",
+    "compute_merkle_root",
+    "parse_coinbase_body",
+]
 
-#: Standard coinbase input outpoint (null hash, max index).
-_COINBASE_OUTPOINT_TXID: Final[bytes] = b"\x00" * 32
-_COINBASE_OUTPOINT_INDEX: Final[int] = 0xFFFFFFFF
-#: Coinbase input sequence number.
-_COINBASE_SEQUENCE: Final[int] = 0xFFFFFFFF
+#: The null outpoint every coinbase input spends.
+_NULL_HASH: Final[bytes] = b"\x00" * 32
+_NULL_INDEX: Final[int] = 0xFFFFFFFF
 
-#: Maximum coinbase script size Bitcoin Core accepts by default.
-MAX_COINBASE_SCRIPTSIG = 100
+#: Default payout hash for the **parent** coinbase's single output.
+#:
+#: When the parent chain is simulated this output is never spendable and its
+#: value is irrelevant — only the commitment inside ``coinbase_data`` matters.
+#: It is a placeholder, not a burn address anyone should send to.
+DEFAULT_PARENT_PAYOUT_HASH: Final[bytes] = b"\x00" * PUBKEY_HASH_LENGTH
 
 
 @dataclass(frozen=True)
 class ParentCoinbase:
-    """A pre-constructed parent (Bitcoin) coinbase split for Stratum."""
+    """A parent coinbase body split for Stratum."""
 
     coinbase1: str
-    """Hex-encoded prefix: version, inputs, script up to extranonce1."""
+    """Hex prefix, ending just before ``extranonce1``."""
     coinbase2: str
-    """Hex-encoded suffix: rest of script after extranonce2, outputs, locktime."""
+    """Hex suffix, starting just after ``extranonce2`` (the commitment)."""
     coinbase_value: int
-    """Total output value in satoshis (subsidy + fees)."""
-    extranonce1: str
-    """Hex-encoded extranonce1 assigned to this connection."""
+    """Output value in satoshis."""
+    extranonce1_size: int
+    """Bytes ``mining.subscribe`` hands the miner."""
     extranonce2_size: int
-    """Number of bytes the miner may append for extranonce2."""
+    """Bytes the miner may choose for ``extranonce2``."""
+    coinbase_data_size: int
+    """Total length of the ``coinbase_data`` field this layout produces."""
 
 
-def compute_merkle_root(coinbase_hash: bytes, txids: list[bytes]) -> bytes:
-    """Compute the Merkle root from *coinbase_hash* and *txids*.
-
-    Uses the same duplication rule as Bitcoin/ScarletCoin.
-    """
+def compute_merkle_root(coinbase_hash: bytes, txids: Sequence[bytes]) -> bytes:
+    """Compute a Merkle root from *coinbase_hash* and *txids* (internal order)."""
     from scarletcoin.core.block import merkle_root
 
     return merkle_root([coinbase_hash, *txids])
 
 
-class CoinbaseBuilder:
-    """Builds parent Bitcoin coinbases containing ScarletCoin AuxPoW commitments.
+def coinbase_merkle_branch(txids: Sequence[bytes]) -> list[bytes]:
+    """Return the Merkle branch proving the coinbase (leaf 0) is in the tree.
 
-    The builder is initialised once with pool-wide settings; each call to
-    :meth:`build` produces a fresh coinbase for a new job.
+    The coinbase is always the leftmost leaf, so every sibling on the path to
+    the root is on the right-hand side of the tree and is built purely from
+    *txids*.  The branch can therefore be computed before the coinbase exists,
+    which is what a pool needs: the coinbase hash depends on the miner's
+    extranonces.
+
+    Args:
+        txids: The non-coinbase transaction ids, in internal byte order.
+
+    Returns:
+        The sibling hashes, nearest first, in internal byte order.
     """
+    # A placeholder stands in for the coinbase: it only ever feeds index 0 of
+    # each level, and index 0 is never selected as a sibling.
+    level: list[bytes] = [b"\x00" * 32, *txids]
+    branches: list[bytes] = []
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        branches.append(level[1])
+        level = [hash256(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+    return branches
+
+
+def parse_coinbase_body(body: bytes) -> Transaction:
+    """Parse a coinbase *body* into a :class:`Transaction`.
+
+    ``Transaction.serialize_body`` omits the per-input witness counts that the
+    wire format carries, so a trailing zero byte is appended to make the body a
+    complete, parseable transaction.
+    """
+    return Transaction.deserialize(body + b"\x00")
+
+
+class CoinbaseBuilder:
+    """Builds parent coinbases containing ScarletCoin AuxPoW commitments."""
 
     def __init__(
         self,
         *,
-        pool_tag: bytes = b"/scarlet-pool/",
         extranonce1_size: int = 4,
         extranonce2_size: int = 4,
     ) -> None:
-        self.pool_tag = pool_tag[:80]  # keep scriptSig small
         self.extranonce1_size = max(1, min(extranonce1_size, 16))
         self.extranonce2_size = max(1, min(extranonce2_size, 16))
 
@@ -79,109 +146,92 @@ class CoinbaseBuilder:
         *,
         coinbase_value: int,
         block_height: int,
-        payout_script: bytes,
+        payout_hash: bytes,
         aux_commitment: bytes,
-        extranonce1: bytes,
     ) -> ParentCoinbase:
         """Build a parent coinbase carrying an AuxPoW commitment.
 
         Args:
-            coinbase_value: Total output value in satoshis (subsidy + fees).
-            block_height: Bitcoin block height (BIP-34).
-            payout_script: The pool's payout output script.
+            coinbase_value: Output value in satoshis.
+            block_height: Height committed to at the start of ``coinbase_data``.
+            payout_hash: The 20-byte payout hash for the single output.
             aux_commitment: The serialised AuxPoW commitment bytes.
-            extranonce1: Unique bytes for this connection (4-16 bytes).
 
         Returns:
             A :class:`ParentCoinbase` ready for Stratum job assembly.
         """
-        # -- Build the coinbase input script ----------------------------------
-        # BIP-34 height prefix
-        height_prefix = self._bip34_height(block_height)
-        # Script:  height_prefix || pool_tag || extranonce1 || <extranonce2> || aux_commitment
-        script_prefix = height_prefix + self.pool_tag
-        script_suffix = aux_commitment
+        if not 0 <= block_height <= 0xFFFFFFFF:
+            raise ValueError(f"block height out of range: {block_height}")
+        if len(payout_hash) != PUBKEY_HASH_LENGTH:
+            raise ValueError(
+                f"payout hash must be {PUBKEY_HASH_LENGTH} bytes, got {len(payout_hash)}"
+            )
 
-        # Build coinbase1 = everything up to (and including) extranonce1
+        data_size = 4 + self.extranonce1_size + self.extranonce2_size + len(aux_commitment)
+        if data_size > MAX_COINBASE_DATA:
+            raise ValueError(
+                f"coinbase_data would be {data_size} bytes, over the {MAX_COINBASE_DATA}-byte limit"
+            )
+
         w = Writer()
         w.uint32(1)  # version
         w.varint(1)  # input count
-        w.hash32(_COINBASE_OUTPOINT_TXID)
-        w.uint32(_COINBASE_OUTPOINT_INDEX)
-        # scriptSig: placeholder length that covers prefix + extranonce1 + extranonce2 + suffix
-        total_script_len = (
-            len(script_prefix) + self.extranonce1_size + self.extranonce2_size + len(script_suffix)
-        )
-        w.varint(total_script_len)
-        w.raw(script_prefix)
-        w.raw(extranonce1)
+        w.hash32(_NULL_HASH)  # prevout hash
+        w.uint32(_NULL_INDEX)  # prevout index
+        w.uint32(SEQUENCE_FINAL)  # sequence
+        w.varint(1)  # output count
+        w.uint8(OUTPUT_P2PKH)  # output type
+        w.uint64(coinbase_value)  # output value
+        w.raw(payout_hash)  # output payload
+        w.uint32(0)  # lock time
+        w.varint(data_size)  # coinbase_data length
+        w.raw(block_height.to_bytes(4, "little"))  # height prefix
         coinbase1 = w.getvalue().hex()
 
-        # Build coinbase2 = everything after extranonce2
-        w2 = Writer()
-        w2.raw(script_suffix)  # the AuxPoW commitment (goes after extranonce2)
-        w2.uint32(_COINBASE_SEQUENCE)
-        # Outputs
-        w2.varint(1)  # one output
-        w2.raw(payout_script)
-        w2.uint32(0)  # lock_time
-        coinbase2 = w2.getvalue().hex()
+        # Everything after the two extranonces: the commitment.
+        coinbase2 = aux_commitment.hex()
 
         return ParentCoinbase(
             coinbase1=coinbase1,
             coinbase2=coinbase2,
             coinbase_value=coinbase_value,
-            extranonce1=extranonce1.hex(),
+            extranonce1_size=self.extranonce1_size,
             extranonce2_size=self.extranonce2_size,
+            coinbase_data_size=data_size,
         )
-
-    @staticmethod
-    def _bip34_height(height: int) -> bytes:
-        """BIP-34 height prefix for the coinbase script."""
-        if height <= 16:
-            return bytes([0x51 + height])
-        if height <= 127:
-            return bytes([1, height])
-        if height <= 0x7FFF:
-            return bytes([2]) + height.to_bytes(2, "little")
-        return bytes([3]) + height.to_bytes(4, "little")
 
     @staticmethod
     def reconstruct_header(
         coinbase1_hex: str,
+        extranonce1_hex: str,
         extranonce2_hex: str,
         coinbase2_hex: str,
-        merkle_branches: list[str],
+        merkle_branches_hex: Sequence[str],
         prev_hash_hex: str,
         version: int,
         nbits: int,
         ntime: int,
         nonce: int,
     ) -> bytes:
-        """Reconstruct the 80-byte parent header from Stratum submission data.
+        """Reconstruct the 80-byte parent header a miner says it hashed.
 
-        This is the exact header the ASIC hashed.  We rebuild the full coinbase,
-        compute its txid, calculate the Merkle root, and assemble the header.
+        Everything is in internal byte order, exactly as it went out in
+        ``mining.notify``: the miner assembled the coinbase, hashed it, folded
+        in the branch and filled the header.
 
         Returns:
-            The 80-byte little-endian serialised block header (internal order).
+            The 80-byte serialised parent block header (internal order).
         """
-        # Reconstruct full coinbase
-        parts = [bytes.fromhex(h) for h in (coinbase1_hex, extranonce2_hex, coinbase2_hex)]
-        coinbase = b"".join(parts)
-        coinbase_hash = hash256(coinbase)
+        parts = (coinbase1_hex, extranonce1_hex, extranonce2_hex, coinbase2_hex)
+        coinbase = b"".join(bytes.fromhex(part) for part in parts)
 
-        # Compute Merkle root
-        branches = [bytes.fromhex(b)[::-1] for b in merkle_branches]  # display → internal
-        root = coinbase_hash
-        for sibling in branches:
-            root = hash256(root + sibling)
+        root = hash256(coinbase)
+        for sibling_hex in merkle_branches_hex:
+            root = hash256(root + bytes.fromhex(sibling_hex))
 
-        # Build header
-        prev_hash = bytes.fromhex(prev_hash_hex)[::-1]  # display → internal
         w = Writer()
         w.uint32(version)
-        w.hash32(prev_hash)
+        w.hash32(bytes.fromhex(prev_hash_hex))
         w.hash32(root)
         w.uint32(ntime)
         w.uint32(nbits)

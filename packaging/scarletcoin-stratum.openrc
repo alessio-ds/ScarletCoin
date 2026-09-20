@@ -6,21 +6,30 @@ description="ScarletCoin merged-mining Stratum bridge"
 # -- You MUST set these before starting --------------------------------
 # The SCT address that receives block rewards.
 : ${payout_address:=Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
-# The node's RPC token.  Find it with:
+# The node's RPC token.  Only needed when the node does NOT run with
+# --rpc-public-mining.  Find it with:
 #   cat /var/lib/scarletcoin/mainnet/rpc.token
 : ${scarlet_token:=}
 : ${scarlet_url:=http://127.0.0.1:20332}
+# 1 = mainnet, 2 = testnet, 3 = regtest.  The bridge refuses to start
+# against a node whose chain id does not match, rather than building
+# proofs the node would reject.
 : ${chain_id:=1}
 : ${port:=3333}
 : ${host:=0.0.0.0}
+# Stratum share difficulty (NOT the chain difficulty).  It throttles how
+# often a miner submits, and therefore how often the bridge submits a
+# block.  See docs/MERGED-MINING.md.
+: ${share_difficulty:=1}
 # ---------------------------------------------------------------------
 
 command="/opt/scarletcoin/.venv/bin/python"
 command_args="-m pool.scarlet_pool.server
     --scarlet-url ${scarlet_url}
-    --scarlet-token ${scarlet_token}
+    ${scarlet_token:+--scarlet-token ${scarlet_token}}
     --payout-address ${payout_address}
     --chain-id ${chain_id}
+    --share-difficulty ${share_difficulty}
     --host ${host}
     --port ${port}
     --job-interval 30"
@@ -39,14 +48,12 @@ depend() {
 
 start_pre() {
     checkpath -d -o scarlet:scarlet -m 0750 /var/log/scarletcoin
-    if [ -z "${scarlet_token}" ]; then
-        eerror "scarlet_token is not set."
-        eerror "Find it at: /var/lib/scarletcoin/mainnet/rpc.token"
-        return 1
-    fi
     if [ "${payout_address}" = "Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ]; then
         eerror "payout_address is still the placeholder."
         eerror "Set it to your actual SCT address in /etc/conf.d/scarletcoin-stratum"
         return 1
+    fi
+    if ! wget -q -T 5 -O /dev/null "${scarlet_url}/api/info"; then
+        ewarn "could not reach ${scarlet_url} yet; the bridge will keep retrying"
     fi
 }

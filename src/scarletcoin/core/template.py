@@ -176,6 +176,14 @@ class AuxBlockCandidate:
     """The integer target the parent PoW must not exceed."""
     commitment_nonce: int
     """Random 32-bit nonce for the deterministic index calculation."""
+    timestamp: int
+    """The exact header timestamp this candidate was frozen with.
+
+    The AuxPoW proof commits to :attr:`aux_block_hash`, which is the hash of a
+    header carrying this timestamp.  The block must be rebuilt with the *same*
+    timestamp or the reconstructed hash will not match the commitment and the
+    proof will be rejected, so this value is stored rather than recomputed.
+    """
     pubkey_hash: bytes
     """The 20-byte pubkey hash that will receive the block reward."""
     transactions: tuple[Transaction, ...] = field(default_factory=tuple)
@@ -194,11 +202,18 @@ class AuxBlockCandidate:
             "coinbasehash": self.coinbase_hash[::-1].hex(),
             "tree_size": 1,
             "nonce": self.commitment_nonce,
+            "timestamp": self.timestamp,
             "pubkey_hash": self.pubkey_hash.hex(),
         }
 
     def build_block(self) -> Block:
-        """Reconstruct the full ScarletCoin block from this candidate."""
+        """Reconstruct the full ScarletCoin block from this candidate.
+
+        The rebuilt block is byte-identical to the one whose hash was frozen in
+        :attr:`aux_block_hash`: same coinbase, same transactions, same bits,
+        same timestamp, same version and nonce.  Any deviation would break the
+        AuxPoW commitment.
+        """
         from scarletcoin.core.block import Block
         from scarletcoin.core.coinbase import build_coinbase
 
@@ -212,7 +227,7 @@ class AuxBlockCandidate:
             prev_hash=self.prev_hash,
             transactions=[coinbase, *self.transactions],
             bits=self.bits,
-            timestamp=int(time.time()),
+            timestamp=self.timestamp,
             version=1,
             nonce=0,
         )
@@ -289,6 +304,7 @@ def create_aux_block(
         chain_id=params.auxpow_chain_id,
         target=bits_to_target(bits),
         commitment_nonce=commitment_nonce,
+        timestamp=current_time,
         pubkey_hash=pubkey_hash,
         transactions=tuple(transactions),
     )

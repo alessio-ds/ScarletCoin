@@ -236,7 +236,11 @@ MAINNET = ChainParams(
     # started, not stay complete.
     public_nodes=("https://scarletcoin.remotewire.net",),
     auxpow_chain_id=1,
-    auxpow_activation_height=None,  # Not yet activated on mainnet
+    # Activated at a fixed height so every operator has a definite cutover
+    # point.  Before this height an AuxPoW block is rejected outright; after
+    # it, both native and merged-mined blocks are valid, so the existing CPU
+    # miner keeps working exactly as before.
+    auxpow_activation_height=47_000,
 )
 
 TESTNET = ChainParams(

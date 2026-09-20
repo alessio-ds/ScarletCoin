@@ -225,8 +225,17 @@ class Block:
             [ScarletCoin header  (80 bytes)]
             [transaction count  (varint)]
             [transactions …]
-            [AuxPoW marker]         0x00 = no AuxPoW, 0x01 = AuxPoW follows
+            [AuxPoW marker]         0x01 = AuxPoW payload follows (optional)
             [AuxPoW payload]        only present when marker is 0x01
+
+        A block **without** an AuxPoW proof serialises exactly as it did before
+        merged mining existed (header, count, transactions) — no trailing bytes
+        at all.  This keeps the wire format and the on-disk ``blocks.raw``
+        column byte-for-byte compatible with pre-AuxPoW releases, so nodes that
+        have not been upgraded still accept and relay ordinary blocks, and an
+        upgraded node can read a database written by an older one.
+
+        Only merged-mined blocks carry the extra ``0x01`` marker and payload.
         """
         writer = Writer()
         writer.raw(self.header.serialize())
@@ -236,15 +245,16 @@ class Block:
         if self.auxpow is not None:
             auxpow: AuxPoW = self.auxpow  # type: ignore[no-redef]
             writer.uint8(0x01)
-            aux_data = auxpow.serialize()
-            writer.varbytes(aux_data)
-        else:
-            writer.uint8(0x00)
+            writer.varbytes(auxpow.serialize())
         return writer.getvalue()
 
     @classmethod
     def deserialize(cls, data: bytes) -> Block:
-        """Parse a block from its wire format."""
+        """Parse a block from its wire format.
+
+        A block that ends right after its transactions is a native-PoW block;
+        a trailing ``0x01`` marker introduces an AuxPoW proof.
+        """
         reader = Reader(data)
         header = BlockHeader.read(reader)
         count = reader.varint()
@@ -253,17 +263,15 @@ class Block:
         if count > reader.remaining:
             raise SerializationError("transaction count is larger than the remaining data")
         transactions = tuple(Transaction.read(reader) for _ in range(count))
-        # Check for AuxPoW marker if any bytes remain
+        # An AuxPoW proof, if present, is introduced by a single 0x01 marker.
         auxpow = None
         if reader.remaining > 0:
             marker = reader.uint8()
-            if marker == 0x01:
-                from scarletcoin.core.auxpow import AuxPoW
-
-                aux_data = reader.varbytes()
-                auxpow = AuxPoW.deserialize(aux_data)
-            elif marker != 0x00:
+            if marker != 0x01:
                 raise SerializationError(f"unknown AuxPoW marker: {marker:#04x}")
+            from scarletcoin.core.auxpow import AuxPoW
+
+            auxpow = AuxPoW.deserialize(reader.varbytes())
         reader.expect_end()
         return cls(header, transactions, auxpow=auxpow)
 

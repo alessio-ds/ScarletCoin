@@ -468,6 +468,51 @@ class TestAuxPoWBlock:
         assert block2.has_auxpow is False
         assert block2.auxpow is None
 
+    def test_native_block_has_no_auxpow_trailer(self, key):
+        """A native block must be byte-identical to the pre-AuxPoW wire format.
+
+        This is a compatibility guarantee: an un-upgraded node has to be able
+        to parse and relay ordinary blocks, and the on-disk ``blocks.raw``
+        column must stay readable by older releases.
+        """
+        block = mine_block(make_chain(), key)
+        data = block.serialize()
+        legacy = block.header.serialize()
+        # header + varint count + every transaction, and nothing else.
+        assert data[:80] == legacy
+        assert len(data) == 80 + 1 + sum(len(tx.serialize()) for tx in block.transactions)
+        assert data == block.header.serialize() + b"\x01" + b"".join(
+            tx.serialize() for tx in block.transactions
+        )
+
+    def test_auxpow_block_appends_exactly_one_marker(self, key):
+        """An AuxPoW block is a native block plus 0x01 plus a length-prefixed payload."""
+        block = mine_block(make_chain(), key)
+        native = block.serialize()
+        auxpow = AuxPoW(
+            _make_coinbase_tx(100, 50 * 10**8, b"test"),
+            (),
+            0,
+            (),
+            0,
+            _make_parent_header(),
+        )
+        payload = auxpow.serialize()
+        data = block.with_auxpow(auxpow).serialize()
+        assert data[: len(native)] == native
+        assert data[len(native)] == 0x01
+        # varint length prefix (payload is small, so a single byte) + payload
+        assert data[len(native) + 1 :] == bytes([len(payload)]) + payload
+        assert Block.deserialize(data).has_auxpow is True
+
+    def test_zero_marker_is_rejected(self, key):
+        """The old 0x00 'no AuxPoW' marker is no longer part of the format."""
+        from scarletcoin.core.serialize import SerializationError
+
+        block = mine_block(make_chain(), key)
+        with pytest.raises(SerializationError, match="unknown AuxPoW marker"):
+            Block.deserialize(block.serialize() + b"\x00")
+
     def test_block_serialization_with_auxpow(self, key):
         """Block with AuxPoW payload round-trips through serialization."""
         from scarletcoin.core.auxpow import AuxPoW
@@ -677,6 +722,33 @@ class TestAuxBlockCandidate:
         chain = make_chain(params=params)
         with pytest.raises(ValueError, match="not configured"):
             create_aux_block(chain, pubkey_hash=key.public_key().hash160())
+        chain.storage.close()
+
+    def test_candidate_hash_is_stable_after_a_delay(self, key, monkeypatch):
+        """The rebuilt block must hash to the committed value even seconds later.
+
+        The AuxPoW proof commits to ``aux_block_hash``.  If ``build_block``
+        recomputed the header timestamp at submission time the hash would drift
+        and every proof would be rejected, so the frozen timestamp must be
+        reused.
+        """
+        import scarletcoin.core.template as template_module
+
+        chain, pool = make_node_state()
+        candidate = create_aux_block(chain, pool, pubkey_hash=key.public_key().hash160())
+        # Simulate the job being handed to a miner and a share arriving much
+        # later (a real pool refreshes jobs every 30 seconds).
+        monkeypatch.setattr(template_module.time, "time", lambda: 2_000_000_000)
+        block = candidate.build_block()
+        assert block.header.timestamp == candidate.timestamp
+        assert block.hash() == candidate.aux_block_hash
+        chain.storage.close()
+
+    def test_candidate_to_dict_exposes_timestamp(self, key):
+        """``to_dict`` exposes the frozen timestamp for pool bookkeeping."""
+        chain, pool = make_node_state()
+        candidate = create_aux_block(chain, pool, pubkey_hash=key.public_key().hash160())
+        assert candidate.to_dict()["timestamp"] == candidate.timestamp
         chain.storage.close()
 
 

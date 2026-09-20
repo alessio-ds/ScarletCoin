@@ -48,19 +48,22 @@ chmod -R a+rX /opt/scarletcoin
 #   UV_PYTHON_DOWNLOADS=never uv sync --python /usr/bin/python3
 ```
 
-### 2. Find the RPC token
+### 2. Check the mining RPC is available
 
-The node auto-generates a token on first start:
-
-```sh
-cat /var/lib/scarletcoin/mainnet/rpc.token
-```
-
-If that file doesn't exist, look in the node's startup log:
+`createauxblock` and `submitauxblock` are mining methods. The reference node
+already runs with `--rpc-public-mining`, so they are reachable on localhost
+without a token. Confirm it:
 
 ```sh
-grep -i token /var/log/scarletcoin/node.log | tail -1
+curl -s -X POST http://127.0.0.1:20332/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"createauxblock","params":["<your-sct-address>"]}'
 ```
+
+A JSON object with `hash`, `target`, `chainid` and `nonce` means you are good.
+If you get an authorization error instead, the node needs `--rpc-public-mining`
+in `/etc/init.d/scarlet-node`, or the bridge needs `--scarlet-token` (the token
+is in `/var/lib/scarletcoin/mainnet/rpc.token`).
 
 ### 3. Test the bridge manually
 
@@ -68,21 +71,20 @@ grep -i token /var/log/scarletcoin/node.log | tail -1
 su -s /bin/sh scarlet -c \
   'cd /opt/scarletcoin && /opt/scarletcoin/.venv/bin/python -m pool.scarlet_pool.server \
     --scarlet-url http://127.0.0.1:20332 \
-    --scarlet-token YOUR_TOKEN_HERE \
-    --payout-address Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
-    --chain-id 1'
+    --payout-address <your-sct-address> \
+    --chain-id 1 \
+    --share-difficulty 1'
 ```
 
-It should print:
+You should see the listening line and a first job:
+
 ```
-Stratum server starting on 0.0.0.0:3333
-ScarletCoin node: http://127.0.0.1:20332
-Payout address: Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-Chain ID: 1
+Stratum server listening on 0.0.0.0:3333
 ```
 
-Press Ctrl-C once you've confirmed it starts.  If it exits with
-`"AuxPoW is not configured"` you used the wrong `--chain-id` (mainnet = 1).
+Press Ctrl-C once you have confirmed it starts. If it exits with a
+`chain id` error, the node is not on the network you asked for. If it exits
+with `AuxPoW is not configured`, the node predates AuxPoW.
 
 ### 4. Install as an OpenRC service
 
@@ -93,18 +95,20 @@ chmod +x /etc/init.d/scarletcoin-stratum
 
 # Create the config file with your real values
 cat > /etc/conf.d/scarletcoin-stratum <<'EOF'
-payout_address="Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-scarlet_token="YOUR_TOKEN_HERE"
+payout_address="<your-sct-address>"
 scarlet_url="http://127.0.0.1:20332"
 chain_id="1"
 port="3333"
 host="0.0.0.0"
+share_difficulty="1"
 EOF
 
 # Enable and start
 rc-update add scarletcoin-stratum default
 rc-service scarletcoin-stratum start
 ```
+
+Leave `scarlet_token` unset while the node runs `--rpc-public-mining`.
 
 ### 5. Open the Stratum port
 
@@ -143,25 +147,18 @@ Pass:   x  (ignored)
 Any Bitcoin ASIC (Antminer, Whatsminer, Avalon) or CPU miner that speaks
 Stratum V1 can connect.
 
-## Bitcoin dual-mining (BTC + SCT)
+## This bridge mines SCT only
 
-The current reference bridge uses `SimulatedParentChain` — it generates fake
-solveable parent headers so miners earn SCT only. To add real BTC dual-mining:
+`SimulatedParentChain` generates the parent header the ASIC hashes. That is not
+a shortcut — it is what the consensus rules require: ScarletCoin validates the
+parent coinbase as one of its **own** transactions, with the commitment in that
+transaction's `coinbase_data` field, so a coinbase taken from a real `bitcoind`
+would not parse. No BTC is mined and no BTC reward exists.
 
-1. Run **Bitcoin Core** on the same server:
-   ```sh
-   bitcoind -rpcuser=pool -rpcpassword=securepassword
-   ```
-
-2. Replace `SimulatedParentChain` with a `BitcoinCoreClient` that wraps
-   `bitcoind` RPC (not yet implemented — see `pool/scarlet_pool/jobs.py`
-   `ParentChainClient` protocol).
-
-3. The bridge will then:
-   - Fetch real Bitcoin block templates
-   - Build real Bitcoin coinbases (with SCT commitment)
-   - Submit valid Bitcoin blocks back to `bitcoind`
-   - Earn real BTC block rewards alongside SCT
+The ASIC cannot tell the difference, so this is exactly what you want for
+mining ScarletCoin with Bitcoin hardware. Supporting a genuine Bitcoin parent
+would mean adding a Bitcoin-format coinbase parser to the consensus validation
+path — a consensus change, not a configuration option.
 
 ## Monitoring
 
