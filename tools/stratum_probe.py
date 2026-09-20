@@ -106,6 +106,20 @@ class Job:
     ntime: str
 
 
+def _job_from(params: list) -> Job:
+    """Build a :class:`Job` from a ``mining.notify`` params list."""
+    return Job(
+        job_id=params[0],
+        prev_hash=params[1],
+        coinbase1=params[2],
+        coinbase2=params[3],
+        branches=params[4],
+        version=params[5],
+        nbits=params[6],
+        ntime=params[7],
+    )
+
+
 def coinbase_for(job: Job, extranonce1: str, extranonce2: str) -> bytes:
     """Assemble the coinbase the way an ASIC does."""
     return bytes.fromhex(job.coinbase1 + extranonce1 + extranonce2 + job.coinbase2)
@@ -242,35 +256,43 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("authorized")
 
-        # Resolve the target we must beat to produce a *block* (not just a share).
+        # Resolve the target we must beat to produce a *block* (not just a
+        # share).  Fetch it only after a job arrives and check it describes the
+        # same tip: the node retargets every block, so a target belonging to a
+        # different tip is simply the wrong difficulty.
         target: int | None = None
-        if args.payout_address:
+        last: tuple[int, list] | None = None
+        for _ in range(5):
+            notify = client.wait_for("mining.notify")
+            params = notify["params"]
+            job = _job_from(params)
+            if not args.payout_address:
+                break
             try:
                 candidate = rpc(args.rpc_url, "createauxblock", [args.payout_address])
-                target = int(str(candidate["target"]), 16)  # type: ignore[index]
-                print(f"block target from the node: {target:064x}")
             except (urllib.error.URLError, RuntimeError, KeyError, ValueError) as exc:
                 print(f"could not read the target from the node ({exc}); deriving it")
+                break
+            candidate_target = int(str(candidate["target"]), 16)  # type: ignore[index]
+            last = (candidate_target, params)
+            tip = str(candidate.get("previousblock", ""))  # type: ignore[union-attr]
+            if not tip or tip == job.prev_hash[::-1]:
+                target = candidate_target
+                print(f"block target from the node: {target:064x}")
+                break
+            print(f"job {job.job_id} is stale (the tip moved); waiting for the next one")
+
         if target is None:
-            share_target = int(DIFF1_TARGET / difficulty)
-            target = max(1, share_target // max(1, args.share_ease))
-            print(f"block target derived from difficulty: {target:064x}")
+            if last is not None:
+                target, params = last
+                job = _job_from(params)
+            else:
+                share_target = int(DIFF1_TARGET / difficulty)
+                target = max(1, share_target // max(1, args.share_ease))
+                print(f"block target derived from difficulty: {target:064x}")
 
         height_before = chain_height(args.rpc_url)
         print(f"chain height before: {height_before}")
-
-        notify = client.wait_for("mining.notify")
-        params = notify["params"]
-        job = Job(
-            job_id=params[0],
-            prev_hash=params[1],
-            coinbase1=params[2],
-            coinbase2=params[3],
-            branches=params[4],
-            version=params[5],
-            nbits=params[6],
-            ntime=params[7],
-        )
         print(f"job {job.job_id}: prevhash={job.prev_hash} nbits={job.nbits} ntime={job.ntime}")
 
         extranonce2 = "00" * int(extranonce2_size)
@@ -301,8 +323,10 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 print("RESULT: block accepted and the chain advanced")
             else:
-                print("RESULT: share accepted (the block may have already been superseded)")
-            return 0
+                print("RESULT: share accepted, but the chain did not advance.")
+            print("        The block was refused - check the pool log (AuxPoW not")
+            print("        active yet, or the tip moved while the nonce was ground).")
+            return 1
         print(f"RESULT: rejected: {reply.get('error')}")
         return 1
     finally:

@@ -401,6 +401,36 @@ async def _recv_method(reader: asyncio.StreamReader, method: str) -> dict:
 class TestStratumWireProtocol:
     """A real TCP client speaking Stratum to the real server."""
 
+    def test_an_idle_miner_is_disconnected_after_the_timeout(self, rpc, key):
+        """The idle timeout must reap dead sockets, at the configured value."""
+        node, _server, client = rpc
+        manager = _manager(node, client, str(key.address(node.params.address_version)))
+        stratum = StratumServer(
+            host="127.0.0.1", port=0, manager=manager, job_interval=3600, client_timeout=1.0
+        )
+        asyncio.run(self._idle(stratum))
+        assert stratum.sessions == 0
+
+    async def _idle(self, stratum: StratumServer) -> None:
+        await stratum.start()
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", stratum.port)
+            try:
+                await _send(writer, {"id": 1, "method": "mining.subscribe", "params": ["t/1"]})
+                await _recv_id(reader, 1)
+                # Say nothing else; the pool should hang up on its own.  It
+                # may still send us a difficulty and a job first.
+                for _ in range(10):
+                    line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+                    if line == b"":
+                        break
+                else:
+                    raise AssertionError("the pool never closed the idle connection")
+            finally:
+                writer.close()
+        finally:
+            await stratum.stop()
+
     def test_subscribe_authorize_and_submit_a_block(self, rpc, key):
         node, _server, client = rpc
         manager = _manager(node, client, str(key.address(node.params.address_version)))

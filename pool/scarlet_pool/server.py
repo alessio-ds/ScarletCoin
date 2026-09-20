@@ -32,6 +32,7 @@ from scarletcoin.net.client import RpcClient
 from .coinbase import CoinbaseBuilder
 from .jobs import JobManager, ParentChainClient, ParentTemplate
 from .stratum import (
+    DEFAULT_READ_TIMEOUT,
     StratumError,
     StratumRequest,
     StratumResponse,
@@ -111,11 +112,13 @@ class StratumSession:
         writer: asyncio.StreamWriter,
         manager: JobManager,
         on_disconnect: Callable[[StratumSession], None],
+        read_timeout: float = DEFAULT_READ_TIMEOUT,
     ) -> None:
         self._reader = reader
         self._writer = writer
         self._manager = manager
         self._on_disconnect = on_disconnect
+        self._read_timeout = read_timeout
 
         self.worker_name: str = "unknown"
         self.address: str = writer.get_extra_info("peername", ("?", 0))[0]
@@ -131,7 +134,7 @@ class StratumSession:
         """Read-submit loop for one miner."""
         try:
             while True:
-                line = await read_message(self._reader)
+                line = await read_message(self._reader, self._read_timeout)
                 try:
                     req = StratumRequest.parse(line)
                 except StratumError as exc:
@@ -308,11 +311,15 @@ class StratumServer:
         port: int = 3333,
         manager: JobManager,
         job_interval: float = 30.0,
+        client_timeout: float = DEFAULT_READ_TIMEOUT,
     ) -> None:
         self._host = host
         self._port = port
         self._manager = manager
         self._job_interval = max(5.0, float(job_interval))
+        if client_timeout <= 0:
+            raise ValueError("client timeout must be positive")
+        self._client_timeout = float(client_timeout)
         self._sessions: set[StratumSession] = set()
         self._server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
@@ -359,7 +366,13 @@ class StratumServer:
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        session = StratumSession(reader, writer, self._manager, self._on_disconnect)
+        session = StratumSession(
+            reader,
+            writer,
+            self._manager,
+            self._on_disconnect,
+            read_timeout=self._client_timeout,
+        )
         self._sessions.add(session)
         logger.info("miner connected from %s (total: %s)", session.address, len(self._sessions))
         try:
@@ -405,6 +418,7 @@ def create_server(
     host: str = "0.0.0.0",
     port: int = 3333,
     job_interval: float = 30.0,
+    client_timeout: float = DEFAULT_READ_TIMEOUT,
     share_difficulty: float | None = DEFAULT_SHARE_DIFFICULTY,
     chain_id: int = 0,
     parent: ParentChainClient | None = None,
@@ -425,7 +439,13 @@ def create_server(
         share_difficulty=share_difficulty,
         coinbase_builder=CoinbaseBuilder(),
     )
-    return StratumServer(host=host, port=port, manager=manager, job_interval=job_interval)
+    return StratumServer(
+        host=host,
+        port=port,
+        manager=manager,
+        job_interval=job_interval,
+        client_timeout=client_timeout,
+    )
 
 
 def _main() -> None:
@@ -446,6 +466,13 @@ def _main() -> None:
     parser.add_argument("--host", default="0.0.0.0", help="Stratum listen address")
     parser.add_argument("--port", type=int, default=3333, help="Stratum listen port")
     parser.add_argument("--job-interval", type=float, default=30.0, help="Seconds between new jobs")
+    parser.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_READ_TIMEOUT,
+        help="Seconds a miner may stay silent before being disconnected"
+        f" (default: {DEFAULT_READ_TIMEOUT:.0f})",
+    )
     parser.add_argument(
         "--share-difficulty",
         type=float,
@@ -474,6 +501,7 @@ def _main() -> None:
         host=args.host,
         port=args.port,
         job_interval=args.job_interval,
+        client_timeout=args.client_timeout,
         share_difficulty=args.share_difficulty,
         chain_id=args.chain_id,
     )

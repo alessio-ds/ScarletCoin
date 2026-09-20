@@ -11,7 +11,19 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["StratumError", "StratumRequest", "StratumResponse", "encode_message", "read_message"]
+__all__ = [
+    "DEFAULT_READ_TIMEOUT",
+    "StratumError",
+    "StratumRequest",
+    "StratumResponse",
+    "encode_message",
+    "read_message",
+]
+
+#: How long a miner may stay silent before the pool gives up on it.  A miner
+#: is silent whenever it is simply hashing, so this must be generous: dropping
+#: it costs a reconnect and lost work.  It exists only to reap dead sockets.
+DEFAULT_READ_TIMEOUT: float = 600.0
 
 
 class StratumError(Exception):
@@ -72,10 +84,10 @@ def encode_message(obj: dict[str, Any]) -> str:
     return json.dumps(obj, separators=(",", ":")) + "\n"
 
 
-async def read_message(reader: asyncio.StreamReader) -> str:
+async def read_message(reader: asyncio.StreamReader, timeout: float = DEFAULT_READ_TIMEOUT) -> str:
     """Read one newline-delimited line from *reader*."""
     try:
-        line = await asyncio.wait_for(reader.readline(), timeout=120.0)
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
     except asyncio.TimeoutError:
         raise StratumError("read timeout") from None
     if not line:

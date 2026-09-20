@@ -24,6 +24,9 @@ description="ScarletCoin merged-mining Stratum bridge"
 # Seconds between fresh jobs.  A job goes stale as soon as the chain tip
 # moves, so keep this shorter than the block interval.
 : ${job_interval:=10}
+# Seconds a miner may stay silent before being dropped.  Miners are silent
+# while hashing, so this is generous.
+: ${client_timeout:=600}
 # ---------------------------------------------------------------------
 
 command="/opt/scarletcoin/.venv/bin/python"
@@ -35,7 +38,8 @@ command_args="-m pool.scarlet_pool.server
     ${share_difficulty:+--share-difficulty ${share_difficulty}}
     --host ${host}
     --port ${port}
-    --job-interval ${job_interval}"
+    --job-interval ${job_interval}
+    --client-timeout ${client_timeout}"
 # The bridge is not an installed package, so it has to run from the checkout
 # for ``python -m pool.scarlet_pool.server`` to resolve.
 directory="/opt/scarletcoin"
