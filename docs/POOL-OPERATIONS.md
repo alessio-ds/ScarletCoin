@@ -134,6 +134,34 @@ echo '{"id":1,"method":"mining.subscribe","params":["cpuminer/test"]}' \
 You should get back a JSON response with subscription details and a
 `mining.set_difficulty` notification.
 
+### Prove it end to end
+
+`tools/stratum_probe.py` does what an ASIC does — subscribe, authorize, build
+the coinbase, fold the Merkle branch, grind a nonce against the real block
+target, submit — and reports whether the chain advanced:
+
+```sh
+python tools/stratum_probe.py \
+    --host scarletcoin.remotewire.net --port 3333 \
+    --payout-address <your-sct-address>
+```
+
+It exits 0 only when a block was accepted. Run it from a machine with several
+cores: it needs roughly `2^256 / target` hashes, which on this chain is a few
+seconds of pure Python, but the tip can move while it grinds, so it retries
+across jobs. Each attempt is reported, including the pool's refusal.
+
+To confirm a block really was merged-mined rather than found natively:
+
+```sh
+curl -s -X POST http://127.0.0.1:20332/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getblock","params":["<block-hash>"]}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["proof_type"])'
+```
+
+`auxpow` means the proof of work came from a parent header, and the SCT header
+nonce will be 0.
+
 ## Miner instructions
 
 Give miners this info:

@@ -290,26 +290,30 @@ docs/        protocol and consensus reference, network operator's guide
 
 ## Mine ScarletCoin with Bitcoin ASICs
 
-ScarletCoin supports **merged mining (AuxPoW)** — standard Bitcoin SHA-256d ASICs
-can mine ScarletCoin at **zero extra hashing cost** as a by-product of Bitcoin
-mining.  No custom firmware required.
+ScarletCoin supports **merged mining (AuxPoW)**: standard Bitcoin SHA-256d
+ASICs can mine ScarletCoin with **no firmware change**.  The miner hashes the
+80-byte headers it already hashes; the pool wraps that work in an AuxPoW proof.
 
 ```text
 Your Antminer / Whatsminer
         │
         │ Stratum V1
         ▼
-  Merged-mining pool
+  Merged-mining pool  ──►  ScarletCoin node
         │
-   +----+----+
-   │         │
-   ▼         ▼
-  BTC       SCT
+        └──►  SCT block reward
 ```
 
-* [docs/MERGED-MINING.md](docs/MERGED-MINING.md) — how to mine SCT with existing ASICs
+Merged mining is **active on mainnet from height 47,000**, and blocks have been
+mined through the reference Stratum bridge.  Note that this mines SCT only —
+the parent header is supplied by the pool, not by Bitcoin, so no BTC is
+produced.  See [docs/MERGED-MINING.md](docs/MERGED-MINING.md).
+
+* [docs/MERGED-MINING.md](docs/MERGED-MINING.md) — mining SCT with existing ASICs
 * [docs/AUXPOW.md](docs/AUXPOW.md) — consensus-level AuxPoW specification
-* [docs/ACTIVATION.md](docs/ACTIVATION.md) — activation plan and mainnet timeline
+* [docs/ACTIVATION.md](docs/ACTIVATION.md) — activation height and upgrade notes
+* [docs/POOL-OPERATIONS.md](docs/POOL-OPERATIONS.md) — running a Stratum bridge
+* `tools/stratum_probe.py` — verify a bridge by mining a real block through it
 
 ## Development
 
