@@ -21,6 +21,9 @@ description="ScarletCoin merged-mining Stratum bridge"
 # often a miner submits, and therefore how often the bridge submits a
 # block.  See docs/MERGED-MINING.md.
 : ${share_difficulty:=1}
+# Seconds between fresh jobs.  A job goes stale as soon as the chain tip
+# moves, so keep this shorter than the block interval.
+: ${job_interval:=10}
 # ---------------------------------------------------------------------
 
 command="/opt/scarletcoin/.venv/bin/python"
@@ -32,7 +35,7 @@ command_args="-m pool.scarlet_pool.server
     --share-difficulty ${share_difficulty}
     --host ${host}
     --port ${port}
-    --job-interval 30"
+    --job-interval ${job_interval}"
 command_user="scarlet:scarlet"
 
 supervisor="supervise-daemon"
