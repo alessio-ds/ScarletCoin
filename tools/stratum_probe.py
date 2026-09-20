@@ -200,6 +200,21 @@ def rpc(url: str, method: str, params: list, timeout: float = 15.0) -> object:
     return payload["result"]
 
 
+def _block_target(args: argparse.Namespace, difficulty: float) -> int:
+    """The target a parent header must beat to produce a ScarletCoin block.
+
+    Prefers the node's own candidate, which is authoritative.  Falls back to
+    deriving it from the share difficulty the pool advertised.
+    """
+    if args.payout_address:
+        try:
+            candidate = rpc(args.rpc_url, "createauxblock", [args.payout_address])
+            return int(str(candidate["target"]), 16)  # type: ignore[index]
+        except (urllib.error.URLError, RuntimeError, KeyError, ValueError) as exc:
+            print(f"  could not read the target from the node ({exc}); deriving it")
+    return max(1, int(DIFF1_TARGET / difficulty) // max(1, args.share_ease))
+
+
 def chain_height(url: str) -> int | None:
     try:
         with urllib.request.urlopen(f"{url.rstrip('/')}/api/info", timeout=10) as reply:
@@ -233,7 +248,12 @@ def main(argv: list[str] | None = None) -> int:
         help="fallback: how much easier a share is than a block",
     )
     parser.add_argument("--workers", type=int, default=0, help="grinding processes (0 = auto)")
-    parser.add_argument("--timeout", type=float, default=180.0, help="seconds to grind a block")
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=5,
+        help="jobs to try before giving up; the tip moves while grinding",
+    )
     args = parser.parse_args(argv)
 
     workers = args.workers or max(1, (multiprocessing.cpu_count() or 2))
@@ -256,78 +276,57 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("authorized")
 
-        # Resolve the target we must beat to produce a *block* (not just a
-        # share).  Fetch it only after a job arrives and check it describes the
-        # same tip: the node retargets every block, so a target belonging to a
-        # different tip is simply the wrong difficulty.
-        target: int | None = None
-        last: tuple[int, list] | None = None
-        for _ in range(5):
-            notify = client.wait_for("mining.notify")
-            params = notify["params"]
-            job = _job_from(params)
-            if not args.payout_address:
-                break
-            try:
-                candidate = rpc(args.rpc_url, "createauxblock", [args.payout_address])
-            except (urllib.error.URLError, RuntimeError, KeyError, ValueError) as exc:
-                print(f"could not read the target from the node ({exc}); deriving it")
-                break
-            candidate_target = int(str(candidate["target"]), 16)  # type: ignore[index]
-            last = (candidate_target, params)
-            tip = str(candidate.get("previousblock", ""))  # type: ignore[union-attr]
-            if not tip or tip == job.prev_hash[::-1]:
-                target = candidate_target
-                print(f"block target from the node: {target:064x}")
-                break
-            print(f"job {job.job_id} is stale (the tip moved); waiting for the next one")
-
-        if target is None:
-            if last is not None:
-                target, params = last
-                job = _job_from(params)
-            else:
-                share_target = int(DIFF1_TARGET / difficulty)
-                target = max(1, share_target // max(1, args.share_ease))
-                print(f"block target derived from difficulty: {target:064x}")
-
-        height_before = chain_height(args.rpc_url)
-        print(f"chain height before: {height_before}")
-        print(f"job {job.job_id}: prevhash={job.prev_hash} nbits={job.nbits} ntime={job.ntime}")
-
+        # The parent chain is simulated, so the job's prevhash has nothing to
+        # do with the ScarletCoin tip; the target has to come from the node's
+        # own candidate.  Fetch a job, read the target that goes with the tip
+        # the node is on, grind, submit, and retry if the tip moved underneath
+        # us - which is routine, because native mining keeps producing blocks.
         extranonce2 = "00" * int(extranonce2_size)
-        coinbase = coinbase_for(job, extranonce1, extranonce2)
-        root = merkle_root_for(coinbase, job.branches)
-        print(f"coinbase {len(coinbase)} bytes, merkle root {root[::-1].hex()}")
+        last_error: str = "no attempt made"
+        for attempt in range(1, args.attempts + 1):
+            notify = client.wait_for("mining.notify")
+            job = _job_from(notify["params"])
+            print(
+                f"attempt {attempt}: job {job.job_id} prevhash={job.prev_hash}"
+                f" nbits={job.nbits} ntime={job.ntime}"
+            )
 
-        started = time.time()
-        nonce, _header = grind(job, root, target, int(job.ntime, 16), workers)
-        elapsed = time.time() - started
-        print(f"found nonce {nonce:08x} after {elapsed:.1f}s ({workers} processes)")
+            target = _block_target(args, difficulty)
+            print(f"  block target {target:064x}")
 
-        reply = client.call(
-            "mining.submit",
-            [args.worker, job.job_id, extranonce2, job.ntime, f"{nonce:08x}"],
-        )
-        print(f"submit reply: {reply}")
+            height_before = chain_height(args.rpc_url)
+            coinbase = coinbase_for(job, extranonce1, extranonce2)
+            root = merkle_root_for(coinbase, job.branches)
 
-        time.sleep(2.0)
-        height_after = chain_height(args.rpc_url)
-        print(f"chain height after: {height_after}")
+            started = time.time()
+            nonce, _header = grind(job, root, target, int(job.ntime, 16), workers)
+            print(f"  found nonce {nonce:08x} in {time.time() - started:.1f}s")
 
-        if reply.get("result") is True:
+            reply = client.call(
+                "mining.submit",
+                [args.worker, job.job_id, extranonce2, job.ntime, f"{nonce:08x}"],
+            )
+            print(f"  submit reply: {reply}")
+
+            if reply.get("result") is not True:
+                last_error = str(reply.get("error") or "the pool refused the share")
+                print(f"  refused: {last_error}")
+                continue
+
+            time.sleep(2.0)
+            height_after = chain_height(args.rpc_url)
+            print(f"  chain height {height_before} -> {height_after}")
             if (
-                height_after is not None
-                and height_before is not None
+                height_before is not None
+                and height_after is not None
                 and height_after > height_before
             ):
-                print("RESULT: block accepted and the chain advanced")
-            else:
-                print("RESULT: share accepted, but the chain did not advance.")
-            print("        The block was refused - check the pool log (AuxPoW not")
-            print("        active yet, or the tip moved while the nonce was ground).")
-            return 1
-        print(f"RESULT: rejected: {reply.get('error')}")
+                print("RESULT: AuxPoW block accepted and the chain advanced")
+                return 0
+            last_error = "the share was accepted but no block landed"
+            print(f"  {last_error}")
+
+        print(f"RESULT: no block accepted after {args.attempts} attempts ({last_error})")
         return 1
     finally:
         client.close()
