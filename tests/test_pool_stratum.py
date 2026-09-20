@@ -29,6 +29,7 @@ from scarletcoin.core.block import merkle_root
 from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.serialize import Writer
 from scarletcoin.crypto.hashing import hash256
+from scarletcoin.net.client import RpcClientError
 
 # ------------------------------------------------------------------ helpers
 
@@ -327,6 +328,34 @@ class TestJobManager:
         assert result["status"] == "connected"
         assert manager.sct_blocks_accepted == 1
         assert node.chain.height == 1
+
+    def test_a_stale_candidate_is_reported_and_not_raised(self, rpc, key, monkeypatch):
+        """A tip that moved must not take the miner's connection down with it."""
+        node, _server, client = rpc
+        manager = _manager(node, client, str(key.address(node.params.address_version)))
+        job = manager.refresh()
+
+        en1, en2 = "aabbccdd", "00000000"
+        coinbase = _miner_coinbase(job.coinbase.coinbase1, en1, en2, job.coinbase.coinbase2)
+        nonce, _header = _solve(
+            version=job.parent.version,
+            prev_hash=bytes.fromhex(job.parent.prev_hash),
+            coinbase=coinbase,
+            branches=job.merkle_branches,
+            ntime=job.ntime,
+            nbits=job.parent.nbits,
+            target=min(job.scarlet.target, manager.share_target),
+        )
+
+        def stale(*_args, **_kwargs):
+            raise RpcClientError("no AuxPoW candidate with that hash; the tip advanced")
+
+        monkeypatch.setattr(client, "call", stale)
+        result = manager.submit_sct_block(job.job_id, en1, en2, job.ntime, nonce)
+        assert result is not None
+        assert result["status"] == "rejected"
+        assert manager.sct_blocks_rejected == 1
+        assert manager.sct_blocks_accepted == 0
 
     def test_a_share_below_the_share_target_is_rejected(self, rpc, key):
         """A share difficulty that is too high rejects work even if a block would qualify."""

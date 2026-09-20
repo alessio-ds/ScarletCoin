@@ -26,7 +26,7 @@ from scarletcoin.core.auxpow import (
     build_auxpow_commitment,
 )
 from scarletcoin.crypto.hashing import hash256
-from scarletcoin.net.client import RpcClient
+from scarletcoin.net.client import RpcClient, RpcClientError
 
 from .coinbase import (
     DEFAULT_PARENT_PAYOUT_HASH,
@@ -368,9 +368,16 @@ class JobManager:
             parent_header=ParentBlockHeader.deserialize(header_bytes),
         )
 
-        result = self._scarlet.call(
-            "submitauxblock", job.scarlet.aux_hash, auxpow.serialize().hex()
-        )
+        try:
+            result = self._scarlet.call(
+                "submitauxblock", job.scarlet.aux_hash, auxpow.serialize().hex()
+            )
+        except RpcClientError as exc:
+            # Routine: the tip moved between mining this job and submitting it,
+            # so the node no longer holds the candidate.  Report it instead of
+            # letting it escape, which would drop the miner's connection.
+            self.sct_blocks_rejected += 1
+            return {"status": "rejected", "reason": str(exc)}
         if isinstance(result, dict) and result.get("status") == "connected":
             self.sct_blocks_accepted += 1
         else:
