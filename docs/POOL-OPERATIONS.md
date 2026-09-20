@@ -72,8 +72,7 @@ su -s /bin/sh scarlet -c \
   'cd /opt/scarletcoin && /opt/scarletcoin/.venv/bin/python -m pool.scarlet_pool.server \
     --scarlet-url http://127.0.0.1:20332 \
     --payout-address <your-sct-address> \
-    --chain-id 1 \
-    --share-difficulty 1'
+    --chain-id 1'
 ```
 
 You should see the listening line and a first job:
@@ -100,7 +99,6 @@ scarlet_url="http://127.0.0.1:20332"
 chain_id="1"
 port="3333"
 host="0.0.0.0"
-share_difficulty="1"
 EOF
 
 # Enable and start
@@ -108,7 +106,9 @@ rc-update add scarletcoin-stratum default
 rc-service scarletcoin-stratum start
 ```
 
-Leave `scarlet_token` unset while the node runs `--rpc-public-mining`.
+Leave `scarlet_token` unset while the node runs `--rpc-public-mining`, and leave
+`share_difficulty` unset so the share rate tracks the chain — see
+[MERGED-MINING.md](MERGED-MINING.md).
 
 ### 5. Open the Stratum port
 

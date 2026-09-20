@@ -17,10 +17,10 @@ description="ScarletCoin merged-mining Stratum bridge"
 : ${chain_id:=1}
 : ${port:=3333}
 : ${host:=0.0.0.0}
-# Stratum share difficulty (NOT the chain difficulty).  It throttles how
-# often a miner submits, and therefore how often the bridge submits a
-# block.  See docs/MERGED-MINING.md.
-: ${share_difficulty:=1}
+# Stratum share difficulty in Bitcoin difficulty-1 units.  Leave empty
+# (the default) to derive it from the chain target, which keeps the share
+# rate sensible for any hashrate.  See docs/MERGED-MINING.md.
+: ${share_difficulty:=}
 # Seconds between fresh jobs.  A job goes stale as soon as the chain tip
 # moves, so keep this shorter than the block interval.
 : ${job_interval:=10}
@@ -32,7 +32,7 @@ command_args="-m pool.scarlet_pool.server
     ${scarlet_token:+--scarlet-token ${scarlet_token}}
     --payout-address ${payout_address}
     --chain-id ${chain_id}
-    --share-difficulty ${share_difficulty}
+    ${share_difficulty:+--share-difficulty ${share_difficulty}}
     --host ${host}
     --port ${port}
     --job-interval ${job_interval}"

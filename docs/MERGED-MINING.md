@@ -56,24 +56,27 @@ scarletcoin node mainnet --rpc --rpc-public-mining
 python -m pool.scarlet_pool.server \
     --scarlet-url http://127.0.0.1:20332 \
     --payout-address S... \
-    --chain-id 1 \
-    --share-difficulty 1
+    --chain-id 1
 ```
 
 ### Share difficulty
 
-`--share-difficulty` is **not** the chain difficulty. It only controls how often
-a miner submits a share, i.e. how often the pool is allowed to submit a block.
-It is expressed in Bitcoin difficulty-1 units, so `1` means "a share must beat
-Bitcoin's difficulty-1 target".
+By default the pool **derives the share target from the chain target**: a share
+must be eight times easier than a block, so roughly one share in eight is a
+block. That keeps the submission rate tied to the chain as its difficulty
+moves.
 
-ScarletCoin's own difficulty is currently far below 1, which means every share
-that beats the share target *also* beats the ScarletCoin target — each accepted
-share becomes a block. Raise `--share-difficulty` to throttle submissions from a
-fast ASIC; lower it if a small miner never finds anything. Because the chain
-retargets per block, its difficulty climbs toward whatever hashrate is pointed
-at it, and once it passes the share difficulty the pool stops throttling and
-simply accepts everything that is a block.
+This matters because ScarletCoin's difficulty is far below Bitcoin's
+difficulty 1. Pinning `--share-difficulty 1` — a natural-looking choice — means
+a share must beat Bitcoin's difficulty-1 target, which is *harder* than a
+ScarletCoin block, and an ASIC hashing at 100 TH/s would find roughly 20,000
+shares a second and drown the pool. The flag takes Bitcoin difficulty-1 units
+and exists for pinning the rate deliberately; leave it unset unless you have a
+reason.
+
+The chain retargets every block, by at most 4x per block, so pointing new
+hashrate at it converges to the 60-second spacing within a handful of blocks.
+Expect a short burst of fast blocks the first time a large ASIC connects.
 
 ### Job flow
 

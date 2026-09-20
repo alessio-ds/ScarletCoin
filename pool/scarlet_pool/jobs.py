@@ -48,6 +48,11 @@ __all__ = [
 #: share target.  ``target = _DIFF1_TARGET // difficulty``.
 _DIFF1_TARGET: Final[int] = 0x00000000FFFF0000_000000000000000000000000000000000000000000000000
 
+#: How much easier than a block a share should be when the share difficulty is
+#: derived automatically.  One share in eight is a block, which is enough to
+#: keep a miner busy without drowning the pool in submissions.
+DEFAULT_SHARE_EASE: Final[int] = 8
+
 
 # ── abstract parent-chain interface ───────────────────────────────────────
 
@@ -144,7 +149,7 @@ class JobManager:
         scarlet: RpcClient,
         payout_address: str,
         chain_id: int,
-        share_difficulty: float = 1.0,
+        share_difficulty: float | None = None,
         parent_payout_hash: bytes = DEFAULT_PARENT_PAYOUT_HASH,
         coinbase_builder: CoinbaseBuilder | None = None,
     ) -> None:
@@ -155,14 +160,15 @@ class JobManager:
         self._coinbase_builder = coinbase_builder or CoinbaseBuilder()
         self._parent_payout_hash = parent_payout_hash
 
-        if share_difficulty <= 0:
+        if share_difficulty is not None and share_difficulty <= 0:
             raise ValueError("share difficulty must be positive")
-        self.share_difficulty = float(share_difficulty)
-        #: A share must beat this target.  When it is *harder* than the
-        #: ScarletCoin target (the usual case while the chain is young), every
-        #: accepted share is also a block, which throttles how often the pool
-        #: submits blocks to a rate the operator chose.
-        self.share_target = max(1, int(_DIFF1_TARGET / self.share_difficulty))
+        #: ``None`` means "derive it from the chain target each job" (see
+        #: :attr:`share_target`).  An explicit value pins it instead.
+        self._fixed_share_target: int | None = (
+            None
+            if share_difficulty is None
+            else max(1, int(_DIFF1_TARGET / float(share_difficulty)))
+        )
 
         self._current: _ActiveJob | None = None
         self._job_counter: int = 0
@@ -173,6 +179,36 @@ class JobManager:
         self.sct_blocks_found: int = 0
         self.sct_blocks_accepted: int = 0
         self.sct_blocks_rejected: int = 0
+
+    # ── share target ───────────────────────────────────────────────────
+
+    @property
+    def share_target(self) -> int:
+        """The target a submitted share must beat.
+
+        Pinned when the operator passed an explicit share difficulty.
+        Otherwise it is derived from the current block target, so the share
+        rate follows the chain as its difficulty moves.  Without that, a
+        fixed difficulty is either so easy that an ASIC floods the pool with
+        tens of thousands of submissions a second, or so hard that a small
+        miner never submits anything.
+        """
+        if self._fixed_share_target is not None:
+            return self._fixed_share_target
+        job = self._current
+        if job is None:
+            return _DIFF1_TARGET
+        return max(1, job.scarlet.target * DEFAULT_SHARE_EASE)
+
+    @share_target.setter
+    def share_target(self, value: int) -> None:
+        """Pin the share target, bypassing the derived value."""
+        self._fixed_share_target = max(1, int(value))
+
+    @property
+    def share_difficulty(self) -> float:
+        """The current share target as a Bitcoin difficulty, for the miner."""
+        return _DIFF1_TARGET / self.share_target
 
     # ── template rotation ──────────────────────────────────────────────
 

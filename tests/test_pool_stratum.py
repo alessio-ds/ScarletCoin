@@ -18,7 +18,11 @@ from pool.scarlet_pool.coinbase import (
     coinbase_merkle_branch,
     parse_coinbase_body,
 )
-from pool.scarlet_pool.jobs import JobManager
+from pool.scarlet_pool.jobs import (
+    _DIFF1_TARGET,
+    DEFAULT_SHARE_EASE,
+    JobManager,
+)
 from pool.scarlet_pool.server import SimulatedParentChain, StratumServer
 
 from scarletcoin.core.block import merkle_root
@@ -244,6 +248,27 @@ class TestJobManager:
         job = manager.refresh()
         assert job.scarlet.chain_id == node.params.auxpow_chain_id
         assert job.scarlet.height == node.chain.height + 1
+
+    def test_share_difficulty_tracks_the_chain_by_default(self, rpc, key):
+        """With no explicit difficulty the share rate follows the chain target."""
+        node, _server, client = rpc
+        manager = JobManager(
+            bitcoin=SimulatedParentChain(),
+            scarlet=client,
+            payout_address=str(key.address(node.params.address_version)),
+            chain_id=node.params.auxpow_chain_id,
+        )
+        job = manager.refresh()
+        assert manager.share_target == job.scarlet.target * DEFAULT_SHARE_EASE
+        # Easier than a block, so shares arrive more often than blocks.
+        assert manager.share_target > job.scarlet.target
+        assert manager.share_difficulty == pytest.approx(_DIFF1_TARGET / manager.share_target)
+
+    def test_an_explicit_share_difficulty_pins_the_target(self, rpc, key):
+        node, _server, client = rpc
+        manager = _manager(node, client, str(key.address(node.params.address_version)))
+        manager.refresh()
+        assert manager.share_target == int(_DIFF1_TARGET / 1e-9)
 
     def test_wrong_chain_id_is_refused(self, rpc, key):
         node, _server, client = rpc

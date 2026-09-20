@@ -43,11 +43,13 @@ __all__ = ["SimulatedParentChain", "StratumServer", "StratumSession", "create_se
 
 logger = logging.getLogger(__name__)
 
-#: Default Stratum share difficulty.  This is *not* the chain difficulty: it
-#: only controls how often a miner submits.  Because ScarletCoin's difficulty
-#: is far below Bitcoin's difficulty 1, every share that beats this target also
-#: beats the ScarletCoin target, so each accepted share produces a block.
-DEFAULT_SHARE_DIFFICULTY = 1.0
+#: Default Stratum share difficulty.  ``None`` means "track the chain": the
+#: share target is derived from each job's block target, so the submission rate
+#: follows the chain as its difficulty moves.  An explicit value pins it in
+#: Bitcoin difficulty-1 units.  A fixed value is a trap here, because
+#: ScarletCoin's difficulty is orders of magnitude below Bitcoin's difficulty 1
+#: and moves fast while the network hashrate is changing.
+DEFAULT_SHARE_DIFFICULTY: float | None = None
 
 
 # ── simulated parent chain (SCT-only mining, testing) ────────────────────
@@ -403,7 +405,7 @@ def create_server(
     host: str = "0.0.0.0",
     port: int = 3333,
     job_interval: float = 30.0,
-    share_difficulty: float = DEFAULT_SHARE_DIFFICULTY,
+    share_difficulty: float | None = DEFAULT_SHARE_DIFFICULTY,
     chain_id: int = 0,
     parent: ParentChainClient | None = None,
 ) -> StratumServer:
@@ -448,7 +450,9 @@ def _main() -> None:
         "--share-difficulty",
         type=float,
         default=DEFAULT_SHARE_DIFFICULTY,
-        help="Stratum share difficulty (throttles miner submissions, default: 1.0)",
+        help="Pin the Stratum share difficulty in Bitcoin difficulty-1 units."
+        " By default it is derived from the chain target so the share rate"
+        " tracks the chain.",
     )
     parser.add_argument(
         "--chain-id",
@@ -475,7 +479,12 @@ def _main() -> None:
     )
     logger.info("ScarletCoin node: %s", args.scarlet_url)
     logger.info("Payout address: %s", args.payout_address)
-    logger.info("Share difficulty: %s", args.share_difficulty)
+    logger.info(
+        "Share difficulty: %s",
+        "auto (derived from the chain target)"
+        if args.share_difficulty is None
+        else args.share_difficulty,
+    )
     logger.info("Expected chain id: %s", args.chain_id)
     logger.info("Miners connect to stratum+tcp://%s:%s", args.host, args.port)
     asyncio.run(server.serve_forever())
