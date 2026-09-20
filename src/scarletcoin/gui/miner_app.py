@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -360,9 +361,14 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``scarlet-miner-gui``."""
     import multiprocessing
 
-    multiprocessing.freeze_support()
+    # Pick the start method *before* freeze_support(): on Python 3.13+
+    # freeze_support() itself selects "spawn", after which set_start_method
+    # raises "context has already been set" and the window never opens.
     if sys.platform != "win32":
-        multiprocessing.set_start_method("forkserver")
+        # forkserver is unavailable on some platforms; spawn still works.
+        with contextlib.suppress(RuntimeError, ValueError):
+            multiprocessing.set_start_method("forkserver", force=True)
+    multiprocessing.freeze_support()
 
     parser = argparse.ArgumentParser(
         prog="scarlet-miner-gui", description="ScarletCoin desktop miner."
