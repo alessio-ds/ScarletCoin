@@ -219,7 +219,7 @@ class StratumSession:
                 "method": "mining.notify",
                 "params": [
                     job.job_id,
-                    job.parent.prev_hash,  # internal order
+                    CoinbaseBuilder.stratum_prevhash(job.parent.prev_hash),
                     job.coinbase.coinbase1,
                     job.coinbase.coinbase2,
                     job.merkle_branches,  # internal order
@@ -263,7 +263,6 @@ class StratumSession:
                 self.extranonce2_size,
             ],
         )
-        await self._set_difficulty(self._manager.share_difficulty)
 
     async def _set_difficulty(self, difficulty: float) -> None:
         await self._write(
@@ -314,10 +313,19 @@ class StratumSession:
         await self._refresh_own_job()
 
     async def _refresh_own_job(self) -> None:
-        """Build and push a job whose coinbase pays this miner."""
+        """Build and push a job whose coinbase pays this miner.
+
+        The share difficulty is sent immediately before the job, never on its
+        own: it is derived from the chain target, and before a job exists there
+        is no target to derive it from.  Subscribing used to advertise the
+        fallback difficulty of 1.0, which is around a billion times harder than
+        intended, so a miner that connected before the pool's first refresh
+        found almost no shares and submitted nothing.
+        """
         if not self.authorized or not self.payout_address:
             return
         self.job = self._manager.refresh(self.payout_address)
+        await self._set_difficulty(self._manager.share_difficulty)
         await self.send_job(clean=True)
 
     async def _handle_submit(self, req: StratumRequest) -> None:
@@ -344,10 +352,6 @@ class StratumSession:
             return
 
         share = self._manager.process_share(job, self.extranonce1, extranonce2, ntime, nonce)
-        if not share.accepted:
-            logger.debug("share rejected from %s: %s", worker or self.address, share.reason)
-            await self._send_result(req.id, False)
-            return
 
         landed = False
         if share.meets_sct_target:

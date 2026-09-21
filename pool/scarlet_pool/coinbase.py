@@ -201,6 +201,22 @@ class CoinbaseBuilder:
         )
 
     @staticmethod
+    def stratum_prevhash(prev_hash_internal: str) -> str:
+        """Return ``prev_hash_internal`` as Stratum sends it.
+
+        The header stores the previous block hash in internal byte order, but
+        Stratum puts it on the wire with **every 32-bit word byte-swapped**.
+        A miner copies the field into its header and the swap cancels out, so
+        sending it verbatim makes the miner hash a different header than the
+        pool rebuilds - which silently reduces share checking to "did the
+        pool's own header happen to beat the target", and on a hard target
+        rejects every share a real miner ever submits.
+        """
+        raw = bytes.fromhex(prev_hash_internal)
+        swapped = b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
+        return swapped.hex()
+
+    @staticmethod
     def reconstruct_header(
         coinbase1_hex: str,
         extranonce1_hex: str,

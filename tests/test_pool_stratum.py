@@ -71,6 +71,15 @@ def _miner_coinbase(coinbase1: str, en1: str, en2: str, coinbase2: str) -> bytes
     return bytes.fromhex(coinbase1 + en1 + en2 + coinbase2)
 
 
+def _unswap(raw: bytes) -> bytes:
+    """Stratum sends the prevhash with each 32-bit word byte-swapped.
+
+    A miner undoes that when it writes the field into its header, so a test
+    client that copies the notify value verbatim is not imitating a miner.
+    """
+    return b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
+
+
 def _solve(
     *,
     version: int,
@@ -241,6 +250,22 @@ class TestHeaderReconstruction:
 
 
 # --------------------------------------------------------------- job manager
+
+
+class TestStratumPrevhash:
+    """Stratum's prevhash encoding is a byte-order trap worth pinning down."""
+
+    def test_each_word_is_byte_swapped(self):
+        internal = bytes(range(32))
+        swapped = bytes.fromhex(CoinbaseBuilder.stratum_prevhash(internal.hex()))
+        assert swapped == b"".join(internal[i : i + 4][::-1] for i in range(0, 32, 4))
+        assert swapped != internal
+
+    def test_the_swap_is_its_own_inverse(self):
+        internal = bytes(range(32)).hex()
+        assert (
+            CoinbaseBuilder.stratum_prevhash(CoinbaseBuilder.stratum_prevhash(internal)) == internal
+        )
 
 
 class TestJobManager:
@@ -583,7 +608,7 @@ class TestStratumWireProtocol:
                 job = manager.current
                 nonce, _header = _solve(
                     version=int(version, 16),
-                    prev_hash=bytes.fromhex(prevhash),
+                    prev_hash=_unswap(bytes.fromhex(prevhash)),
                     coinbase=coinbase,
                     branches=branches,
                     ntime=int(ntime, 16),

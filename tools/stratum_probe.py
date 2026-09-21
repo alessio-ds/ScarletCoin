@@ -132,10 +132,21 @@ def merkle_root_for(coinbase: bytes, branches: list[str]) -> bytes:
     return root
 
 
+def _unswap(raw: bytes) -> bytes:
+    """Undo Stratum's per-32-bit-word byte swap of the previous block hash."""
+    return b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
+
+
 def header_for(job: Job, merkle_root: bytes, ntime: int, nonce: int) -> bytes:
+    """Build the 80-byte parent header exactly as a real miner does.
+
+    ``version``, ``nbits`` and ``ntime`` arrive as the header's own bytes in
+    hex, so they are written verbatim; the nonce is ours to choose.
+    """
     return (
         int(job.version, 16).to_bytes(4, "little")
-        + bytes.fromhex(job.prev_hash)
+        # Stratum sends the prevhash word-swapped; undo it for the header.
+        + _unswap(bytes.fromhex(job.prev_hash))
         + merkle_root
         + ntime.to_bytes(4, "little")
         + int(job.nbits, 16).to_bytes(4, "little")
@@ -271,18 +282,20 @@ def main(argv: list[str] | None = None) -> int:
         _, extranonce1, extranonce2_size = subscribe["result"]
         print(f"subscribed: extranonce1={extranonce1} extranonce2_size={extranonce2_size}")
 
-        difficulty_msg = client.wait_for("mining.set_difficulty")
-        difficulty = float(difficulty_msg["params"][0])
-        print(f"share difficulty: {difficulty:g}")
-
         # A Stratum miner cannot build its own coinbase, so the pool has to be
         # told where to pay; the convention is "ADDRESS" or "ADDRESS.rig".
+        # Authorise first: a pool cannot know the share difficulty until it has
+        # a job, and it has no job until it knows where to pay.
         username = f"{args.payout_address}.{args.worker}" if args.payout_address else args.worker
         authorized = client.call("mining.authorize", [username, "x"])
         if authorized.get("result") is not True:
             print(f"authorize failed: {authorized.get('error')}")
             return 1
         print(f"authorized as {username}")
+
+        difficulty_msg = client.wait_for("mining.set_difficulty")
+        difficulty = float(difficulty_msg["params"][0])
+        print(f"share difficulty: {difficulty:g}")
 
         # The parent chain is simulated, so the job's prevhash has nothing to
         # do with the ScarletCoin tip; the target has to come from the node's
