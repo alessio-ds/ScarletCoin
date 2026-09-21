@@ -115,7 +115,10 @@ jobs:
 
   publish:
     name: Publish the GitHub release
-    needs: build
+    # build-fedora must be in needs, not just build: that job uploads its own
+    # artifact, and download-artifact only sees what has finished.  With only
+    # "build" the Fedora tarball is included by luck of timing.
+    needs: [build, build-fedora]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -123,6 +126,39 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # A tag can be moved and re-pushed - that is how 2.5.0 was rebuilt - and
+      # the artifact names carry the version, so an upload on its own leaves
+      # the previous version's binaries attached to the same release under the
+      # new tag.  Clear the release first so it holds exactly what this run
+      # built and nothing else.
+      - name: Delete assets left over from an earlier build of this tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({
+                ...context.repo,
+                tag,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`No release exists for ${tag} yet; nothing to delete.`);
+                return;
+              }
+              throw error;
+            }
+            const stale = release.data.assets;
+            core.info(`${tag} already has ${stale.length} asset(s).`);
+            for (const asset of stale) {
+              await github.rest.repos.deleteReleaseAsset({
+                ...context.repo,
+                asset_id: asset.id,
+              });
+              core.info(`Deleted stale asset: ${asset.name}`);
+            }
 
       - uses: softprops/action-gh-release@v2
         with:
