@@ -79,6 +79,7 @@ def check_transaction_inputs(
     *,
     height: int,
     params: ChainParams,
+    verify_signatures: bool = True,
 ) -> int:
     """Validate a non-coinbase transaction's inputs and return the fee it pays.
 
@@ -92,6 +93,13 @@ def check_transaction_inputs(
         view: The coins available to it.
         height: Height of the block the transaction would be included in.
         params: Chain parameters (for the coinbase maturity rule).
+        verify_signatures: When false, skip the ECDSA checks and confirm only
+            that every input still exists, is mature and is spendable.  A
+            mempool revalidating a transaction it has already verified can pass
+            ``False``: a signature commits to the transaction id, the input
+            index and the coin being spent, none of which can change while the
+            transaction itself is unchanged, so repeating the work would only
+            burn CPU and keep the mempool lock held.
 
     Returns:
         The fee, in scar.
@@ -104,8 +112,9 @@ def check_transaction_inputs(
         raise ValidationError("check_transaction_inputs must not be used on a coinbase")
 
     # One shared hasher for the whole transaction: rebuilding the body per
-    # input would make validating a many-input transaction quadratic.
-    hasher = SignatureHasher(transaction)
+    # input would make validating a many-input transaction quadratic.  It is
+    # only needed when the signatures are actually checked.
+    hasher = SignatureHasher(transaction) if verify_signatures else None
     total_in = 0
     for index, txin in enumerate(transaction.inputs):
         coin = view.get_coin(txin.prevout)
@@ -119,14 +128,13 @@ def check_transaction_inputs(
         if coin.output_type not in (OUTPUT_P2PKH, OUTPUT_P2SH):
             raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
 
-        if coin.output_type == OUTPUT_P2PKH:
-            valid = transaction.verify_input_signature(index, coin.value, coin.payload, hasher)
-        elif coin.output_type == OUTPUT_P2SH:
-            valid = _verify_p2sh(transaction, index, coin.value, hasher)
-        else:  # pragma: no cover - checked just above
-            raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
-        if not valid:
-            raise ValidationError(f"input {index} has an invalid signature")
+        if verify_signatures:
+            if coin.output_type == OUTPUT_P2PKH:
+                valid = transaction.verify_input_signature(index, coin.value, coin.payload, hasher)
+            else:
+                valid = _verify_p2sh(transaction, index, coin.value, hasher)
+            if not valid:
+                raise ValidationError(f"input {index} has an invalid signature")
         total_in += coin.value
         if total_in > MAX_MONEY:
             raise ValidationError("input values sum to more than the maximum money supply")

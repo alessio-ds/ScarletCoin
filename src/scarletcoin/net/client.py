@@ -51,6 +51,11 @@ class RpcClientError(Exception):
         self.code = code
 
 
+def _is_unknown_method(exc: RpcClientError) -> bool:
+    """Whether the node answered that it does not know the method at all."""
+    return exc.code == -32601 or "unknown method" in str(exc)
+
+
 def default_url(network: str = "mainnet", host: str = "127.0.0.1") -> str:
     """Return the usual RPC URL for a network."""
     return f"http://{host}:{get_params(network).default_rpc_port}"
@@ -160,6 +165,20 @@ class RpcClient:
         """Return the unspent outputs of an address."""
         return self.call("getutxos", address)
 
+    def getutxosmulti(self, addresses: list[str]) -> dict:
+        """Return the unspent outputs of several addresses in one request.
+
+        A node that does not know the method — one that has not been upgraded
+        yet — is asked one address at a time instead, so a new wallet keeps
+        working against an older node.
+        """
+        try:
+            return self.call("getutxosmulti", addresses)
+        except RpcClientError as exc:
+            if not _is_unknown_method(exc):
+                raise
+        return {address: self.getutxos(address) for address in addresses}
+
     def getaddresshistory(self, address: str, limit: int = 100) -> dict:
         """Return the transactions that touched an address."""
         return self.call("getaddresshistory", address, limit)
@@ -171,6 +190,42 @@ class RpcClient:
     def sendrawtransaction(self, raw_hex: str) -> str:
         """Broadcast a serialised transaction and return its id."""
         return self.call("sendrawtransaction", raw_hex)
+
+    def broadcast(self, raw_hex: str, txid: str) -> str:
+        """Broadcast a transaction, tolerating a node that was too slow to answer.
+
+        A public node behind a reverse proxy can return a 502, or the client
+        timeout can fire, while the node is still verifying a large
+        transaction.  The transaction may well have been accepted even though
+        the caller saw a failure, so look for it before reporting the broadcast
+        lost.  A real rejection (a 4xx, or an error the node actually returned)
+        is raised immediately and never retried.
+
+        Args:
+            raw_hex: The serialised transaction.
+            txid: Its id in display order, so the node can be asked about it.
+
+        Returns:
+            The transaction id.
+
+        Raises:
+            RpcClientError: if the node rejected it, or never accepted it.
+        """
+        try:
+            return self.sendrawtransaction(raw_hex)
+        except RpcClientError as exc:
+            if exc.code is not None and exc.code < 500:
+                raise
+            # The verification may still be running: give it time to land in
+            # the mempool (or a block) and then ask the node whether it knows it.
+            for delay in (1.0, 2.0, 4.0):
+                time.sleep(delay)
+                try:
+                    if self.gettransaction(txid):
+                        return txid
+                except RpcClientError:
+                    continue
+            raise
 
     def getblocktemplate(self) -> dict:
         """Fetch a template for the next block."""

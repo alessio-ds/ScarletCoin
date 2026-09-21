@@ -254,6 +254,44 @@ class TestWallet:
             offline.balance()
         assert "error" in offline.node_info()
 
+    def test_coins_are_fetched_for_every_address_in_one_call(self, tmp_path):
+        """A wallet must not pay one round trip per address."""
+        keystore = Keystore.create(tmp_path / "one-call.json", "regtest")
+        second = str(keystore.new_key("second"))
+        first = keystore.default_address()
+        payload = {
+            address: {
+                "address": address,
+                "height": 10,
+                "utxos": [
+                    {
+                        "txid": "00" * 32,
+                        "index": 0,
+                        "value": 1_000,
+                        "height": 1,
+                        "confirmations": 10,
+                        "coinbase": True,
+                        "spendable": True,
+                        "mempool_spent": False,
+                    }
+                ],
+            }
+            for address in (first, second)
+        }
+
+        class FakeClient:
+            def __init__(self):
+                self.calls: list[list[str]] = []
+
+            def getutxosmulti(self, addresses):
+                self.calls.append(list(addresses))
+                return payload
+
+        client = FakeClient()
+        coins = Wallet(keystore, client).coins()
+        assert client.calls == [[first, second]]
+        assert len(coins) == 2
+
 
 class TestSolver:
     def test_scan_finds_an_easy_nonce(self):

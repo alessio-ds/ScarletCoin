@@ -70,13 +70,19 @@ class Wallet:
     def coins(self, *, spendable_only: bool = True) -> list[tuple[OutPoint, Coin]]:
         """Return the wallet's unspent outputs.
 
+        Every address is asked about in a single ``getutxosmulti`` call: one
+        round trip per address is what made a wallet with a handful of
+        addresses slow against a public node.
+
         Raises:
             RpcClientError: if the node cannot be reached.
         """
+        addresses = self.keystore.address_strings()
+        data = self.client.getutxosmulti(addresses)
         result: list[tuple[OutPoint, Coin]] = []
-        for address in self.keystore.address_strings():
+        for address in addresses:
             pubkey_hash = Address.decode(address).hash
-            for item in self.client.getutxos(address)["utxos"]:
+            for item in data.get(address, {}).get("utxos", []):
                 if spendable_only and not item["spendable"]:
                     continue
                 result.append(
@@ -174,7 +180,7 @@ class Wallet:
         )
         txid = built.transaction.txid_hex()
         if broadcast:
-            txid = self.client.sendrawtransaction(built.transaction.serialize().hex())
+            txid = self.client.broadcast(built.transaction.serialize().hex(), txid)
         return SendResult(txid, built.fee, built.change, built.transaction)
 
     def send_everything(
@@ -205,7 +211,7 @@ class Wallet:
         for item in built:
             txid = item.transaction.txid_hex()
             if broadcast:
-                txid = self.client.sendrawtransaction(item.transaction.serialize().hex())
+                txid = self.client.broadcast(item.transaction.serialize().hex(), txid)
             results.append(SendResult(txid, item.fee, item.change, item.transaction))
         return results
 

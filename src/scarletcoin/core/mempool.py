@@ -33,6 +33,13 @@ from scarletcoin.core.validation import (
 
 __all__ = ["Mempool", "MempoolEntry", "MempoolError"]
 
+#: How many verified transaction ids to remember before the cache is dropped.
+#:
+#: The cache only bounds memory: discarding it costs a re-verification, never
+#: correctness, because a transaction's signatures are a property of the
+#: transaction itself.
+MAX_VERIFIED_CACHE = 100_000
+
 
 class MempoolError(ValidationError):
     """Raised when a transaction cannot enter the pool."""
@@ -108,6 +115,14 @@ class Mempool:
         self._spent_by: dict[OutPoint, bytes] = {}
         self._order: list[bytes] = []
         self._total_bytes = 0
+        #: Transaction ids whose signatures have been checked at least once.
+        #:
+        #: A signature commits to the transaction id, the input index and the
+        #: coin being spent; none of those change while the transaction is
+        #: unchanged, so a revalidation only has to confirm the coins still
+        #: exist.  Without this, every new block re-ran every ECDSA check in the
+        #: pool and a many-input transaction could stall the node for seconds.
+        self._verified: set[bytes] = set()
 
     # ------------------------------------------------------------------ queries
 
@@ -123,9 +138,15 @@ class Mempool:
         return self._total_bytes
 
     def is_spent(self, outpoint: OutPoint) -> bool:
-        """Return ``True`` if a pooled transaction already spends ``outpoint``."""
-        with self._lock:
-            return outpoint in self._spent_by
+        """Return ``True`` if a pooled transaction already spends ``outpoint``.
+
+        The spend index is read without taking the main lock on purpose.
+        Verifying a many-input transaction can hold that lock for seconds, and a
+        spendability *hint* — which is all this is — must not queue behind it.
+        A dict membership test is atomic under CPython's GIL; the caller uses
+        the answer to mark an output as unspendable, never to accept a block.
+        """
+        return outpoint in self._spent_by
 
     def get(self, txid: bytes) -> Transaction | None:
         """Return a pooled transaction by id."""
@@ -155,8 +176,14 @@ class Mempool:
 
     # ------------------------------------------------------------------ mutation
 
-    def add(self, transaction: Transaction) -> MempoolEntry:
+    def add(self, transaction: Transaction, *, verify_signatures: bool = True) -> MempoolEntry:
         """Validate ``transaction`` and add it to the pool.
+
+        Args:
+            transaction: The transaction to accept.
+            verify_signatures: Pass ``False`` only for a transaction already in
+                :attr:`_verified` — a revalidation, where the ECDSA checks
+                cannot have changed but the coins still have to be confirmed.
 
         Returns:
             The new pool entry.
@@ -187,6 +214,9 @@ class Mempool:
             if size > self.params.max_block_size // 2:
                 raise MempoolError("transaction is too large to be relayed")
 
+            # A transaction whose signatures we have already checked does not
+            # need them checked again; only the coins can have moved.
+            check_signatures = verify_signatures and txid not in self._verified
             conflicts = {
                 self._spent_by[txin.prevout]
                 for txin in transaction.inputs
@@ -195,12 +225,20 @@ class Mempool:
             if conflicts:
                 ignored = frozenset(txin.prevout for txin in transaction.inputs)
                 fee = check_transaction_inputs(
-                    transaction, self.coin_view(height, ignored), height=height, params=self.params
+                    transaction,
+                    self.coin_view(height, ignored),
+                    height=height,
+                    params=self.params,
+                    verify_signatures=check_signatures,
                 )
                 self._replace_conflicts(transaction, fee, size, conflicts)
             else:
                 fee = check_transaction_inputs(
-                    transaction, self.coin_view(height), height=height, params=self.params
+                    transaction,
+                    self.coin_view(height),
+                    height=height,
+                    params=self.params,
+                    verify_signatures=check_signatures,
                 )
 
             minimum = self.minimum_fee(size)
@@ -209,10 +247,18 @@ class Mempool:
                     f"fee of {fee} scar is below the {minimum} scar minimum for {size} bytes"
                 )
 
+            self._remember_verified(txid)
             entry = MempoolEntry(transaction, txid, fee, size, time.time())
             self._insert(entry)
             self._evict_if_needed()
             return entry
+
+    def _remember_verified(self, txid: bytes) -> None:
+        """Remember that ``txid``'s signatures have been checked once."""
+        if len(self._verified) >= MAX_VERIFIED_CACHE:
+            # A cache, not a ledger: dropping it only costs re-verification.
+            self._verified.clear()
+        self._verified.add(txid)
 
     def _replace_conflicts(self, transaction: Transaction, fee: int, size: int, conflicts) -> None:
         """Replace pooled transactions this one double-spends, or refuse.
@@ -334,20 +380,34 @@ class Mempool:
         with self._lock:
             for transaction in block.transactions[1:]:
                 try:
-                    self.add(transaction)
+                    self.add(
+                        transaction, verify_signatures=transaction.txid() not in self._verified
+                    )
                 except ValidationError:
                     continue
             self._revalidate()
 
     def _revalidate(self) -> None:
-        """Re-check every pooled transaction against the current chain state."""
-        transactions = [self._by_txid[txid].transaction for txid in self._order]
-        self.clear()
-        for transaction in transactions:
-            try:
-                self.add(transaction)
-            except (ValidationError, MissingInputError):
-                continue
+        """Re-check every pooled transaction against the current chain state.
+
+        Signatures are not re-verified for transactions this pool has already
+        checked: the expensive ECDSA work cannot change while the transaction
+        is unchanged, and doing it again for the whole pool on every block is
+        what used to keep the lock held for seconds and stall the node.
+        """
+        with self._lock:
+            if not self._by_txid:
+                return
+            transactions = [self._by_txid[txid].transaction for txid in self._order]
+            self.clear()
+            for transaction in transactions:
+                try:
+                    self.add(
+                        transaction,
+                        verify_signatures=transaction.txid() not in self._verified,
+                    )
+                except (ValidationError, MissingInputError):
+                    continue
 
     # ------------------------------------------------------------ block template
 

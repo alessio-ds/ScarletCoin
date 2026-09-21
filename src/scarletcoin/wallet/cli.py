@@ -286,7 +286,9 @@ def _cmd_send(args: argparse.Namespace) -> int:
             return 1
     try:
         for result in results:
-            txid = wallet.client.sendrawtransaction(result.transaction.serialize().hex())
+            txid = wallet.client.broadcast(
+                result.transaction.serialize().hex(), result.transaction.txid_hex()
+            )
             print(f"broadcast {txid}")
     except RpcClientError as exc:
         die(str(exc))

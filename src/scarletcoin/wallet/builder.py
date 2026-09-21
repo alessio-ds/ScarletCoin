@@ -24,6 +24,7 @@ from scarletcoin.crypto.hashing import hash256
 from scarletcoin.crypto.keys import Address, PrivateKey
 
 __all__ = [
+    "DEFAULT_MAX_SWEEP_INPUTS",
     "PER_INPUT_BYTES",
     "PER_OUTPUT_BYTES",
     "BuiltTransaction",
@@ -42,6 +43,14 @@ __all__ = [
 PER_INPUT_BYTES = 140
 #: Serialised cost of one output: 1-byte type + 8-byte amount + 20-byte hash.
 PER_OUTPUT_BYTES = 29
+#: Most inputs a single sweep transaction should carry.
+#:
+#: The relay limit alone allows a ~500 kB transaction (about 3,500 inputs), but
+#: validating one costs every node real CPU and, behind a reverse proxy, can
+#: outlive the proxy's read timeout.  Chunking well below the byte limit keeps
+#: each broadcast quick to verify while still consolidating a lot of coins at
+#: once.  Pass ``max_inputs_per_tx=None`` to use the byte limit alone.
+DEFAULT_MAX_SWEEP_INPUTS = 1_000
 #: Fixed overhead of the body with single-byte counts: version, input and output
 #: counts, lock time and the empty coinbase-data field.  Exact while a
 #: transaction has fewer than 253 inputs and outputs; :func:`estimate_size`
@@ -239,13 +248,16 @@ def build_sweep_transactions(
     fee_per_kb: int,
     params: ChainParams,
     lock_time: int = 0,
+    max_inputs_per_tx: int | None = DEFAULT_MAX_SWEEP_INPUTS,
 ) -> list[BuiltTransaction]:
     """Sweep *every* coin to one destination, splitting into relay-sized chunks.
 
     A node refuses to relay a transaction larger than half a block, so a wallet
     with many unspent outputs cannot sweep them in one go.  This splits the coins
-    into the largest groups that each fit under that limit and returns one
-    signed, no-change transaction per group, all paying the same destination.
+    into groups that each fit under that limit — and under
+    ``max_inputs_per_tx``, so no single transaction is so expensive to verify
+    that a node or the proxy in front of it gives up — and returns one signed,
+    no-change transaction per group, all paying the same destination.
 
     Raises:
         InsufficientFundsError: if there are no coins, or a chunk cannot cover its fee.
@@ -255,6 +267,8 @@ def build_sweep_transactions(
         raise InsufficientFundsError("there are no coins to spend")
     budget = params.max_block_size // 2
     per_transaction = max(1, _max_inputs_for_budget(budget))
+    if max_inputs_per_tx is not None:
+        per_transaction = min(per_transaction, max(1, int(max_inputs_per_tx)))
     coins = list(spendable_coins)
     built: list[BuiltTransaction] = []
     for start in range(0, len(coins), per_transaction):

@@ -356,6 +356,38 @@ class TestRpc:
         finally:
             node.stop()
 
+    def test_getutxosmulti_answers_every_address_in_one_call(self, rpc, key, other_key):
+        """A wallet must not need one round trip per address."""
+        _, _, client = rpc
+        first = str(key.address(REGTEST.address_version))
+        second = str(other_key.address(REGTEST.address_version))
+        client.call("generate", 2, first)
+        client.call("generate", 1, second)
+
+        result = client.getutxosmulti([first, second])
+        assert set(result) == {first, second}
+        assert len(result[first]["utxos"]) == 2
+        assert len(result[second]["utxos"]) == 1
+        assert all(item["coinbase"] for item in result[first]["utxos"])
+
+    def test_getutxosmulti_is_public(self):
+        from scarletcoin.net.rpc import PUBLIC_METHODS
+
+        assert "getutxosmulti" in PUBLIC_METHODS
+
+    def test_rpc_responses_are_compact(self, rpc):
+        """Indenting every response wasted bandwidth on the wallet's hot path."""
+        _, server, _ = rpc
+        request = urllib.request.Request(
+            server.url + "/rpc",
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getinfo"}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-token"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8")
+        assert "\n" not in body
+        assert json.loads(body)["result"]["network"] == "regtest"
+
 
 class TestRpcClientRetry:
     """Transient connection drops are retried; real errors are not."""
@@ -440,6 +472,73 @@ class TestRpcClientRetry:
         with pytest.raises(RpcClientError, match="401"):
             client.getinfo()
         assert len(calls) == 1
+
+    def test_broadcast_recovers_when_the_node_answers_too_late(self, monkeypatch):
+        """A 502 from the proxy must not lose a transaction the node accepted."""
+        import scarletcoin.net.client as client_module
+
+        client = RpcClient("http://127.0.0.1:1")
+        calls = {"send": 0, "get": 0}
+
+        def late_send(raw):
+            calls["send"] += 1
+            raise RpcClientError("node returned HTTP 502 for sendrawtransaction: ", 502)
+
+        def found(txid):
+            calls["get"] += 1
+            return {"txid": txid}
+
+        monkeypatch.setattr(client, "sendrawtransaction", late_send)
+        monkeypatch.setattr(client, "gettransaction", found)
+        monkeypatch.setattr(client_module.time, "sleep", lambda _seconds: None)
+
+        assert client.broadcast("00", "ab" * 32) == "ab" * 32
+        assert calls == {"send": 1, "get": 1}
+
+    def test_broadcast_does_not_retry_a_rejection(self, monkeypatch):
+        """A genuine refusal is final; it must not be masked by a lookup."""
+        client = RpcClient("http://127.0.0.1:1")
+
+        def refused(raw):
+            raise RpcClientError("transaction is already in the mempool", -32000)
+
+        monkeypatch.setattr(client, "sendrawtransaction", refused)
+        with pytest.raises(RpcClientError, match="already in the mempool"):
+            client.broadcast("00", "ab" * 32)
+
+    def test_broadcast_raises_when_the_transaction_never_landed(self, monkeypatch):
+        import scarletcoin.net.client as client_module
+
+        client = RpcClient("http://127.0.0.1:1")
+
+        def late_send(raw):
+            raise RpcClientError("the node did not answer within 30.0s")
+
+        def missing(txid):
+            raise RpcClientError("no transaction with that id")
+
+        monkeypatch.setattr(client, "sendrawtransaction", late_send)
+        monkeypatch.setattr(client, "gettransaction", missing)
+        monkeypatch.setattr(client_module.time, "sleep", lambda _seconds: None)
+
+        with pytest.raises(RpcClientError, match="did not answer"):
+            client.broadcast("00", "ab" * 32)
+
+    def test_getutxosmulti_falls_back_for_an_older_node(self, monkeypatch):
+        """A new wallet must still work against a node without the method."""
+        client = RpcClient("http://127.0.0.1:1")
+        seen: list[str] = []
+
+        def fake_call(method, *args):
+            seen.append(method)
+            if method == "getutxosmulti":
+                raise RpcClientError("unknown method 'getutxosmulti'", -32601)
+            return {"address": args[0], "height": 1, "utxos": []}
+
+        monkeypatch.setattr(client, "call", fake_call)
+        result = client.getutxosmulti(["a", "b"])
+        assert seen == ["getutxosmulti", "getutxos", "getutxos"]
+        assert set(result) == {"a", "b"}
 
 
 class TestPublicRpc:

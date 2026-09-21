@@ -426,6 +426,7 @@ is configured, requests must carry `Authorization: Bearer <token>`.
 | `validateaddress` | `address` | validity, type and hash |
 | `getbalance` | `address` | confirmed, spendable and immature balance |
 | `getutxos` | `address` | unspent outputs |
+| `getutxosmulti` | `addresses` | unspent outputs for several addresses, keyed by address |
 | `getaddresshistory` | `address`, `limit=100` | transactions touching the address |
 | `getrichlist` | `limit=10` | largest balances |
 | `getblocktemplate` | — | work for a miner |

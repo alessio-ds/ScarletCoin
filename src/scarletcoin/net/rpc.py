@@ -73,6 +73,7 @@ PUBLIC_METHODS = frozenset(
         "getbalance",
         "getbalances",
         "getutxos",
+        "getutxosmulti",
         "getaddresshistory",
         "getrichlist",
         "sendrawtransaction",
@@ -372,6 +373,16 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
             ],
         }
 
+    def getutxosmulti(addresses: list[str]) -> dict:
+        """Return the unspent outputs of several addresses in one call.
+
+        A wallet with many addresses otherwise issues one ``getutxos`` round
+        trip per address, which is slow for the wallet and heavy for a public
+        node.  The result is keyed by address string, exactly as
+        :func:`getbalances` is.
+        """
+        return {str(address): getutxos(str(address)) for address in addresses}
+
     def getaddresshistory(address: str, limit: int = 100) -> dict:
         pubkey_hash = address_hash(address)
         limit = max(1, min(int(limit), 1000))
@@ -553,6 +564,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "getbalance": getbalance,
         "getbalances": getbalances,
         "getutxos": getutxos,
+        "getutxosmulti": getutxosmulti,
         "getaddresshistory": getaddresshistory,
         "getrichlist": getrichlist,
         "getblocktemplate": getblocktemplate,
@@ -796,8 +808,12 @@ class RpcServer:
                 self.end_headers()
 
             def _json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
+                # Compact on purpose: the callers are programs, and a UTXO list
+                # with thousands of entries is mostly whitespace when indented.
                 self._respond(
-                    status, json.dumps(payload, indent=1).encode("utf-8"), "application/json"
+                    status,
+                    json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                    "application/json",
                 )
 
             def _html(self, markup: str, status: HTTPStatus = HTTPStatus.OK) -> None:

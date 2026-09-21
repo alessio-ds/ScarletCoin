@@ -21,7 +21,7 @@ from scarletcoin.wallet.builder import (
     fee_for_size,
     select_coins,
 )
-from tests.helpers import make_node_state, mine_and_add, regtest_params, spend
+from tests.helpers import make_node_state, mine_and_add, mine_block, regtest_params, spend
 
 
 def _coins(*values: int, pubkey_hash: bytes) -> list[tuple[OutPoint, Coin]]:
@@ -218,6 +218,43 @@ class TestMempool:
         assert pool.minimum_fee(2000) == REGTEST.min_relay_fee_per_kb * 2
         assert pool.minimum_fee(1) >= 1
 
+    def test_revalidation_does_not_recheck_signatures(
+        self, chain_and_pool, key, other_key, monkeypatch
+    ):
+        """A new block must not make the pool re-run every ECDSA check.
+
+        Re-verifying the whole pool on every block is what used to hold the
+        mempool lock for seconds and stall the node's RPC reads.
+        """
+        import scarletcoin.core.mempool as mempool_module
+
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        transaction = spend(
+            chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool
+        )
+        assert len(pool) == 1
+
+        seen: list[bool] = []
+        real = mempool_module.check_transaction_inputs
+
+        def counting(transaction, view, *, height, params, verify_signatures=True):
+            seen.append(verify_signatures)
+            return real(
+                transaction,
+                view,
+                height=height,
+                params=params,
+                verify_signatures=verify_signatures,
+            )
+
+        monkeypatch.setattr(mempool_module, "check_transaction_inputs", counting)
+        # A block that does not include the pooled transaction forces the pool
+        # to revalidate it: the coins are checked again, the signatures are not.
+        chain.add_block(mine_block(chain, key, None))
+        assert transaction.txid() in pool
+        assert seen == [False]
+
 
 class TestCoinSelection:
     def test_a_single_covering_coin_is_preferred(self):
@@ -383,3 +420,27 @@ class TestSweep:
             params=REGTEST,
         )
         assert len(results) == 1
+
+    def test_a_sweep_respects_the_input_cap(self):
+        """No single sweep transaction should be huge to verify."""
+        key = PrivateKey.generate()
+        pubkey_hash = key.public_key().hash160()
+        coins = [
+            (OutPoint(bytes([index + 1]) * 32, 0), Coin(10_000, 0, pubkey_hash, 1, False))
+            for index in range(10)
+        ]
+        results = build_sweep_transactions(
+            spendable_coins=coins,
+            keys={pubkey_hash: key},
+            destination=pubkey_hash,
+            fee_per_kb=1000,
+            params=REGTEST,
+            max_inputs_per_tx=4,
+        )
+        assert [len(built.transaction.inputs) for built in results] == [4, 4, 2]
+        assert sum(built.total_input for built in results) == 10 * 10_000
+
+    def test_the_default_cap_keeps_chunks_small(self):
+        from scarletcoin.wallet.builder import DEFAULT_MAX_SWEEP_INPUTS
+
+        assert 0 < DEFAULT_MAX_SWEEP_INPUTS <= 2_000

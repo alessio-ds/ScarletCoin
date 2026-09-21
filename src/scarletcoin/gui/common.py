@@ -267,8 +267,14 @@ class ConnectionSettings:
         """Store the settings, keeping the file private."""
         save_connection(datadir, network, NodeConnection(self.url, self.token))
 
-    def client(self, timeout: float = 20.0) -> RpcClient:
-        """Build a client from these settings."""
+    def client(self, timeout: float = 60.0) -> RpcClient:
+        """Build a client from these settings.
+
+        The default is generous on purpose: a wallet asking a public node for
+        its unspent outputs, or broadcasting a large transaction, is not a
+        liveness probe.  Code that wants a quick "is it there?" answer asks
+        :meth:`answers`, which uses its own short timeout.
+        """
         return RpcClient(self.url, token=self.token or None, timeout=timeout)
 
     def answers(self, timeout: float = 6.0) -> bool:
