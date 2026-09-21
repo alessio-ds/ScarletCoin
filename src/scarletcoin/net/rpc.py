@@ -929,5 +929,9 @@ def metrics_text(node: Node) -> str:
         "# HELP scarletcoin_auxpow_templates_created_total AuxPoW templates served.",
         "# TYPE scarletcoin_auxpow_templates_created_total counter",
         f"scarletcoin_auxpow_templates_created_total {node.auxpow_templates_created_total}",
+        "# HELP scarletcoin_auxpow_candidates Cached AuxPoW candidates, one per"
+        " miner when a bridge pays each miner its own address.",
+        "# TYPE scarletcoin_auxpow_candidates gauge",
+        f"scarletcoin_auxpow_candidates {node.aux_candidate_count}",
     ]
     return "\n".join(lines) + "\n"

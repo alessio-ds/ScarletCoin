@@ -263,6 +263,29 @@ class TestPublicRpcSurface:
         assert "scarletcoin_peers" in body
         assert response.headers["Content-Type"].startswith("text/plain")
 
+    def test_metrics_report_how_many_aux_candidates_are_cached(self, rpc, key):
+        """Operators size --max-aux-candidates off this number.
+
+        A bridge paying every miner its own address holds one candidate per
+        connected miner, so a gauge pinned at the limit means it is evicting
+        candidates miners are still hashing for.
+        """
+        node, server, client = rpc
+        import urllib.request
+
+        address = str(key.address(node.params.address_version))
+        before = node.aux_candidate_count
+        for _ in range(3):
+            client.call("createauxblock", address)
+        assert node.aux_candidate_count > before
+
+        with urllib.request.urlopen(f"{server.url}/metrics", timeout=10.0) as response:
+            body = response.read().decode("utf-8")
+        line = next(
+            ln for ln in body.splitlines() if ln.startswith("scarletcoin_auxpow_candidates ")
+        )
+        assert int(line.rsplit(" ", 1)[1]) == node.aux_candidate_count
+
     def test_getinfo_says_whether_the_node_is_public(self, public_node, rpc):
         _, server = public_node
         public = directory.RpcClient(server.url, timeout=5.0).getinfo()

@@ -83,7 +83,11 @@ def rpc(tmp_path) -> Iterator[tuple[Node, RpcServer, RpcClient]]:
     running = _start_node(tmp_path, "rpcnode", listen=False)
     server = RpcServer(running, port=0, token="test-token")
     server.start()
-    client = RpcClient(server.url, token="test-token", timeout=15.0)
+    # Generous on purpose: some tests ask the node to mine a couple of hundred
+    # regtest blocks in one call, and a busy CI runner can take longer than a
+    # liveness-sized timeout to answer.  A too-short timeout here fails the
+    # test for the machine's load, not for anything the node did.
+    client = RpcClient(server.url, token="test-token", timeout=60.0)
     yield running, server, client
     server.stop()
     running.stop()

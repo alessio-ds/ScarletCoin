@@ -1096,6 +1096,18 @@ class Node:
                 self._aux_candidates.popitem(last=False)
             self._aux_candidates[candidate.aux_block_hash] = candidate
 
+    @property
+    def aux_candidate_count(self) -> int:
+        """How many AuxPoW candidates are currently cached.
+
+        A bridge that pays every miner its own address holds one candidate per
+        connected miner, so this is the number to watch when deciding whether
+        ``--max-aux-candidates`` is large enough: when it sits at the limit,
+        the bridge is evicting candidates that some miner is still hashing for.
+        """
+        with self._aux_candidates_lock:
+            return len(self._aux_candidates)
+
     def find_aux_candidate(self, aux_block_hash: bytes):
         """Return the stored candidate for ``aux_block_hash``, or ``None``.
 
