@@ -1,0 +1,65 @@
+#!/sbin/openrc-run
+
+name="scarlet-node"
+description="ScarletCoin node"
+
+# -- Tunables (set in /etc/conf.d/scarlet-node) -------------------------
+: ${network:=mainnet}
+: ${datadir:=/var/lib/scarletcoin}
+: ${p2p_port:=20333}
+: ${rpc_host:=127.0.0.1}
+: ${rpc_port:=20332}
+# Public mining exposes createauxblock / submitauxblock / getblocktemplate /
+# submitblock without a token, which is what lets a Stratum bridge -- or any
+# other merged-mining pool -- build proofs against this node.
+: ${rpc_public_mining:=yes}
+# A peer to fall back on when the seed list is not used.
+: ${public_peer:=http://74.113.235.48:20332}
+# How many createauxblock candidates to keep.
+#
+# A bridge that pays every miner its own address asks for one candidate per
+# connected miner per job refresh, so this is really "how many miners can be
+# served at once": when it fills, the oldest candidate is evicted and a miner
+# still hashing for it finds its block refused with "no AuxPoW candidate with
+# that hash".
+#
+# Candidates are cheap.  They hold a tuple of references to transactions that
+# the mempool already owns, not copies, so an empty mempool is a few dozen
+# bytes each and 512 of them measured as no measurable RSS change.  Raise it
+# for a busy pool; it is bounded by available memory, not by this number.
+: ${max_aux_candidates:=512}
+# -----------------------------------------------------------------------
+
+aux_flag=""
+if [ -n "${max_aux_candidates}" ]; then
+    aux_flag="--max-aux-candidates ${max_aux_candidates}"
+fi
+
+mining_flag=""
+if [ "${rpc_public_mining}" = "yes" ]; then
+    mining_flag="--rpc-public-mining"
+fi
+
+command="/opt/scarletcoin/.venv/bin/scarlet-node"
+command_args="--network ${network} --datadir ${datadir}
+    --p2p-port ${p2p_port}
+    --rpc-host ${rpc_host} --rpc-port ${rpc_port}
+    ${mining_flag}
+    --no-seeds ${public_peer:+--public-peer ${public_peer}}
+    ${aux_flag}"
+command_user="scarlet:scarlet"
+
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/scarletcoin/node.log"
+error_log="/var/log/scarletcoin/node.log"
+
+depend() {
+    need net
+    after firewall chronyd
+}
+
+start_pre() {
+    checkpath -d -o scarlet:scarlet -m 0750 "${datadir}" /var/log/scarletcoin
+}
