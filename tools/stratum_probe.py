@@ -230,7 +230,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1", help="pool host")
     parser.add_argument("--port", type=int, default=3333, help="pool Stratum port")
-    parser.add_argument("--worker", default="probe", help="worker name to authorize as")
+    parser.add_argument(
+        "--worker",
+        default="probe",
+        help="rig label; the pool is told '<payout-address>.<label>' because the"
+        " address is what the block reward is paid to",
+    )
     parser.add_argument(
         "--rpc-url",
         default="http://127.0.0.1:20332",
@@ -270,11 +275,14 @@ def main(argv: list[str] | None = None) -> int:
         difficulty = float(difficulty_msg["params"][0])
         print(f"share difficulty: {difficulty:g}")
 
-        authorized = client.call("mining.authorize", [args.worker, "x"])
+        # A Stratum miner cannot build its own coinbase, so the pool has to be
+        # told where to pay; the convention is "ADDRESS" or "ADDRESS.rig".
+        username = f"{args.payout_address}.{args.worker}" if args.payout_address else args.worker
+        authorized = client.call("mining.authorize", [username, "x"])
         if authorized.get("result") is not True:
             print(f"authorize failed: {authorized.get('error')}")
             return 1
-        print("authorized")
+        print(f"authorized as {username}")
 
         # The parent chain is simulated, so the job's prevhash has nothing to
         # do with the ScarletCoin tip; the target has to come from the node's
@@ -304,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
             reply = client.call(
                 "mining.submit",
-                [args.worker, job.job_id, extranonce2, job.ntime, f"{nonce:08x}"],
+                [username, job.job_id, extranonce2, job.ntime, f"{nonce:08x}"],
             )
             print(f"  submit reply: {reply}")
 

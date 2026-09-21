@@ -94,7 +94,11 @@ chmod +x /etc/init.d/scarletcoin-stratum
 
 # Create the config file with your real values
 cat > /etc/conf.d/scarletcoin-stratum <<'EOF'
-payout_address="<your-sct-address>"
+# Optional. Miners are paid the address in their worker name by default.
+# Set this (and allow_pool_payout="yes") only to pay miners that send no
+# address to you instead of refusing them.
+payout_address=""
+allow_pool_payout="no"
 scarlet_url="http://127.0.0.1:20332"
 chain_id="1"
 port="3333"
@@ -168,7 +172,7 @@ Give miners this info:
 
 ```
 URL:    stratum+tcp://scarletcoin.remotewire.net:3333
-Worker: Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  (your SCT payout address)
+Worker: <your-sct-address>            (add ".rig1" to name a rig)
 Pass:   x  (ignored)
 ```
 
@@ -207,7 +211,7 @@ path — a consensus change, not a configuration option.
 |---------|-------------|-----|
 | Bridge exits immediately | Wrong RPC token | Check `/var/lib/scarletcoin/mainnet/rpc.token` |
 | "AuxPoW is not configured" | Wrong chain-id | Use `chain_id="1"` for mainnet |
-| "payout_address is still placeholder" | Not configured | Edit `/etc/conf.d/scarletcoin-stratum` |
+| "put your ScarletCoin address in the worker name" | The miner authorised with no payout address | Use `ADDRESS` or `ADDRESS.rig1` as the username, or set `allow_pool_payout="yes"` to pay those miners the pool address |
 | Miners connect but get no jobs | RPC connection lost | Check `scarlet_url` is reachable from localhost |
 | Port 3333 closed | Firewall | `iptables -A INPUT -p tcp --dport 3333 -j ACCEPT` |
 

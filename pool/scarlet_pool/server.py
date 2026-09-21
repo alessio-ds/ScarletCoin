@@ -27,10 +27,11 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 
+from scarletcoin.crypto.keys import Address, InvalidKeyError
 from scarletcoin.net.client import RpcClient
 
 from .coinbase import CoinbaseBuilder
-from .jobs import JobManager, ParentChainClient, ParentTemplate
+from .jobs import JobManager, ParentChainClient, ParentTemplate, _ActiveJob
 from .stratum import (
     DEFAULT_READ_TIMEOUT,
     StratumError,
@@ -100,6 +101,28 @@ class SimulatedParentChain:
         return block_hash
 
 
+def payout_address_from_worker(worker: str) -> str | None:
+    """Return the ScarletCoin address embedded in a Stratum worker name.
+
+    A Stratum miner cannot build its own coinbase - the pool does - so the only
+    way it can be paid is to tell the pool where.  The usual pool convention is
+    ``ADDRESS`` or ``ADDRESS.rig1``, which lets a miner name its rig without
+    losing its payout.
+
+    Returns ``None`` when the worker name carries no address.  The network
+    version is not checked here; the node rejects a wrong-network address when
+    the pool asks it for a candidate.
+    """
+    candidate = worker.strip().split(".", 1)[0].split(":", 1)[0]
+    if not candidate:
+        return None
+    try:
+        Address.decode(candidate)
+    except InvalidKeyError:
+        return None
+    return candidate
+
+
 # ── Stratum session (one per connected miner) ────────────────────────────
 
 
@@ -114,6 +137,8 @@ class StratumSession:
         on_disconnect: Callable[[StratumSession], None],
         read_timeout: float = DEFAULT_READ_TIMEOUT,
         on_block: Callable[[], Awaitable[None]] | None = None,
+        default_payout_address: str = "",
+        allow_pool_payout: bool = False,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -121,6 +146,8 @@ class StratumSession:
         self._on_disconnect = on_disconnect
         self._read_timeout = read_timeout
         self._on_block = on_block
+        self._default_payout_address = default_payout_address
+        self._allow_pool_payout = allow_pool_payout
 
         self.worker_name: str = "unknown"
         self.address: str = writer.get_extra_info("peername", ("?", 0))[0]
@@ -129,6 +156,12 @@ class StratumSession:
         self.extranonce1: str = ""
         self.extranonce2_size: int = 4
         self.subscription_id: str = ""
+
+        #: The payout address this miner authorised with, and the job built for
+        #: it.  Both are per session: every miner is paid its own address, so
+        #: every miner needs its own parent coinbase.
+        self.payout_address: str = ""
+        self.job: _ActiveJob | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -176,8 +209,8 @@ class StratumSession:
             await self._send_error(req.id, -32601, f"unknown method {method!r}")
 
     async def send_job(self, clean: bool = False) -> None:
-        """Push the current job to this miner."""
-        job = self._manager.current
+        """Push this miner's own job to it."""
+        job = self.job
         if job is None:
             return
         msg = encode_message(
@@ -244,13 +277,48 @@ class StratumSession:
         )
 
     async def _handle_authorize(self, req: StratumRequest) -> None:
-        if len(req.params) >= 1:
-            self.worker_name = str(req.params[0])
+        if not req.params:
+            await self._send_error(req.id, -32602, "missing worker name")
+            return
+
+        worker = str(req.params[0])
+        address = payout_address_from_worker(worker)
+        if address is None:
+            if self._allow_pool_payout and self._default_payout_address:
+                # Explicitly opted in: this miner is paid the pool's address.
+                address = self._default_payout_address
+                logger.warning(
+                    "worker %r gave no payout address; paying the pool address %s instead",
+                    worker[:60],
+                    address,
+                )
+            else:
+                await self._send_error(
+                    req.id,
+                    -32002,
+                    "put your ScarletCoin address in the worker name so the pool can"
+                    " pay you, for example SYoFdo....rig1",
+                )
+                logger.warning(
+                    "rejected worker %r from %s: no payout address in the worker name",
+                    worker[:60],
+                    self.address,
+                )
+                return
+
+        self.worker_name = worker
+        self.payout_address = address
         self.authorized = True
-        logger.info("worker %s authorized", self.worker_name)
+        logger.info("worker %s authorized, mining to %s", worker, address)
         await self._send_result(req.id, True)
-        if self._manager.current is not None:
-            await self.send_job(clean=True)
+        await self._refresh_own_job()
+
+    async def _refresh_own_job(self) -> None:
+        """Build and push a job whose coinbase pays this miner."""
+        if not self.authorized or not self.payout_address:
+            return
+        self.job = self._manager.refresh(self.payout_address)
+        await self.send_job(clean=True)
 
     async def _handle_submit(self, req: StratumRequest) -> None:
         if not self.authorized:
@@ -269,7 +337,13 @@ class StratumSession:
             await self._send_error(req.id, -32602, f"bad params: {exc}")
             return
 
-        share = self._manager.process_share(job_id, self.extranonce1, extranonce2, ntime, nonce)
+        job = self.job
+        if job is None or job.job_id != job_id:
+            logger.debug("share rejected from %s: stale job", worker or self.address)
+            await self._send_result(req.id, False)
+            return
+
+        share = self._manager.process_share(job, self.extranonce1, extranonce2, ntime, nonce)
         if not share.accepted:
             logger.debug("share rejected from %s: %s", worker or self.address, share.reason)
             await self._send_result(req.id, False)
@@ -283,7 +357,7 @@ class StratumSession:
                 share.hash_hex,
             )
             result = self._manager.submit_sct_block(
-                job_id, self.extranonce1, extranonce2, ntime, nonce
+                job, self.extranonce1, extranonce2, ntime, nonce
             )
             if result and result.get("status") == "connected":
                 logger.info("SCT block accepted: %s", result.get("hash"))
@@ -325,10 +399,14 @@ class StratumServer:
         manager: JobManager,
         job_interval: float = 30.0,
         client_timeout: float = DEFAULT_READ_TIMEOUT,
+        default_payout_address: str = "",
+        allow_pool_payout: bool = False,
     ) -> None:
         self._host = host
         self._port = port
         self._manager = manager
+        self._default_payout_address = default_payout_address
+        self._allow_pool_payout = allow_pool_payout
         self._job_interval = max(5.0, float(job_interval))
         if client_timeout <= 0:
             raise ValueError("client timeout must be positive")
@@ -386,6 +464,8 @@ class StratumServer:
             self._on_disconnect,
             read_timeout=self._client_timeout,
             on_block=self.refresh_job,
+            default_payout_address=self._default_payout_address,
+            allow_pool_payout=self._allow_pool_payout,
         )
         self._sessions.add(session)
         logger.info("miner connected from %s (total: %s)", session.address, len(self._sessions))
@@ -399,18 +479,31 @@ class StratumServer:
         logger.info("miner disconnected from %s (total: %s)", session.address, len(self._sessions))
 
     async def refresh_job(self) -> None:
-        """Fetch a fresh template and push it to every authorized miner."""
-        job = self._manager.refresh()
-        logger.debug(
-            "new job %s (sct height=%s, share target=%064x)",
-            job.job_id,
-            job.scarlet.height,
-            self._manager.share_target,
-        )
+        """Rebuild every authorized miner's own job and push it.
+
+        Each miner gets a job whose coinbase pays *that* miner, so this is one
+        ``createauxblock`` per miner rather than one per pool.  A miner whose
+        job cannot be built keeps its previous job rather than being dropped.
+        """
         for session in list(self._sessions):
-            if session.authorized:
-                with contextlib.suppress(Exception):
-                    await session.send_job(clean=True)
+            if not session.authorized:
+                continue
+            try:
+                await session._refresh_own_job()
+            except Exception as exc:
+                logger.error(
+                    "job refresh failed for %s (%s): %s",
+                    session.payout_address or session.address,
+                    session.address,
+                    exc,
+                )
+        if self._manager.current is not None:
+            logger.debug(
+                "refreshed %s jobs (sct height=%s, share target=%064x)",
+                sum(1 for s in self._sessions if s.authorized),
+                self._manager.current.scarlet.height,
+                self._manager.share_target,
+            )
 
     async def _refresh_loop(self) -> None:
         """Periodically refresh templates and push new jobs."""
@@ -440,6 +533,7 @@ def create_server(
     share_difficulty: float | None = DEFAULT_SHARE_DIFFICULTY,
     chain_id: int = 0,
     parent: ParentChainClient | None = None,
+    allow_pool_payout: bool = False,
 ) -> StratumServer:
     """Build a Stratum server wired to a ScarletCoin node.
 
@@ -458,6 +552,7 @@ def create_server(
         coinbase_builder=CoinbaseBuilder(),
     )
     return StratumServer(
+        allow_pool_payout=allow_pool_payout,
         host=host,
         port=port,
         manager=manager,
@@ -480,7 +575,19 @@ def _main() -> None:
         default=None,
         help="ScarletCoin RPC bearer token (omit when the node runs --rpc-public-mining)",
     )
-    parser.add_argument("--payout-address", default="", help="SCT address for block rewards")
+    parser.add_argument(
+        "--payout-address",
+        default="",
+        help="Fallback SCT address. By default it is unused: each miner is paid"
+        " the address in its worker name. Only used with --allow-pool-payout.",
+    )
+    parser.add_argument(
+        "--allow-pool-payout",
+        action="store_true",
+        help="Pay miners that do not put an address in their worker name to"
+        " --payout-address instead of rejecting them. Without this, such a"
+        " miner is refused rather than silently mining for the pool.",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Stratum listen address")
     parser.add_argument("--port", type=int, default=3333, help="Stratum listen port")
     parser.add_argument("--job-interval", type=float, default=30.0, help="Seconds between new jobs")
@@ -509,8 +616,8 @@ def _main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    if not args.payout_address:
-        parser.error("--payout-address is required: it receives every SCT block reward")
+    if args.allow_pool_payout and not args.payout_address:
+        parser.error("--allow-pool-payout needs --payout-address to fall back to")
 
     server = create_server(
         scarlet_url=args.scarlet_url,
@@ -522,9 +629,13 @@ def _main() -> None:
         client_timeout=args.client_timeout,
         share_difficulty=args.share_difficulty,
         chain_id=args.chain_id,
+        allow_pool_payout=args.allow_pool_payout,
     )
     logger.info("ScarletCoin node: %s", args.scarlet_url)
-    logger.info("Payout address: %s", args.payout_address)
+    if args.allow_pool_payout:
+        logger.info("Miners without an address are paid to %s", args.payout_address)
+    else:
+        logger.info("Every miner is paid the address in its worker name")
     logger.info(
         "Share difficulty: %s",
         "auto (derived from the chain target)"

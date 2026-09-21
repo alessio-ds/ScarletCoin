@@ -29,6 +29,7 @@ from scarletcoin.core.block import merkle_root
 from scarletcoin.core.coinbase import build_coinbase
 from scarletcoin.core.serialize import Writer
 from scarletcoin.crypto.hashing import hash256
+from scarletcoin.crypto.keys import Address
 from scarletcoin.net.client import RpcClientError
 
 # ------------------------------------------------------------------ helpers
@@ -287,17 +288,58 @@ class TestJobManager:
         node, _server, client = rpc
         manager = _manager(node, client, str(key.address(node.params.address_version)))
         job = manager.refresh()
-        result = manager.process_share(job.job_id, "aabbccdd", "00", job.ntime, 0)
+        result = manager.process_share(job, "aabbccdd", "00", job.ntime, 0)
         assert result.accepted is False
         assert "extranonce2" in result.reason
 
-    def test_stale_job_is_rejected(self, rpc, key):
+    def test_two_miners_are_paid_two_different_addresses(self, rpc, key):
+        """The whole point of per-miner jobs: each block pays its finder.
+
+        A Stratum miner cannot build its own coinbase, so if the pool hands
+        every miner the same one, everyone who connects mines for the pool
+        operator.  Building a job per payout address is what fixes that, and
+        the only proof is where the mined blocks actually pay.
+        """
+        node, _server, client = rpc
+        version = node.params.address_version
+        first = Address(version, b"\x11" * 20)
+        second = Address(version, b"\x22" * 20)
+
+        manager = _manager(node, client, str(first))
+
+        def mine_with(address: Address) -> str:
+            job = manager.refresh(str(address))
+            en1, en2 = "aabbccdd", "00000000"
+            coinbase = _miner_coinbase(job.coinbase.coinbase1, en1, en2, job.coinbase.coinbase2)
+            nonce, _header = _solve(
+                version=job.parent.version,
+                prev_hash=bytes.fromhex(job.parent.prev_hash),
+                coinbase=coinbase,
+                branches=job.merkle_branches,
+                ntime=job.ntime,
+                nbits=job.parent.nbits,
+                target=min(job.scarlet.target, manager.share_target),
+            )
+            result = manager.submit_sct_block(job, en1, en2, job.ntime, nonce)
+            assert result is not None and result["status"] == "connected", result
+            block = node.chain.storage.get_block(node.chain.tip_hash)
+            paid = block.transactions[0].outputs[0].payload
+            return str(Address(version, paid))
+
+        assert mine_with(first) == str(first)
+        assert mine_with(second) == str(second)
+        assert manager.sct_blocks_accepted == 2
+
+    def test_an_older_job_is_still_judged_against_its_own_coinbase(self, rpc, key):
+        """Every miner holds its own job, so a job must not be rejected merely
+        for not being the most recently built one."""
         node, _server, client = rpc
         manager = _manager(node, client, str(key.address(node.params.address_version)))
-        manager.refresh()
-        result = manager.process_share("deadbeef", "aabbccdd", "00000000", 1, 0)
-        assert result.accepted is False
-        assert result.reason == "stale job"
+        mine = manager.refresh()
+        manager.refresh()  # another miner's job becomes the newest
+        result = manager.process_share(mine, "aabbccdd", "00000000", mine.ntime, 0)
+        # What matters is that a job is never refused for not being the newest.
+        assert result.reason != "stale job"
 
     def test_a_valid_share_becomes_an_accepted_block(self, rpc, key):
         """Drive a whole share through the manager and into a real block."""
@@ -319,11 +361,11 @@ class TestJobManager:
             target=min(job.scarlet.target, manager.share_target),
         )
 
-        share = manager.process_share(job.job_id, en1, en2, job.ntime, nonce)
+        share = manager.process_share(job, en1, en2, job.ntime, nonce)
         assert share.accepted is True, share.reason
         assert share.meets_sct_target is True
 
-        result = manager.submit_sct_block(job.job_id, en1, en2, job.ntime, nonce)
+        result = manager.submit_sct_block(job, en1, en2, job.ntime, nonce)
         assert result is not None
         assert result["status"] == "connected"
         assert manager.sct_blocks_accepted == 1
@@ -351,7 +393,7 @@ class TestJobManager:
             raise RpcClientError("no AuxPoW candidate with that hash; the tip advanced")
 
         monkeypatch.setattr(client, "call", stale)
-        result = manager.submit_sct_block(job.job_id, en1, en2, job.ntime, nonce)
+        result = manager.submit_sct_block(job, en1, en2, job.ntime, nonce)
         assert result is not None
         assert result["status"] == "rejected"
         assert manager.sct_blocks_rejected == 1
@@ -363,7 +405,7 @@ class TestJobManager:
         manager = _manager(node, client, str(key.address(node.params.address_version)))
         job = manager.refresh()
         manager.share_target = 1  # astronomically hard
-        result = manager.process_share(job.job_id, "aabbccdd", "00000000", job.ntime, 0)
+        result = manager.process_share(job, "aabbccdd", "00000000", job.ntime, 0)
         assert result.accepted is False
         assert result.reason == "share above target"
 
@@ -443,6 +485,54 @@ class TestStratumWireProtocol:
         finally:
             await stratum.stop()
 
+    def test_a_worker_without_an_address_is_refused(self, rpc, key):
+        """Nobody should be able to mine for the operator by accident.
+
+        If the pool silently accepted a worker name with no address, that
+        miner's hashrate would pay the pool's address without the miner ever
+        being told.  Refuse instead, and say what to do.
+        """
+        node, _server, client = rpc
+        manager = _manager(node, client, str(key.address(node.params.address_version)))
+        stratum = StratumServer(host="127.0.0.1", port=0, manager=manager, job_interval=3600)
+        asyncio.run(self._authorize(stratum, "rig1", expect_ok=False))
+
+    def test_a_worker_without_an_address_is_accepted_when_the_pool_opts_in(self, rpc, key):
+        """--allow-pool-payout is the explicit escape hatch, not the default."""
+        node, _server, client = rpc
+        operator = str(key.address(node.params.address_version))
+        manager = _manager(node, client, operator)
+        stratum = StratumServer(
+            host="127.0.0.1",
+            port=0,
+            manager=manager,
+            job_interval=3600,
+            default_payout_address=operator,
+            allow_pool_payout=True,
+        )
+        asyncio.run(self._authorize(stratum, "rig1", expect_ok=True))
+
+    async def _authorize(self, stratum: StratumServer, worker: str, *, expect_ok: bool) -> None:
+        await stratum.start()
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", stratum.port)
+            try:
+                await _send(writer, {"id": 1, "method": "mining.subscribe", "params": ["t/1"]})
+                await _recv_id(reader, 1)
+                await _send(
+                    writer, {"id": 2, "method": "mining.authorize", "params": [worker, "x"]}
+                )
+                reply = await _recv_id(reader, 2)
+                if expect_ok:
+                    assert reply.get("result") is True
+                else:
+                    assert reply.get("result") is not True
+                    assert "address" in json.dumps(reply.get("error", "")).lower()
+            finally:
+                writer.close()
+        finally:
+            await stratum.stop()
+
     def test_subscribe_authorize_and_submit_a_block(self, rpc, key):
         node, _server, client = rpc
         manager = _manager(node, client, str(key.address(node.params.address_version)))
@@ -466,7 +556,12 @@ class TestStratumWireProtocol:
                 assert extranonce2_size == 4
 
                 await _send(
-                    writer, {"id": 2, "method": "mining.authorize", "params": ["worker", "x"]}
+                    writer,
+                    {
+                        "id": 2,
+                        "method": "mining.authorize",
+                        "params": [f"{manager._payout_address}.rig1", "x"],
+                    },
                 )
                 assert (await _recv_id(reader, 2))["result"] is True
 

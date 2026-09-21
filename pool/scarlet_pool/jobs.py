@@ -212,13 +212,18 @@ class JobManager:
 
     # ── template rotation ──────────────────────────────────────────────
 
-    def refresh(self) -> _ActiveJob:
+    def refresh(self, payout_address: str | None = None) -> _ActiveJob:
         """Fetch fresh templates from both chains and build a new job.
 
-        Returns the new active job.  Miners receive a ``clean_jobs``
-        notification telling them to drop everything older.
+        ``payout_address`` is the address that will receive the block reward if
+        this job wins.  A Stratum miner cannot choose its own coinbase, so the
+        pool has to build one per miner for each miner to be paid.
+
+        Returns the new job.  Miners receive a ``clean_jobs`` notification
+        telling them to drop everything older.
         """
-        scarlet_raw = self._scarlet.call("createauxblock", self._payout_address)
+        address = payout_address or self._payout_address
+        scarlet_raw = self._scarlet.call("createauxblock", address)
         if not isinstance(scarlet_raw, dict):
             raise RuntimeError(f"unexpected createauxblock reply: {scarlet_raw!r}")
 
@@ -297,18 +302,18 @@ class JobManager:
 
     def process_share(
         self,
-        job_id: str,
+        job: _ActiveJob,
         extranonce1_hex: str,
         extranonce2_hex: str,
         ntime: int,
         nonce: int,
     ) -> ShareResult:
-        """Validate a submitted share and check for block eligibility."""
-        job = self._current
-        if job is None or job.job_id != job_id:
-            self.shares_rejected += 1
-            return ShareResult(accepted=False, reason="stale job")
+        """Validate a submitted share and check for block eligibility.
 
+        ``job`` is the job the submitting session was given, which is not
+        necessarily the most recently built one: every miner gets its own job so
+        that it can be paid its own address.
+        """
         if len(extranonce2_hex) != job.coinbase.extranonce2_size * 2:
             self.shares_rejected += 1
             return ShareResult(accepted=False, reason="bad extranonce2 size")
@@ -333,17 +338,13 @@ class JobManager:
 
     def submit_sct_block(
         self,
-        job_id: str,
+        job: _ActiveJob,
         extranonce1_hex: str,
         extranonce2_hex: str,
         ntime: int,
         nonce: int,
     ) -> dict | None:
         """Assemble and submit an AuxPoW proof for a share that met the SCT target."""
-        job = self._current
-        if job is None or job.job_id != job_id:
-            return None
-
         header_bytes = self._parent_header(job, extranonce1_hex, extranonce2_hex, ntime, nonce)
 
         parts = (

@@ -3,9 +3,18 @@
 name="scarletcoin-stratum"
 description="ScarletCoin merged-mining Stratum bridge"
 
-# -- You MUST set these before starting --------------------------------
-# The SCT address that receives block rewards.
-: ${payout_address:=Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
+# NOTE: by default every miner is paid the address it puts in its worker
+# name ("ADDRESS" or "ADDRESS.rig1"), because a Stratum miner cannot build
+# its own coinbase.  A miner that sends no address is REFUSED rather than
+# silently mining for this pool.
+#
+# -- Optional ----------------------------------------------------------
+# Fallback SCT address, only used when allow_pool_payout="yes".  Leave it
+# empty for the default behaviour, where every miner names its own address.
+: ${payout_address:=}
+# Set to "yes" to pay miners that send no address to ${payout_address}
+# instead of refusing them.  Only do this on a pool you control.
+: ${allow_pool_payout:=no}
 # The node's RPC token.  Only needed when the node does NOT run with
 # --rpc-public-mining.  Find it with:
 #   cat /var/lib/scarletcoin/mainnet/rpc.token
@@ -29,17 +38,24 @@ description="ScarletCoin merged-mining Stratum bridge"
 : ${client_timeout:=600}
 # ---------------------------------------------------------------------
 
+# Only the opt-in case passes the flag; the default is strict.
+pool_payout_flag=""
+if [ "${allow_pool_payout}" = "yes" ]; then
+    pool_payout_flag="--allow-pool-payout"
+fi
+
 command="/opt/scarletcoin/.venv/bin/python"
 command_args="-m pool.scarlet_pool.server
     --scarlet-url ${scarlet_url}
     ${scarlet_token:+--scarlet-token ${scarlet_token}}
-    --payout-address ${payout_address}
+    ${payout_address:+--payout-address ${payout_address}}
     --chain-id ${chain_id}
     ${share_difficulty:+--share-difficulty ${share_difficulty}}
     --host ${host}
     --port ${port}
     --job-interval ${job_interval}
-    --client-timeout ${client_timeout}"
+    --client-timeout ${client_timeout}
+    ${pool_payout_flag}"
 # The bridge is not an installed package, so it has to run from the checkout
 # for ``python -m pool.scarlet_pool.server`` to resolve.
 directory="/opt/scarletcoin"
@@ -58,9 +74,9 @@ depend() {
 
 start_pre() {
     checkpath -d -o scarlet:scarlet -m 0750 /var/log/scarletcoin
-    if [ "${payout_address}" = "Sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ]; then
-        eerror "payout_address is still the placeholder."
-        eerror "Set it to your actual SCT address in /etc/conf.d/scarletcoin-stratum"
+    if [ "${allow_pool_payout}" = "yes" ] && [ -z "${payout_address}" ]; then
+        eerror "allow_pool_payout=yes needs payout_address set to the"
+        eerror "address that should receive those blocks."
         return 1
     fi
     if ! wget -q -T 5 -O /dev/null "${scarlet_url}/api/info"; then

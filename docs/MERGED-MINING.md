@@ -13,13 +13,14 @@ Your existing Antminer / Whatsminer / Avalon
         ▼
   Merged-mining pool  ──── createauxblock / submitauxblock ────►  ScarletCoin node
         │
-        └─── SCT block reward ──►  the pool's payout address
+        └─── SCT block reward ──►  the address in the miner's worker name
 ```
 
 ## What this does and does not do
 
 **It works today:** an ASIC pointed at the pool mines **ScarletCoin**, and SCT
-block rewards go to the pool's payout address. This is the useful part, and it
+block rewards are paid to the address the miner puts in its worker name. This is
+the useful part, and it
 needs no ASIC changes.
 
 **It does not produce real Bitcoin blocks.** ScarletCoin's consensus validates
@@ -39,7 +40,7 @@ Worker:   <your-sct-address>
 Password: anything (ignored)
 ```
 
-The worker name is passed to the node as the payout address, so use a real SCT
+The worker name carries your payout address, so use a real SCT
 address. The pool operator sets the address that actually receives the block
 reward; check with them before pointing hardware at a pool.
 
@@ -144,5 +145,8 @@ invalid proofs.
 A: `--share-difficulty` is probably too high for the miner's hashrate. Lower it.
 
 **Q: How are rewards split between miners?**
-A: They are not, yet. Every block reward goes to the single pool payout address;
-there is no per-miner accounting or payout layer in this version.
+A: Each miner is paid its own address, because every miner gets a job whose
+coinbase pays it. That is solo mining through a pool: you are paid only for the
+blocks *you* find. Proportional payouts, where a small miner earns a share of
+every block, need share accounting and are not built yet - see
+[POOL-PAYOUTS](POOLED-PAYOUTS-ROADMAP.md).

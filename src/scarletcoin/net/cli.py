@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--max-inbound", type=int, default=64, help="inbound peer slots (default: %(default)s)"
     )
+    run.add_argument(
+        "--max-aux-candidates",
+        type=int,
+        default=512,
+        metavar="N",
+        help="createauxblock candidates to cache; one per connected miner when"
+        " each miner is paid its own address (default: %(default)s)",
+    )
     run.add_argument("--no-rpc", action="store_true", help="do not start the RPC server")
     run.add_argument(
         "--rpc-host", default="127.0.0.1", help="RPC bind address (default: %(default)s)"
@@ -192,6 +200,7 @@ def _run(args: argparse.Namespace) -> int:
         prune=max(0, args.prune),
         max_outbound=args.max_outbound,
         max_inbound=args.max_inbound,
+        max_aux_candidates=args.max_aux_candidates,
         connect=tuple(args.connect),
         seeds=tuple(args.seeds),
         use_seeds=not args.no_seeds,

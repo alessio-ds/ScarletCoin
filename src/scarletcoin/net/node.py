@@ -132,6 +132,12 @@ class NodeConfig:
     """Keep only this many recent blocks whole; 0 stores the entire chain."""
     max_outbound: int = 8
     max_inbound: int = 64
+    max_aux_candidates: int = 512
+    """How many createauxblock candidates the node keeps in its LRU.
+
+    A pool that hands every miner its own candidate (so each is paid its own
+    address) needs one live candidate per connected miner, so this bounds how
+    many miners a pool can serve at once."""
     connect: tuple[str, ...] = ()
     """Peers to connect to on start, in addition to the address book."""
     seeds: tuple[str, ...] = ()
@@ -1073,8 +1079,6 @@ class Node:
 
     # ---------------------------------------------------------- aux candidates
 
-    _MAX_AUX_CANDIDATES = 64
-
     def store_aux_candidate(self, candidate) -> None:
         """Remember an AuxPoW candidate so :meth:`find_aux_candidate` can find it.
 
@@ -1087,7 +1091,8 @@ class Node:
         self.auxpow_templates_created_total += 1
         self.auxpow_submissions_total += 1  # createauxblock counts as a submission intent
         with self._aux_candidates_lock:
-            if len(self._aux_candidates) >= self._MAX_AUX_CANDIDATES:
+            limit = max(1, self.config.max_aux_candidates)
+            if len(self._aux_candidates) >= limit:
                 self._aux_candidates.popitem(last=False)
             self._aux_candidates[candidate.aux_block_hash] = candidate
 
