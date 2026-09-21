@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from scarletcoin.core.params import ChainParams
 from scarletcoin.core.script import MAX_SCRIPT_SIZE, ScriptError, evaluate_script
-from scarletcoin.core.transaction import MAX_MONEY, OUTPUT_P2PKH, OUTPUT_P2SH, Transaction
+from scarletcoin.core.transaction import (
+    MAX_MONEY,
+    OUTPUT_P2PKH,
+    OUTPUT_P2SH,
+    SignatureHasher,
+    Transaction,
+)
 from scarletcoin.core.utxo import CoinView
 
 __all__ = [
@@ -49,13 +55,18 @@ def check_transaction_final(transaction: Transaction, height: int) -> bool:
     return transaction.lock_time == 0 or transaction.lock_time <= height
 
 
-def _verify_p2sh(transaction: Transaction, index: int, prevout_value: int) -> bool:
+def _verify_p2sh(
+    transaction: Transaction,
+    index: int,
+    prevout_value: int,
+    hasher: SignatureHasher,
+) -> bool:
     txin = transaction.inputs[index]
     if not txin.witness or len(txin.witness[0]) > MAX_SCRIPT_SIZE:
         return False
     redeem_script = txin.witness[0]
     arguments = list(txin.witness[1:])
-    digest = transaction.signature_hash(index, prevout_value, redeem_script)
+    digest = hasher.digest(index, prevout_value, redeem_script)
     try:
         return evaluate_script(redeem_script, arguments, digest)
     except ScriptError:
@@ -92,6 +103,9 @@ def check_transaction_inputs(
     if transaction.is_coinbase:
         raise ValidationError("check_transaction_inputs must not be used on a coinbase")
 
+    # One shared hasher for the whole transaction: rebuilding the body per
+    # input would make validating a many-input transaction quadratic.
+    hasher = SignatureHasher(transaction)
     total_in = 0
     for index, txin in enumerate(transaction.inputs):
         coin = view.get_coin(txin.prevout)
@@ -106,9 +120,9 @@ def check_transaction_inputs(
             raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
 
         if coin.output_type == OUTPUT_P2PKH:
-            valid = transaction.verify_input_signature(index, coin.value, coin.payload)
+            valid = transaction.verify_input_signature(index, coin.value, coin.payload, hasher)
         elif coin.output_type == OUTPUT_P2SH:
-            valid = _verify_p2sh(transaction, index, coin.value)
+            valid = _verify_p2sh(transaction, index, coin.value, hasher)
         else:  # pragma: no cover - checked just above
             raise ValidationError(f"input {index} has an unknown output type {coin.output_type}")
         if not valid:

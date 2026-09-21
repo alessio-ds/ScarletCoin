@@ -21,6 +21,7 @@ from scarletcoin.core.transaction import (
     COINBASE_OUTPOINT,
     MAX_COINBASE_DATA,
     OutPoint,
+    SignatureHasher,
     Transaction,
     TransactionError,
     TxInput,
@@ -255,6 +256,55 @@ class TestTransaction:
     def test_signature_is_bound_to_the_spent_value(self, key):
         transaction = self._payment(key)
         assert not transaction.verify_input_signature(0, 5001, key.public_key().hash160())
+
+    def test_shared_signer_reproduces_every_input_digest(self, key):
+        """The incremental hasher must agree with the one-shot digest exactly.
+
+        Verified per input is not enough: a shared :class:`SignatureHasher`
+        carries SHA-256 state between inputs, so a mistake in the update order
+        would corrupt every digest after the first.
+        """
+        pubkey_hash = key.public_key().hash160()
+        inputs = tuple(TxInput(OutPoint(bytes([i]) * 32, i)) for i in range(8))
+        unsigned = Transaction(
+            inputs=inputs,
+            outputs=(TxOutput.p2pkh(1000, pubkey_hash),),
+        )
+        hasher = SignatureHasher(unsigned)
+        script_code = unsigned.p2pkh_script_code(pubkey_hash)
+        for index in range(len(inputs)):
+            one_shot = unsigned.signature_hash(index, 5000 + index, script_code)
+            assert hasher.digest(index, 5000 + index, script_code) == one_shot
+
+    def test_a_many_input_transaction_signs_and_verifies_quickly(self, key):
+        """Guard against the quadratic sighash returning.
+
+        Each digest commits to the whole body, so the obvious implementation
+        rebuilt and re-hashed the entire transaction once per input.  A 500 kB
+        send of a few thousand coins spent minutes inside this loop and stalled
+        the node; the correct implementation is linear.
+        """
+        pubkey_hash = key.public_key().hash160()
+        count = 400
+        inputs = tuple(TxInput(OutPoint(bytes([i % 256]) * 32, i)) for i in range(count))
+        unsigned = Transaction(
+            inputs=inputs,
+            outputs=(TxOutput.p2pkh(1000, pubkey_hash),),
+        )
+        hasher = SignatureHasher(unsigned)
+        script_code = unsigned.p2pkh_script_code(pubkey_hash)
+        signed = unsigned.signed_with(
+            {
+                index: (
+                    key.public_key().to_bytes(),
+                    key.sign(hasher.digest(index, 5000, script_code)),
+                )
+                for index in range(count)
+            }
+        )
+        assert all(
+            signed.verify_input_signature(index, 5000, pubkey_hash) for index in range(count)
+        )
 
     def test_signature_is_bound_to_the_input_index(self, key):
         unsigned = Transaction(

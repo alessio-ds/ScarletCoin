@@ -27,6 +27,7 @@ higher fee rate.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
 from typing import Final
 
@@ -188,6 +189,37 @@ class TxOutput:
         outputs use ``address_version``.
         """
         return Address(version, self.payload)
+
+
+class SignatureHasher:
+    """Computes signature digests for many inputs of one transaction.
+
+    Every digest commits to the whole transaction body, but the body never
+    depends on which input is being signed.  Serialising and hashing it once and
+    carrying the SHA-256 state forward reduces signing and verifying a
+    transaction from quadratic work to linear: a 500 kB transaction with twelve
+    thousand inputs otherwise re-serialises and re-hashes half a megabyte twelve
+    thousand times, which stalls a node for minutes.  The digests are byte for
+    byte what :meth:`Transaction.signature_hash` returns.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, transaction: Transaction) -> None:
+        writer = Writer()
+        writer.varbytes(_SIGHASH_TAG)
+        writer.raw(transaction.serialize_body())
+        self._state = hashlib.sha256(writer.getvalue())
+
+    def digest(self, input_index: int, prevout_value: int, script_code: bytes) -> bytes:
+        """Return the digest for one input, continuing from the shared state."""
+        writer = Writer()
+        writer.uint32(input_index)
+        writer.uint64(prevout_value)
+        writer.varbytes(script_code)
+        inner = self._state.copy()
+        inner.update(writer.getvalue())
+        return hashlib.sha256(inner.digest()).digest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,16 +391,13 @@ class Transaction:
         output or the full redeem script of a P2SH output.  A signature therefore
         cannot be replayed on another input, another transaction, another output
         of a different size, or a different kind of lock.
+
+        To hash more than one input, share a :class:`SignatureHasher` instead:
+        this method rebuilds the whole body every time it is called.
         """
         if not 0 <= input_index < len(self.inputs):
             raise TransactionError(f"no input at index {input_index}")
-        writer = Writer()
-        writer.varbytes(_SIGHASH_TAG)
-        writer.raw(self.serialize_body())
-        writer.uint32(input_index)
-        writer.uint64(prevout_value)
-        writer.varbytes(script_code)
-        return hash256(writer.getvalue())
+        return SignatureHasher(self).digest(input_index, prevout_value, script_code)
 
     @staticmethod
     def p2pkh_script_code(pubkey_hash: bytes) -> bytes:
@@ -389,7 +418,11 @@ class Transaction:
         return replace(self, inputs=tuple(inputs))
 
     def verify_input_signature(
-        self, input_index: int, prevout_value: int, pubkey_hash: bytes
+        self,
+        input_index: int,
+        prevout_value: int,
+        pubkey_hash: bytes,
+        hasher: SignatureHasher | None = None,
     ) -> bool:
         """Check one P2PKH input's signature against the public key it reveals.
 
@@ -409,9 +442,9 @@ class Transaction:
             return False
         if public_key.hash160() != pubkey_hash:
             return False
-        digest = self.signature_hash(
-            input_index, prevout_value, self.p2pkh_script_code(pubkey_hash)
-        )
+        if hasher is None:
+            hasher = SignatureHasher(self)
+        digest = hasher.digest(input_index, prevout_value, self.p2pkh_script_code(pubkey_hash))
         return public_key.verify(digest, signature)
 
     def to_dict(self, address_version: int) -> dict:

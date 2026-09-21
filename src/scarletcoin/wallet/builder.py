@@ -12,7 +12,13 @@ from dataclasses import dataclass
 
 from scarletcoin.core.params import ChainParams
 from scarletcoin.core.script import multisig_redeem
-from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
+from scarletcoin.core.transaction import (
+    OutPoint,
+    SignatureHasher,
+    Transaction,
+    TxInput,
+    TxOutput,
+)
 from scarletcoin.core.utxo import Coin
 from scarletcoin.crypto.hashing import hash256
 from scarletcoin.crypto.keys import Address, PrivateKey
@@ -273,13 +279,14 @@ def _sign_inputs(
 ) -> Transaction:
     """Sign every P2PKH input of ``unsigned`` with the key owning the matching coin."""
     witnesses: dict[int, tuple[bytes, ...]] = {}
+    # Build the body once; recomputing it per input is quadratic in the number
+    # of inputs, which is what makes large sends crawl.
+    hasher = SignatureHasher(unsigned)
     for index, (outpoint, coin) in enumerate(coins):
         key = keys.get(coin.payload)
         if key is None:
             raise ValueError(f"no private key for coin {outpoint}")
-        digest = unsigned.signature_hash(
-            index, coin.value, unsigned.p2pkh_script_code(coin.payload)
-        )
+        digest = hasher.digest(index, coin.value, unsigned.p2pkh_script_code(coin.payload))
         witnesses[index] = (key.public_key().to_bytes(), key.sign(digest))
     return unsigned.signed_with(witnesses)
 
