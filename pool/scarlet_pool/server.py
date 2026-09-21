@@ -25,7 +25,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from scarletcoin.net.client import RpcClient
 
@@ -113,12 +113,14 @@ class StratumSession:
         manager: JobManager,
         on_disconnect: Callable[[StratumSession], None],
         read_timeout: float = DEFAULT_READ_TIMEOUT,
+        on_block: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
         self._manager = manager
         self._on_disconnect = on_disconnect
         self._read_timeout = read_timeout
+        self._on_block = on_block
 
         self.worker_name: str = "unknown"
         self.address: str = writer.get_extra_info("peername", ("?", 0))[0]
@@ -273,6 +275,7 @@ class StratumSession:
             await self._send_result(req.id, False)
             return
 
+        landed = False
         if share.meets_sct_target:
             logger.info(
                 "SCT block candidate from %s! parent=%s",
@@ -284,10 +287,20 @@ class StratumSession:
             )
             if result and result.get("status") == "connected":
                 logger.info("SCT block accepted: %s", result.get("hash"))
+                landed = True
             else:
                 logger.warning("SCT block rejected: %s", result)
 
         await self._send_result(req.id, True)
+
+        if landed and self._on_block is not None:
+            # The tip just moved, so the job every miner holds is stale.  Fetch
+            # a new template and push it now: otherwise the whole pool keeps
+            # hashing a prevhash that can no longer produce a block until the
+            # next periodic refresh, and every block-worthy share it submits in
+            # the meantime is bounced by the node.
+            with contextlib.suppress(Exception):
+                await self._on_block()
 
     # ── helpers ────────────────────────────────────────────────────────
 
@@ -372,6 +385,7 @@ class StratumServer:
             self._manager,
             self._on_disconnect,
             read_timeout=self._client_timeout,
+            on_block=self.refresh_job,
         )
         self._sessions.add(session)
         logger.info("miner connected from %s (total: %s)", session.address, len(self._sessions))
@@ -384,21 +398,25 @@ class StratumServer:
         self._sessions.discard(session)
         logger.info("miner disconnected from %s (total: %s)", session.address, len(self._sessions))
 
+    async def refresh_job(self) -> None:
+        """Fetch a fresh template and push it to every authorized miner."""
+        job = self._manager.refresh()
+        logger.debug(
+            "new job %s (sct height=%s, share target=%064x)",
+            job.job_id,
+            job.scarlet.height,
+            self._manager.share_target,
+        )
+        for session in list(self._sessions):
+            if session.authorized:
+                with contextlib.suppress(Exception):
+                    await session.send_job(clean=True)
+
     async def _refresh_loop(self) -> None:
         """Periodically refresh templates and push new jobs."""
         while not self._stop.is_set():
             try:
-                job = self._manager.refresh()
-                logger.debug(
-                    "new job %s (sct height=%s, share target=%064x)",
-                    job.job_id,
-                    job.scarlet.height,
-                    self._manager.share_target,
-                )
-                for session in list(self._sessions):
-                    if session.authorized:
-                        with contextlib.suppress(Exception):
-                            await session.send_job(clean=True)
+                await self.refresh_job()
             except Exception as exc:
                 logger.error("job refresh failed: %s", exc)
             for _ in range(int(self._job_interval)):

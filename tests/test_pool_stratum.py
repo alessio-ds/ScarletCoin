@@ -401,6 +401,18 @@ async def _recv_method(reader: asyncio.StreamReader, method: str) -> dict:
 class TestStratumWireProtocol:
     """A real TCP client speaking Stratum to the real server."""
 
+    def test_landing_a_block_pushes_a_fresh_job_immediately(self, rpc, key):
+        """The pool must re-template the moment a block lands.
+
+        Otherwise every miner keeps hashing a prevhash that can no longer win,
+        and each block-worthy share it submits is bounced by the node until the
+        next periodic refresh.
+        """
+        node, _server, client = rpc
+        manager = _manager(node, client, str(key.address(node.params.address_version)))
+        stratum = StratumServer(host="127.0.0.1", port=0, manager=manager, job_interval=3600)
+        asyncio.run(self._run(stratum, manager, expect_refresh=True))
+
     def test_an_idle_miner_is_disconnected_after_the_timeout(self, rpc, key):
         """The idle timeout must reap dead sockets, at the configured value."""
         node, _server, client = rpc
@@ -439,7 +451,9 @@ class TestStratumWireProtocol:
         assert node.chain.height == 1
         assert manager.sct_blocks_accepted == 1
 
-    async def _run(self, stratum: StratumServer, manager: JobManager) -> None:
+    async def _run(
+        self, stratum: StratumServer, manager: JobManager, *, expect_refresh: bool = False
+    ) -> None:
         await stratum.start()
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", stratum.port)
@@ -491,6 +505,16 @@ class TestStratumWireProtocol:
                     },
                 )
                 assert (await _recv_id(reader, 3))["result"] is True
+
+                if expect_refresh:
+                    # The block moved the tip, so the job we just solved against
+                    # is dead.  A fresh one must arrive without waiting for the
+                    # periodic refresh (job_interval is an hour here).
+                    fresh = await asyncio.wait_for(
+                        _recv_method(reader, "mining.notify"), timeout=10.0
+                    )
+                    assert fresh["params"][0] != job_id, "expected a new job after the block"
+                    assert fresh["params"][8] is True, "the refresh should be a clean job"
             finally:
                 writer.close()
                 await writer.wait_closed()
