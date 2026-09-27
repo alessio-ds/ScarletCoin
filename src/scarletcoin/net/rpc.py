@@ -350,13 +350,21 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
             "height": height,
         }
 
-    def getutxos(address: str) -> dict:
+    def getutxos(address: str, limit: int | None = None, offset: int = 0) -> dict:
+        """Return the unspent outputs of an address.
+
+        ``limit`` and ``offset`` page over an address with a very large coin
+        set; without a limit the whole set is returned, which is what a wallet
+        sweeping its balance needs.
+        """
         pubkey_hash = address_hash(address)
         height = chain.height
-        coins = node.storage.coins_of(pubkey_hash)
+        coins = node.storage.coins_of(pubkey_hash, limit=limit, offset=offset)
         return {
             "address": str(address),
             "height": height,
+            "limit": None if limit is None else max(0, int(limit)),
+            "offset": max(0, int(offset)),
             "utxos": [
                 {
                     "txid": outpoint.txid[::-1].hex(),
@@ -373,15 +381,15 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
             ],
         }
 
-    def getutxosmulti(addresses: list[str]) -> dict:
+    def getutxosmulti(addresses: list[str], limit: int | None = None, offset: int = 0) -> dict:
         """Return the unspent outputs of several addresses in one call.
 
         A wallet with many addresses otherwise issues one ``getutxos`` round
-        trip per address, which is slow for the wallet and heavy for a public
-        node.  The result is keyed by address string, exactly as
-        :func:`getbalances` is.
+        trip per address, which is both slow for the wallet and heavy for a
+        public node.  The result is keyed by address string, exactly as
+        :func:`getbalances` is.  ``limit``/``offset`` page over each address.
         """
-        return {str(address): getutxos(str(address)) for address in addresses}
+        return {str(address): getutxos(str(address), limit, offset) for address in addresses}
 
     def getaddresshistory(address: str, limit: int = 100) -> dict:
         pubkey_hash = address_hash(address)

@@ -370,6 +370,36 @@ class TestRpc:
         assert len(result[second]["utxos"]) == 1
         assert all(item["coinbase"] for item in result[first]["utxos"])
 
+    def test_getutxos_pages_over_a_large_coin_set(self, rpc, key):
+        """A caller with thousands of coins can ask for a bounded page.
+
+        This is what keeps a script or wallet from dragging an address's whole
+        unspent-output set over the wire just to spend a few of them.
+        """
+        _, _, client = rpc
+        address = str(key.address(REGTEST.address_version))
+        client.call("generate", 5, address)
+
+        page = client.getutxos(address, limit=2)
+        assert page["limit"] == 2
+        assert page["offset"] == 0
+        assert len(page["utxos"]) == 2
+
+        second = client.getutxos(address, limit=2, offset=2)
+        assert len(second["utxos"]) == 2
+        first_ids = {(item["txid"], item["index"]) for item in page["utxos"]}
+        second_ids = {(item["txid"], item["index"]) for item in second["utxos"]}
+        assert not first_ids & second_ids
+
+        everything = client.getutxos(address)
+        assert len(everything["utxos"]) == 5
+        assert first_ids | second_ids <= {
+            (item["txid"], item["index"]) for item in everything["utxos"]
+        }
+
+        limited = client.getutxosmulti([address], limit=1)
+        assert len(limited[address]["utxos"]) == 1
+
     def test_getutxosmulti_is_public(self):
         from scarletcoin.net.rpc import PUBLIC_METHODS
 

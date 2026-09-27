@@ -16,8 +16,8 @@ count did not disappear; it still has its own page.
 
 The measurement lives in `Blockchain.network_stats()` as two new fields,
 `transactions` and `transactions_per_second`, so `getnetworkstats` over RPC
-reports it too.  Counting is one indexed query (`Storage.count_transactions`)
-rather than loading every block in the window.
+reports it too.  Counting is one query (`Storage.count_transactions`) rather
+than loading every block in the window.
 
 ## The hashrate chart has a logarithmic axis
 
@@ -33,3 +33,37 @@ value and the whole range is readable at once.
 
 No consensus change, no chain change, no wallet-file change.  The new RPC
 fields are additive, and a client that does not know them ignores them.
+
+# ScarletCoin 2.7.1
+
+Three fixes found by running a transaction generator against the live mainnet
+node.
+
+## A rate-capped miner now actually idles
+
+`Miner._mine_template` worked out how long it had to idle to honour
+`--max-rate`, then passed `min(idle, 1.0)` to `Event.wait`.  A miner asked for
+500 H/s hashed for about a second and rested for a second — hundreds of times
+over its cap — and held roughly half of the machine's only core.  It also
+idled *before* submitting a block it had just found, so a solution could wait
+out the cap and go stale.  The idle is now the full amount (an `Event.wait`,
+so Ctrl-C stays immediate) and a solution is submitted first.
+
+## Unspent-output lists can be bounded
+
+`getutxos` and `getutxosmulti` gained `limit` and `offset`.  A client that only
+needs a working pool no longer has to pull an address's entire unspent set:
+with tens of thousands of coins that set is megabytes of JSON and seconds of
+node CPU per call.  `RpcClient` exposes the same arguments and leaves them off
+when no limit is requested, so an older node is called exactly as before.
+
+## The TPS count has an index
+
+`tx_location(height)` is now indexed, so the overview's transactions-per-second
+card no longer scans every indexed transaction.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.  Existing
+databases pick the new index up on the next start; building it is a one-off
+cost, not a migration.

@@ -713,6 +713,24 @@ class TestStorage:
         assert chain.storage.count_transactions(start_height=5, end_height=5) == 2
         assert chain.storage.count_transactions(start_height=4, end_height=1) == 0
 
+    def test_coins_of_pages_oldest_first(self, chain, key):
+        mine_and_add(chain, key, count=4)
+        payload = key.public_key().hash160()
+        every = chain.storage.coins_of(payload)
+        assert len(every) == 4
+        assert chain.storage.coins_of(payload, limit=2) == every[:2]
+        assert chain.storage.coins_of(payload, limit=2, offset=2) == every[2:]
+        assert chain.storage.coins_of(payload, limit=2, offset=99) == []
+
+    def test_count_transactions_uses_the_height_index(self, chain, key):
+        """The explorer's TPS count must not scan every indexed transaction."""
+        mine_and_add(chain, key, count=3)
+        plan = chain.storage._query(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM tx_location WHERE height BETWEEN 1 AND 3"
+        )
+        detail = " ".join(str(row["detail"]) for row in plan)
+        assert "tx_location_height" in detail
+
     def test_network_stats_reports_transactions_per_second(self, chain, key):
         """TPS is measured from the same window as the pace and the hash rate."""
         spacing = chain.params.target_spacing

@@ -259,13 +259,20 @@ class Miner:
             self._tune_chunk(seconds)
             self._emit("progress", hashes=hashes, rate=self.stats.last_rate)
 
-            if self.max_rate is not None and seconds > 0:
-                # Idle the workers until the average rate drops to the cap.
-                idle = hashes / self.max_rate - seconds
-                if idle > 0 and self._stop.wait(min(idle, 1.0)):
-                    break
-
+            # Submit a solution before throttling: a found block must not sit out the
+            # rate cap's idle and go stale.
             if found is not None:
                 solved = candidate.with_header(candidate.header.with_nonce(found))
                 self._submit(solved)
                 return
+
+            if self.max_rate is not None and seconds > 0:
+                # Idle the workers until the average rate drops to the cap.
+                # Waiting the *whole* idle is the point: capping the wait (as
+                # this once did, at one second) let the miner hash for a second
+                # and rest for a second, hundreds of times over the rate it
+                # was asked for.  Event.wait returns at once when stop is set,
+                # so Ctrl-C stays responsive through a long idle.
+                idle = hashes / self.max_rate - seconds
+                if idle > 0 and self._stop.wait(idle):
+                    break

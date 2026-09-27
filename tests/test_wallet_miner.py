@@ -385,8 +385,6 @@ class TestMiner:
         assert stats.blocks_accepted == 1
 
     def test_a_rate_cap_actually_slows_the_loop(self, rpc, key, monkeypatch):
-        import time
-
         import scarletcoin.miner.miner as module
         from scarletcoin.miner.solver import ScanResult
 
@@ -398,15 +396,38 @@ class TestMiner:
                 return ScanResult(start, count, 0.001)
             return ScanResult(None, count, 0.001)
 
+        idle_waits: list[float] = []
+
+        class RecordingStop:
+            """A stop event that records how long the miner asks to idle."""
+
+            def __init__(self) -> None:
+                self._set = False
+
+            def is_set(self) -> bool:
+                return self._set
+
+            def wait(self, timeout: float) -> bool:
+                idle_waits.append(timeout)
+                return False  # report the next round at once instead of sleeping
+
+            def set(self) -> None:
+                self._set = True
+
         monkeypatch.setattr(module, "scan_nonces", quick_scan)
         monkeypatch.setattr(module.Miner, "_tune_chunk", lambda self, seconds: None)
         miner = module.Miner(client, address, workers=1, max_rate=500, refresh_seconds=60)
         miner._chunk = 1 << 16
-        started = time.time()
+        miner._stop = RecordingStop()
         miner.run(max_blocks=1)
-        elapsed = time.time() - started
-        # 3 x 65536 hashes at a 500 H/s cap means ~0.39 s of idle time.
-        assert elapsed >= 0.3
+
+        # 65536 hashes per round at a 500 H/s cap must idle ~131 s.  The old
+        # code truncated that to one second, which is how the cap came to be
+        # exceeded by hundreds of times.  A template can need more than one
+        # attempt (a fabricated nonce only sometimes beats the regtest target),
+        # but every idle it asks for must be the full amount.
+        assert len(idle_waits) >= 2
+        assert all(wait == pytest.approx((1 << 16) / 500, rel=0.05) for wait in idle_waits)
 
     def test_an_unreachable_node_is_reported(self, key):
         from scarletcoin.net.client import RpcClient

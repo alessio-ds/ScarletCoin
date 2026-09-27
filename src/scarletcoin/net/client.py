@@ -161,23 +161,35 @@ class RpcClient:
         """Return the balances of several addresses in one request."""
         return self.call("getbalances", addresses)
 
-    def getutxos(self, address: str) -> dict:
-        """Return the unspent outputs of an address."""
-        return self.call("getutxos", address)
+    def getutxos(self, address: str, *, limit: int | None = None, offset: int = 0) -> dict:
+        """Return the unspent outputs of an address.
 
-    def getutxosmulti(self, addresses: list[str]) -> dict:
+        Pass ``limit`` to ask for a bounded page; without one the call is
+        exactly as before, so a wallet keeps working against an older node.
+        """
+        if limit is None:
+            return self.call("getutxos", address)
+        return self.call("getutxos", address, limit, offset)
+
+    def getutxosmulti(
+        self, addresses: list[str], *, limit: int | None = None, offset: int = 0
+    ) -> dict:
         """Return the unspent outputs of several addresses in one request.
 
         A node that does not know the method — one that has not been upgraded
         yet — is asked one address at a time instead, so a new wallet keeps
-        working against an older node.
+        working against an older node.  ``limit``/``offset`` page over each
+        address and are left out when no limit is requested.
         """
+        args = (addresses,) if limit is None else (addresses, limit, offset)
         try:
-            return self.call("getutxosmulti", addresses)
+            return self.call("getutxosmulti", *args)
         except RpcClientError as exc:
             if not _is_unknown_method(exc):
                 raise
-        return {address: self.getutxos(address) for address in addresses}
+        return {
+            address: self.getutxos(address, limit=limit, offset=offset) for address in addresses
+        }
 
     def getaddresshistory(self, address: str, limit: int = 100) -> dict:
         """Return the transactions that touched an address."""

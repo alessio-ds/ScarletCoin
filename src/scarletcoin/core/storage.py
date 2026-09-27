@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS tx_location (
     position   INTEGER NOT NULL,
     height     INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS tx_location_height ON tx_location (height);
 
 CREATE TABLE IF NOT EXISTS address_history (
     pubkey_hash BLOB NOT NULL,
@@ -904,13 +905,29 @@ class Storage:
             "DELETE FROM utxo WHERE txid = ? AND idx = ?", (outpoint.txid, outpoint.index)
         )
 
-    def coins_of(self, payload: bytes) -> list[tuple[OutPoint, Coin]]:
-        """Return every unspent output paying ``payload`` (pubkey or script hash)."""
-        rows = self._query(
+    def coins_of(
+        self, payload: bytes, *, limit: int | None = None, offset: int = 0
+    ) -> list[tuple[OutPoint, Coin]]:
+        """Return unspent outputs paying ``payload`` (pubkey or script hash).
+
+        Args:
+            payload: The 20-byte public-key or script hash.
+            limit: Return at most this many outputs, oldest first.  ``None``
+                returns every one; a limit lets a caller with a huge coin set
+                ask for a working pool without dragging the whole set over the
+                wire.
+            offset: Skip this many outputs before the limit; ignored when
+                ``limit`` is ``None``.
+        """
+        sql = (
             "SELECT txid, idx, value, type, payload, height, coinbase"
-            " FROM utxo WHERE payload = ? ORDER BY height, txid, idx",
-            (payload,),
+            " FROM utxo WHERE payload = ? ORDER BY height, txid, idx"
         )
+        params: tuple = (payload,)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params = (payload, max(0, int(limit)), max(0, int(offset)))
+        rows = self._query(sql, params)
         return [
             (
                 OutPoint(bytes(row["txid"]), int(row["idx"])),
