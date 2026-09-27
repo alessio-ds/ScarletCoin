@@ -822,6 +822,24 @@ class TestExplorer:
         network_section = body.split("<h2>Network</h2>", 1)[1]
         assert "Unspent outputs" not in network_section
 
+    def test_overview_shows_transactions_per_second_instead_of_peers(self, rpc):
+        """The Network card answers the load question, not the peer count.
+
+        The peer count still has its own page; what a visitor to the overview
+        wants to know is whether the chain is actually carrying traffic.
+        """
+        node, server, client = rpc
+        client.call("generate", 25)
+        status, body = self._get(server.url + "/")
+        assert status == 200
+        network_section = body.split("<h2>Network</h2>", 1)[1]
+        assert "Transactions/s" in network_section
+        assert "Peers" not in network_section
+        stats = node.chain.network_stats()
+        assert stats["transactions_per_second"] is not None
+        assert f"{stats['transactions_per_second']:.2f}" in network_section
+        assert f"{stats['transactions']} tx in {stats['window']} blocks" in network_section
+
     def test_a_pruned_block_says_so_instead_of_looking_missing(self, rpc, key):
         node, server, client = rpc
         client.call("generate", 20, str(key.address(REGTEST.address_version)))
@@ -919,6 +937,40 @@ class TestExplorer:
         status, body = self._get(server.url + "/hashrate?window=nonsense")
         assert status == 404
         assert "Not found" in body
+
+    def test_log_ticks_prefer_powers_of_ten(self):
+        from scarletcoin.net.explorer import _log_ticks
+
+        assert _log_ticks(4.0, 7.0) == [10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0]
+        # Too narrow for two decades: fall back to three labelled endpoints.
+        assert len(_log_ticks(4.1, 4.3)) == 3
+
+    def test_hashrate_chart_uses_a_log_axis(self):
+        from scarletcoin.net.explorer import _hashrate_chart
+
+        history = [
+            {
+                "height": index,
+                "time": 1_700_000_000 + index * 60,
+                "hash_rate": 200_000.0,
+                "difficulty": 1.0,
+            }
+            for index in range(50)
+        ]
+        history.append(
+            {"height": 50, "time": 1_700_003_000, "hash_rate": 90_000_000.0, "difficulty": 1.0}
+        )
+        svg = _hashrate_chart(history)
+        assert "<polyline" in svg
+        # Decades are labelled, so the whole 10^5..10^8 range stays readable.
+        assert "1.00 MH/s" in svg
+        assert "10.00 MH/s" in svg
+        # Nothing is clipped any more.
+        assert "drawn at the top" not in svg
+        # The last (huge) sample is plotted high, near the top of the plot.
+        points = svg.split('<polyline points="', 1)[1].split('"', 1)[0].split()
+        last_y = float(points[-1].split(",")[1])
+        assert last_y < 40
 
     def test_explorer_escapes_hostile_content(self, rpc):
         _, server, _ = rpc

@@ -703,6 +703,28 @@ class TestStorage:
         assert count == 4  # three coinbases plus the genesis output
         assert total == chain.total_supply()
 
+    def test_count_transactions_covers_a_height_range(self, chain_and_pool, key, other_key):
+        chain, pool = chain_and_pool
+        mine_and_add(chain, key, pool, count=4)
+        spend(chain, key, other_key.address(REGTEST.address_version), 10**8, mempool=pool)
+        mine_and_add(chain, key, pool, count=1)
+        # Blocks 1..4 hold one coinbase each; block 5 adds a coinbase and the spend.
+        assert chain.storage.count_transactions(start_height=1, end_height=4) == 4
+        assert chain.storage.count_transactions(start_height=5, end_height=5) == 2
+        assert chain.storage.count_transactions(start_height=4, end_height=1) == 0
+
+    def test_network_stats_reports_transactions_per_second(self, chain, key):
+        """TPS is measured from the same window as the pace and the hash rate."""
+        spacing = chain.params.target_spacing
+        start = chain.tip.timestamp
+        for index in range(10):
+            block = mine_block(chain, key, timestamp=start + (index + 1) * spacing)
+            assert chain.add_block(block).status.value == "connected"
+        stats = chain.network_stats(window=10)
+        assert stats["transactions"] == 10  # one coinbase per block
+        assert stats["window_seconds"] == spacing * 10
+        assert stats["transactions_per_second"] == pytest.approx(1 / spacing, rel=1e-3)
+
     def test_address_history_follows_the_chain(self, chain_and_pool, key, other_key):
         chain, pool = chain_and_pool
         mine_and_add(chain, key, pool, count=4)

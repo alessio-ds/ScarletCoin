@@ -1122,9 +1122,17 @@ class Blockchain:
 
         spacing: float | None = None
         hash_rate: float | None = None
+        transactions: int | None = None
+        tps: float | None = None
         if first is not None and blocks > 0 and seconds > 0:
             spacing = seconds / blocks
             hash_rate = (tip.chainwork - first.chainwork) / seconds
+            # Transactions in the same window the pace and hashrate use, so the
+            # three numbers on the explorer's Network card describe one span.
+            transactions = self.storage.count_transactions(
+                start_height=first_height + 1, end_height=tip.height
+            )
+            tps = transactions / seconds
 
         current_difficulty = difficulty(tip.bits, pow_limit=params.pow_limit)
 
@@ -1154,6 +1162,8 @@ class Blockchain:
             "target_spacing": params.target_spacing,
             "average_spacing": None if spacing is None else round(spacing, 2),
             "hash_rate": None if hash_rate is None else round(hash_rate, 2),
+            "transactions": transactions,
+            "transactions_per_second": None if tps is None else round(tps, 2),
             "difficulty": current_difficulty,
             "next_difficulty": next_difficulty,
             "next_difficulty_change": next_difficulty_change,

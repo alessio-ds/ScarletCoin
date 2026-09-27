@@ -630,6 +630,22 @@ class Storage:
         )
         return 0 if row is None else int(row["n"])
 
+    def count_transactions(self, *, start_height: int, end_height: int) -> int:
+        """Number of confirmed transactions at heights ``start_height..end_height``.
+
+        Counts the coinbase of every block, so it matches summing
+        ``len(block.transactions)`` over the range.  Transactions of pruned
+        blocks are no longer indexed and contribute nothing; use this for
+        recent windows, where pruning does not reach.
+        """
+        if end_height < start_height:
+            return 0
+        row = self._one(
+            "SELECT COUNT(*) AS n FROM tx_location WHERE height BETWEEN ? AND ?",
+            (start_height, end_height),
+        )
+        return 0 if row is None else int(row["n"])
+
     def block_count(self) -> int:
         """Total number of stored blocks, including side branches."""
         row = self._one("SELECT COUNT(*) AS n FROM blocks")

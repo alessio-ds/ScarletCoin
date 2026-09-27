@@ -7,6 +7,7 @@ chain is HTML-escaped: block and transaction data is attacker-controlled.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from html import escape
@@ -258,6 +259,18 @@ def _hash_rate(rate: float | None) -> str:
     return f"{rate:.2f} PH/s"  # pragma: no cover - optimistic
 
 
+def _tps(rate: float | None, transactions: int | None, window: int) -> str:
+    """Render the chain's transaction rate, with the window it was measured over.
+
+    The headline is the value a visitor came for; the sample size sits under it
+    so a lone block with a single transaction cannot read as chain-wide load.
+    """
+    if rate is None:
+        return "&mdash;"
+    counted = "&mdash;" if transactions is None else f"{transactions} tx"
+    return f'{rate:.2f}<div class="sub">{counted} in {window} blocks</div>'
+
+
 def _duration(seconds: float | None) -> str:
     """Render a number of seconds the way a person reads it."""
     if seconds is None:
@@ -377,7 +390,10 @@ def _overview(server: RpcServer) -> str:
             ("Blocks last hour", str(stats["blocks_last_hour"])),
             ("Blocks last 24 h", str(stats["blocks_last_day"])),
             ("Chain weight", _weight(info)),
-            ("Peers", str(info["peers"])),
+            (
+                "Transactions/s",
+                _tps(stats["transactions_per_second"], stats["transactions"], stats["window"]),
+            ),
             ("Node version", escape(info["version"])),
         ]
     )
@@ -391,17 +407,45 @@ def _overview(server: RpcServer) -> str:
     return _page(server, "Overview", body)
 
 
+def _log_ticks(lo: float, hi: float) -> list[float]:
+    """Pick labelled y-axis values for a logarithmic axis spanning ``lo..hi``.
+
+    Powers of ten are preferred; when the range is too narrow to contain two of
+    them, the endpoints and midpoint stand in.
+    """
+    ticks = [
+        10.0**exponent
+        for exponent in range(math.floor(lo), math.ceil(hi) + 1)
+        if lo <= exponent <= hi
+    ]
+    if len(ticks) < 2:
+        ticks = [10.0**lo, 10.0 ** ((lo + hi) / 2), 10.0**hi]
+    return ticks
+
+
 def _hashrate_chart(history: list[dict]) -> str:
     """Render the hashrate history as an inline SVG line chart.
 
     No external assets, matching the rest of the explorer: the chart is drawn
-    server-side, with the y-axis scaled linearly to the observed peak.
+    server-side, with a logarithmic y-axis.  A hashrate series spans orders of
+    magnitude — native blocks land near 10^5 H/s, merged-mined blocks near 10^6,
+    and a pre-fork difficulty jump can read as 10^8 — so a linear axis scaled to
+    the peak erases everything else, while clipping to a percentile hides real
+    recent blocks.  The log axis keeps every sample at its true value.
     """
     if not history:
         return '<p class="empty">Not enough history to plot yet.</p>'
-    peak = max(point["hash_rate"] for point in history)
+    rates = [point["hash_rate"] for point in history]
+    peak = max(rates)
     if peak <= 0:
         return '<p class="empty">No measurable hashrate yet.</p>'
+
+    # Anchor to the smallest positive sample; a flat series still gets half a
+    # decade of room so its line is not pinned to an edge.
+    floor = min(rate for rate in rates if rate > 0)
+    lo, hi = math.log10(floor), math.log10(peak)
+    if hi - lo < 0.5:
+        hi = lo + 0.5
 
     width, height = 1000, 260
     pad_l, pad_r, pad_t, pad_b = 100, 12, 14, 24
@@ -414,16 +458,17 @@ def _hashrate_chart(history: list[dict]) -> str:
         return pad_l + (point["time"] - t0) / span * inner_w
 
     def y(point: dict) -> float:
-        return pad_t + inner_h - (point["hash_rate"] / peak) * inner_h
+        value = math.log10(max(point["hash_rate"], floor))
+        return pad_t + inner_h - (value - lo) / (hi - lo) * inner_h
 
     grid = ""
-    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-        yy = pad_t + inner_h - fraction * inner_h
+    for tick in _log_ticks(lo, hi):
+        yy = pad_t + inner_h - (math.log10(tick) - lo) / (hi - lo) * inner_h
         grid += (
             f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{width - pad_r}" y2="{yy:.1f}" '
             f'stroke="#2e2825" stroke-width="1"/>'
             f'<text x="{pad_l - 6}" y="{yy + 4:.1f}" fill="#97877f" font-size="11" '
-            f'text-anchor="end">{_hash_rate(peak * fraction)}</text>'
+            f'text-anchor="end">{_hash_rate(tick)}</text>'
         )
 
     line_points = " ".join(f"{x(p):.1f},{y(p):.1f}" for p in history)
