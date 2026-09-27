@@ -67,3 +67,23 @@ card no longer scans every indexed transaction.
 No consensus change, no chain change, no wallet-file change.  Existing
 databases pick the new index up on the next start; building it is a one-off
 cost, not a migration.
+
+# ScarletCoin 2.7.2
+
+A follow-up to 2.7.1's miner fix, found by working through what the idle
+actually does on a solo-mined chain.
+
+A rate cap has to bound the *round*, not only the idle after it.  A solution
+found inside a round is submitted at once (deliberately — 2.7.1 made that so a
+block cannot go stale), which means that round never idles.  With rounds tuned
+to about a second of full-speed hashing, every round on an easy chain found a
+solution, so the idle never ran and the cap did nothing again, just in a
+different way.  `Miner._tune_chunk` now clamps a capped miner's round to at
+most `max_rate × ROUND_SECONDS` hashes (never below the existing minimum), so
+the idle is paid on every round that does not find a block and the average
+rate settles at the cap.  On a machine that hashes far faster than the cap,
+that also drops the mining CPU from a full core to a fraction of one.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.

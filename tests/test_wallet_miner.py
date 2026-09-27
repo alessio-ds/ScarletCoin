@@ -429,6 +429,27 @@ class TestMiner:
         assert len(idle_waits) >= 2
         assert all(wait == pytest.approx((1 << 16) / 500, rel=0.05) for wait in idle_waits)
 
+    def test_a_rate_cap_keeps_rounds_small(self, rpc, key):
+        """A capped round must not try more hashes than the cap allows.
+
+        A solution found inside a round is submitted at once and skips that
+        round's idle, so an oversized round would let the real rate run away
+        from the cap whenever the chain is easy to mine.
+        """
+        from scarletcoin.miner.miner import _MIN_CHUNK
+
+        _, _, client = rpc
+        address = str(key.address(REGTEST.address_version))
+        capped = Miner(client, address, workers=1, max_rate=500)
+        capped._chunk = 1 << 16
+        capped._tune_chunk(0.5)  # a fast round that would normally grow the chunk
+        assert capped._chunk == _MIN_CHUNK
+
+        uncapped = Miner(client, address, workers=1)
+        uncapped._chunk = 1 << 16
+        uncapped._tune_chunk(0.5)
+        assert uncapped._chunk > _MIN_CHUNK
+
     def test_an_unreachable_node_is_reported(self, key):
         from scarletcoin.net.client import RpcClient
 

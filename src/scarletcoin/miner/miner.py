@@ -177,12 +177,21 @@ class Miner:
         return True
 
     def _tune_chunk(self, seconds: float) -> None:
-        """Keep rounds close to :data:`ROUND_SECONDS` long."""
+        """Keep rounds close to :data:`ROUND_SECONDS` long.
+
+        A capped miner is bounded differently: a solution found inside a round
+        is submitted at once and skips that round's idle, so a round must not
+        try more hashes than the cap allows in one round, or the cap is only
+        paid on the rounds that find nothing.
+        """
         if seconds <= 0:
             return
         factor = ROUND_SECONDS / seconds
         scaled = self._chunk * min(4.0, max(0.25, factor))
-        self._chunk = int(min(_MAX_CHUNK, max(_MIN_CHUNK, scaled)))
+        upper = _MAX_CHUNK
+        if self.max_rate is not None:
+            upper = min(upper, max(_MIN_CHUNK, int(self.max_rate * ROUND_SECONDS)))
+        self._chunk = int(min(upper, max(_MIN_CHUNK, scaled)))
 
     # ------------------------------------------------------------------- main loop
 
