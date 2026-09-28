@@ -740,14 +740,58 @@ class TestStorage:
         assert chain.storage.coins_of(payload, limit=2, offset=2) == every[2:]
         assert chain.storage.coins_of(payload, limit=2, offset=99) == []
 
-    def test_count_transactions_uses_the_height_index(self, chain, key):
+    def test_count_transactions_uses_the_block_tx_count(self, chain, key):
         """The explorer's TPS count must not scan every indexed transaction."""
         mine_and_add(chain, key, count=3)
         plan = chain.storage._query(
-            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM tx_location WHERE height BETWEEN 1 AND 3"
+            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(tx_count), 0) FROM blocks"
+            " WHERE in_chain = 1 AND height BETWEEN 1 AND 3"
         )
         detail = " ".join(str(row["detail"]) for row in plan)
-        assert "tx_location_height" in detail
+        assert "blocks_chain" in detail
+        indexes = {
+            row[0]
+            for row in chain.storage._query("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        # The two expensive derived indexes were dropped in schema 5.
+        assert "tx_location_height" not in indexes
+        assert "address_history_txid" not in indexes
+
+    def test_undo_is_kept_only_for_recent_blocks(self, chain, key, monkeypatch):
+        """Undo exists for disconnects, and a block far behind the tip can
+        never be disconnected, so keeping it for every block was pure growth."""
+        import scarletcoin.core.chain as chain_module
+
+        monkeypatch.setattr(chain_module, "UNDO_KEEP_BLOCKS", 3)
+        mine_and_add(chain, key, count=6)
+        for height in (1, 2, 3):
+            entry = chain.get_entry_by_height(height)
+            with pytest.raises(StorageError, match="missing undo data"):
+                chain.storage.get_undo(entry.hash)
+        for height in (4, 5, 6):
+            entry = chain.get_entry_by_height(height)
+            assert chain.storage.get_undo(entry.hash) == []
+
+    def test_a_schema_four_database_upgrades_in_place(self, tmp_path, key):
+        """Schema 5 adds ``blocks.tx_count`` and drops the derived indexes."""
+        from scarletcoin.core.chain import Blockchain
+        from scarletcoin.core.storage import Storage
+
+        path = tmp_path / "chain.sqlite3"
+        chain = Blockchain(Storage(path), REGTEST)
+        mine_and_add(chain, key, count=3)
+        before = chain.storage.count_transactions(start_height=1, end_height=3)
+        assert before == 3
+        chain.storage.set_meta("schema_version", b"4")
+        chain.storage.close()
+
+        reopened = Blockchain(Storage(path), REGTEST)
+        try:
+            assert reopened.storage.get_meta("schema_version") == b"5"
+            # The backfill restored the count from the transaction index.
+            assert reopened.storage.count_transactions(start_height=1, end_height=3) == before
+        finally:
+            reopened.storage.close()
 
     def test_network_stats_reports_transactions_per_second(self, chain, key):
         """TPS is measured from the same window as the pace and the hash rate."""

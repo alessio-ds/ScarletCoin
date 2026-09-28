@@ -35,6 +35,7 @@ from scarletcoin.core.coinbase import coinbase_height
 from scarletcoin.core.params import ChainParams
 from scarletcoin.core.pow import bits_from_work, bits_to_target, block_work, difficulty, next_bits
 from scarletcoin.core.storage import (
+    UNDO_KEEP_BLOCKS,
     BlockIndexEntry,
     PruneResult,
     Storage,
@@ -981,6 +982,9 @@ class Blockchain:
         self.storage.put_undo(entry.hash, undo)
         self._index_block(block, height=height, spent=spent)
         self.storage.set_in_chain(entry.hash, True)
+        # Undo only exists so a block can be disconnected.  Keep a bounded
+        # horizon of it instead of one record per block since genesis.
+        self.storage.prune_undo_at_height(height - UNDO_KEEP_BLOCKS)
 
     def _apply_block_state(self, block: Block, *, height: int, spent: dict[OutPoint, Coin]) -> None:
         """Add every output of ``block`` to the UTXO set and index it (genesis path)."""
@@ -1032,7 +1036,7 @@ class Blockchain:
             txid = transaction.txid()
             for index in range(len(transaction.outputs)):
                 self.storage.remove_coin(OutPoint(txid, index))
-            self.storage.unindex_transaction(txid)
+        self.storage.unindex_transactions([tx.txid() for tx in block.transactions])
         for outpoint, coin in self.storage.get_undo(entry.hash):
             self.storage.add_coin(outpoint, coin)
         self.storage.set_in_chain(entry.hash, False)

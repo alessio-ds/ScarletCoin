@@ -550,6 +550,25 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         result["freed_size"] = format_bytes(result["freed_bytes"])
         return result
 
+    def vacuum() -> dict:
+        """Compact the database so deleted pages are returned to the filesystem.
+
+        SQLite reuses the space a delete frees but never shrinks the file on its
+        own, so this is how a node that has dropped indexes or pruned undo gets
+        the disk back.  Reads and writes block for the duration, so it is an
+        operator action, behind the token.
+        """
+        before = node.storage.size_stats(max_age=0.0)["disk_bytes"]
+        reclaimed = node.storage.vacuum()
+        after = node.storage.size_stats(max_age=0.0)["disk_bytes"]
+        return {
+            "reclaimed_bytes": reclaimed,
+            "reclaimed_size": format_bytes(reclaimed),
+            "before_bytes": before,
+            "disk_bytes": after,
+            "disk_size": format_bytes(after),
+        }
+
     methods: dict[str, Callable[..., object]] = {
         "getinfo": getinfo,
         "getblockcount": getblockcount,
@@ -583,6 +602,7 @@ def build_methods(node: Node) -> dict[str, Callable[..., object]]:
         "addpeer": addpeer,
         "getaddresses": getaddresses,
         "prune": prune,
+        "vacuum": vacuum,
         "stop": stop,
     }
 

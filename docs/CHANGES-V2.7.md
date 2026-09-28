@@ -124,3 +124,48 @@ of small coins, which is exactly what the fake-traffic generator does.
 ## Upgrading
 
 No consensus change, no chain change, no wallet-file change.
+
+# ScarletCoin 2.7.5
+
+The chain database was about three times the size of the chain itself.  None
+of that extra was consensus data: it was derived indexes and undo records,
+kept for every block since genesis.  Measured on the live mainnet node
+(283 MB database, 95 MB of active chain): `blocks` 108 MB, `address_history`
+40 MB, `undo` 39 MB, `address_history_txid` 34 MB, `tx_location` 25 MB,
+`tx_location_height` 13 MB.
+
+## Undo is bounded
+
+Undo exists so a block can be disconnected during a reorganisation.  It was
+kept for every block, but a block `UNDO_KEEP_BLOCKS` (now 2,000) behind the tip
+can never be reorganised away.  The node now drops the undo record for the
+block that falls out of that horizon as each block connects, and the schema-5
+migration deletes the backlog.  A reorg deeper than 2,000 blocks can no longer
+be rolled back, which is far deeper than this chain has ever seen.
+
+## The transactions-per-second index is gone
+
+`tx_location_height` existed only to count transactions in a height window.
+`blocks` now carries a `tx_count` for each block, written when the block is
+stored and read through the existing `blocks_chain` index, so the TPS card is
+just as cheap without a second copy of every height.
+
+## The address-history delete index is gone
+
+`address_history_txid` cost 34 MB so that disconnecting a block could delete
+its history rows by transaction id.  Disconnects and prunes now batch every
+transaction in a block into one `DELETE ... IN (...)`, which scans the table
+once per block instead of once per transaction, so the index is not needed.
+
+## `vacuum`
+
+SQLite reuses deleted space but never shrinks the file on its own, so a new
+(token-only) `vacuum` RPC compacts the database and reports the bytes
+reclaimed.  Run it after the schema-5 migration to actually get the disk back.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.  Existing
+databases are upgraded in place on first start: the migration adds
+`blocks.tx_count`, drops the two indexes and prunes old undo.  It can take a
+few seconds; follow it with `vacuum` to reclaim the freed pages.

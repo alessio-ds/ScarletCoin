@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,8 +48,16 @@ __all__ = [
 #: the header stays.  3: the output rewrite (P2SH): the UTXO set gained a type
 #: and the serialisation changed, so the whole database is rebuilt.  4: the
 #: ``address_history`` table gained precomputed ``received``, ``sent`` and
-#: ``coinbase`` columns so history queries stop loading whole blocks.
-SCHEMA_VERSION = 4
+#: ``coinbase`` columns so history queries stop loading whole blocks.  5:
+#: ``blocks.tx_count`` (so the TPS count needs no index on ``tx_location``), the
+#: two large derived indexes are dropped, and old undo records are pruned.
+SCHEMA_VERSION = 5
+
+#: How many blocks of undo records to keep.  Undo exists only so a block can be
+#: disconnected during a reorganisation; a block this far behind the tip can
+#: never be reorged away, and keeping undo since genesis was a sixth of the
+#: database.  2,000 blocks is far deeper than any reorg this chain has seen.
+UNDO_KEEP_BLOCKS = 2_000
 
 #: How long :meth:`Storage.size_stats` may reuse its last measurement.
 SIZE_CACHE_SECONDS = 5.0
@@ -82,7 +90,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     in_chain  INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
     raw       BLOB NOT NULL,
-    pruned    INTEGER NOT NULL DEFAULT 0
+    pruned    INTEGER NOT NULL DEFAULT 0,
+    tx_count  INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blocks_prev ON blocks (prev_hash);
 CREATE INDEX IF NOT EXISTS blocks_chain ON blocks (in_chain, height);
@@ -122,7 +131,6 @@ CREATE TABLE IF NOT EXISTS tx_location (
     position   INTEGER NOT NULL,
     height     INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS tx_location_height ON tx_location (height);
 
 CREATE TABLE IF NOT EXISTS address_history (
     pubkey_hash BLOB NOT NULL,
@@ -133,7 +141,6 @@ CREATE TABLE IF NOT EXISTS address_history (
     coinbase    INTEGER NOT NULL,
     PRIMARY KEY (pubkey_hash, txid)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS address_history_txid ON address_history (txid);
 """
 
 
@@ -343,6 +350,11 @@ class Storage:
         Schema 4 only adds precomputed amounts to the ``address_history`` index,
         which is a derived index that can be recomputed from the stored blocks
         and undo records, so existing databases are upgraded in place.
+
+        Schema 5 adds ``blocks.tx_count`` and drops the derived
+        ``tx_location_height`` and ``address_history_txid`` indexes, then prunes
+        undo records for blocks that can no longer be disconnected.  All of it
+        is derived bookkeeping, so this is also an in-place upgrade.
         """
         if from_version < 3:
             for table in ("blocks", "utxo", "undo", "tx_location", "address_history", "meta"):
@@ -350,7 +362,48 @@ class Storage:
             self._connection.executescript(_SCHEMA)
         elif from_version == 3:
             self._migrate_v3_to_v4()
+            self._migrate_v4_to_v5()
+        elif from_version == 4:
+            self._migrate_v4_to_v5()
         self.set_meta("schema_version", str(SCHEMA_VERSION).encode())
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Add ``blocks.tx_count``, drop two derived indexes and bound undo.
+
+        The indexes are dropped because their cost is large and their use is
+        narrow: ``tx_location_height`` only served the transactions-per-second
+        count, which ``blocks.tx_count`` now answers, and
+        ``address_history_txid`` only made a block *disconnect* fast, which a
+        chain that is not forever-reorganising does not need.  Undo for blocks
+        far behind the tip can never be used, so it is deleted here and kept
+        bounded from then on.
+        """
+        columns = {row[1] for row in self._connection.execute("PRAGMA table_info(blocks)")}
+        with self.write():
+            if "tx_count" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE blocks ADD COLUMN tx_count INTEGER NOT NULL DEFAULT 0"
+                )
+            # Backfill while the height index that makes it cheap still exists.
+            self._connection.execute(
+                "UPDATE blocks SET tx_count ="
+                " (SELECT COUNT(*) FROM tx_location t WHERE t.height = blocks.height)"
+                " WHERE in_chain = 1"
+            )
+        self._connection.execute("DROP INDEX IF EXISTS tx_location_height")
+        self._connection.execute("DROP INDEX IF EXISTS address_history_txid")
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(height), 0) AS tip FROM blocks WHERE in_chain = 1"
+        ).fetchone()
+        tip = 0 if row is None else int(row["tip"])
+        cutoff = tip - UNDO_KEEP_BLOCKS
+        if cutoff > 0:
+            with self.write():
+                self._connection.execute(
+                    "DELETE FROM undo WHERE block_hash IN"
+                    " (SELECT hash FROM blocks WHERE in_chain = 1 AND height < ?)",
+                    (cutoff,),
+                )
 
     def _migrate_v3_to_v4(self) -> None:
         """Add precomputed ``received``/``sent``/``coinbase`` to ``address_history``."""
@@ -517,8 +570,8 @@ class Storage:
         block_hash = block.hash()
         self._execute(
             "INSERT OR REPLACE INTO blocks"
-            " (hash, height, prev_hash, chainwork, in_chain, timestamp, raw, pruned)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            " (hash, height, prev_hash, chainwork, in_chain, timestamp, raw, pruned, tx_count)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 block_hash,
                 height,
@@ -527,6 +580,7 @@ class Storage:
                 1 if in_chain else 0,
                 block.header.timestamp,
                 block.serialize(),
+                len(block.transactions),
             ),
         )
         self._forget_sizes()
@@ -640,14 +694,15 @@ class Storage:
         """Number of confirmed transactions at heights ``start_height..end_height``.
 
         Counts the coinbase of every block, so it matches summing
-        ``len(block.transactions)`` over the range.  Transactions of pruned
-        blocks are no longer indexed and contribute nothing; use this for
-        recent windows, where pruning does not reach.
+        ``len(block.transactions)`` over the range.  The count comes from
+        ``blocks.tx_count``, so a pruned block still contributes its transaction
+        count and no index over ``tx_location`` is needed.
         """
         if end_height < start_height:
             return 0
         row = self._one(
-            "SELECT COUNT(*) AS n FROM tx_location WHERE height BETWEEN ? AND ?",
+            "SELECT COALESCE(SUM(tx_count), 0) AS n FROM blocks"
+            " WHERE in_chain = 1 AND height BETWEEN ? AND ?",
             (start_height, end_height),
         )
         return 0 if row is None else int(row["n"])
@@ -845,9 +900,8 @@ class Storage:
                 block = Block.deserialize(raw)
             except Exception:  # pragma: no cover - stored blocks always parse
                 continue
-            for transaction in block.transactions:
-                self.unindex_transaction(transaction.txid())
-                transactions += 1
+            transactions += len(block.transactions)
+            self.unindex_transactions([tx.txid() for tx in block.transactions])
             undo = self._one(
                 "SELECT LENGTH(data) AS size FROM undo WHERE block_hash = ?", (block_hash,)
             )
@@ -999,6 +1053,24 @@ class Storage:
         """Drop a block's undo record."""
         self._execute("DELETE FROM undo WHERE block_hash = ?", (block_hash,))
 
+    def prune_undo_at_height(self, height: int) -> None:
+        """Drop the undo record for the active-chain block at ``height``.
+
+        Called once per connected block with a height ``UNDO_KEEP_BLOCKS``
+        behind the tip, so undo stays bounded instead of growing with the
+        chain.  A block whose undo is gone can no longer be disconnected,
+        which is the intended trade: it is far below any reorg this chain has
+        ever seen.  Does nothing when there is no block at that height, which
+        is the case for the first ``UNDO_KEEP_BLOCKS`` blocks.
+        """
+        if height < 0:
+            return
+        self._execute(
+            "DELETE FROM undo WHERE block_hash ="
+            " (SELECT hash FROM blocks WHERE in_chain = 1 AND height = ?)",
+            (height,),
+        )
+
     # ----------------------------------------------------------------- indexes
 
     def index_transaction(
@@ -1035,6 +1107,24 @@ class Storage:
         """Forget a transaction that is no longer on the active chain."""
         self._execute("DELETE FROM tx_location WHERE txid = ?", (txid,))
         self._execute("DELETE FROM address_history WHERE txid = ?", (txid,))
+
+    def unindex_transactions(self, txids: Sequence[bytes]) -> None:
+        """Forget several transactions in a single pass per table.
+
+        There is no index on ``address_history.txid`` (it cost more disk than
+        the lookups it saved), so deleting one transaction at a time would scan
+        the whole address history once per transaction.  Batching turns a block
+        disconnect or a prune into one scan per block instead of one per
+        transaction.  The list is chunked because SQLite bounds how many
+        parameters one statement may bind.
+        """
+        if not txids:
+            return
+        for start in range(0, len(txids), 500):
+            chunk = tuple(txids[start : start + 500])
+            placeholders = ",".join("?" for _ in chunk)
+            self._execute(f"DELETE FROM tx_location WHERE txid IN ({placeholders})", chunk)
+            self._execute(f"DELETE FROM address_history WHERE txid IN ({placeholders})", chunk)
 
     def get_tx_location(self, txid: bytes) -> TxLocation | None:
         """Return where a confirmed transaction lives."""
