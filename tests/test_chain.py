@@ -688,6 +688,24 @@ class TestUtxoOverlay:
 
 
 class TestStorage:
+    def test_block_cache_is_bounded_and_evicts(self, chain, key, monkeypatch):
+        """The cache counts serialised bytes but holds Python objects costing
+        several times that, so its budget has to stay modest and it has to
+        actually evict when the budget is reached."""
+        import scarletcoin.core.storage as storage_module
+
+        assert storage_module.BLOCK_CACHE_MAX_BYTES <= 32 * 1024 * 1024
+        assert storage_module.BLOCK_CACHE_SIZE <= 512
+
+        monkeypatch.setattr(storage_module, "BLOCK_CACHE_MAX_BYTES", 1)
+        mine_and_add(chain, key, count=3)
+        for height in range(1, 4):
+            entry = chain.get_entry_by_height(height)
+            assert chain.storage.get_block(entry.hash) is not None
+        # A 1-byte budget evicts even the block just fetched.
+        assert len(chain.storage._block_cache) == 0
+        assert chain.storage._block_cache_bytes == 0
+
     def test_missing_undo_data_is_an_error(self, chain, key):
         mine_and_add(chain, key, count=1)
         entry = chain.get_entry_by_height(1)

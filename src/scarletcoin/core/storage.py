@@ -56,12 +56,17 @@ SIZE_CACHE_SECONDS = 5.0
 
 #: How many deserialised blocks :meth:`Storage.get_block` keeps in memory.
 #: Blocks are immutable, so this is only a read cache; it is dropped on pruning.
-BLOCK_CACHE_SIZE = 1024
+BLOCK_CACHE_SIZE = 256
 
-#: Maximum total bytes the block cache may hold before the oldest entries are
-#: evicted.  A full-size (1 MB) block at the default entry count would take
-#: 1 GB of memory, so the byte limit is the stricter bound in practice.
-BLOCK_CACHE_MAX_BYTES = 128 * 1024 * 1024  # 128 MB
+#: Maximum serialised bytes the block cache may hold before the oldest entries
+#: are evicted.  This is *not* the memory the cache uses: a deserialised block
+#: is several times its serialised size (measured at roughly 3-4x on a chain
+#: full of small transactions), so the budget is deliberately modest.  The old
+#: 128 MB counted bytes here but held 400 MB or more of Python objects, which
+#: is enough to matter on a small node host.  Re-reading a block from SQLite
+#: costs a millisecond; keeping the whole recent chain resident does not pay
+#: for itself on the machines that run this node.
+BLOCK_CACHE_MAX_BYTES = 16 * 1024 * 1024  # 16 MB serialised, ~55 MB resident
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (

@@ -87,3 +87,23 @@ that also drops the mining CPU from a full core to a fraction of one.
 ## Upgrading
 
 No consensus change, no chain change, no wallet-file change.
+# ScarletCoin 2.7.3
+
+## The block cache no longer keeps the whole recent chain resident
+
+`Storage.get_block` caches deserialised blocks in memory.  The budget was
+128 MB, but it counted the *serialised* size while holding Python `Block`
+objects, which measure roughly 3-4x their serialised bytes on a chain full of
+small transactions.  A node whose explorer had walked the recent chain
+therefore sat at 400 MB or more.  Measured on the live mainnet node: RSS fell
+from 285 MB to 30 MB on restart, and grew about 0.34 MB for every recent block
+cached.
+
+The budget is now 16 MB serialised (about 55 MB resident) and the entry cap
+256.  A block that falls out of the cache is re-read from SQLite in about a
+millisecond, which is a good trade on the small hosts this node runs on.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.  The smaller
+cache is purely in memory; nothing on disk changes.
