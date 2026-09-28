@@ -296,12 +296,25 @@ def _sign_inputs(
     # Build the body once; recomputing it per input is quadratic in the number
     # of inputs, which is what makes large sends crawl.
     hasher = SignatureHasher(unsigned)
+    # A sweep spends hundreds of coins paying the same address, so the public
+    # key bytes and the script code are the same for every one of them:
+    # deriving them per input costs an EC point multiplication each time.
+    pubkeys: dict[bytes, bytes] = {}
+    scripts: dict[bytes, bytes] = {}
     for index, (outpoint, coin) in enumerate(coins):
         key = keys.get(coin.payload)
         if key is None:
             raise ValueError(f"no private key for coin {outpoint}")
-        digest = hasher.digest(index, coin.value, unsigned.p2pkh_script_code(coin.payload))
-        witnesses[index] = (key.public_key().to_bytes(), key.sign(digest))
+        pubkey = pubkeys.get(coin.payload)
+        if pubkey is None:
+            pubkey = key.public_key().to_bytes()
+            pubkeys[coin.payload] = pubkey
+        script = scripts.get(coin.payload)
+        if script is None:
+            script = unsigned.p2pkh_script_code(coin.payload)
+            scripts[coin.payload] = script
+        digest = hasher.digest(index, coin.value, script)
+        witnesses[index] = (pubkey, key.sign(digest))
     return unsigned.signed_with(witnesses)
 
 

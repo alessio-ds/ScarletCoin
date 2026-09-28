@@ -107,3 +107,20 @@ millisecond, which is a good trade on the small hosts this node runs on.
 
 No consensus change, no chain change, no wallet-file change.  The smaller
 cache is purely in memory; nothing on disk changes.
+
+# ScarletCoin 2.7.4
+
+## A sweep signs the same key once, not once per coin
+
+`builder._sign_inputs` derived the public key and the script code for every
+input, even though a sweep almost always spends hundreds of coins paying the
+same address.  Deriving a public key is an EC point multiplication, so a
+1000-input sweep paid for one per input; caching both by payload roughly
+halves the time a large sweep takes (4.4 s to 2.6 s for 1000 inputs here).
+
+This matters most when consolidating a wallet that has accumulated thousands
+of small coins, which is exactly what the fake-traffic generator does.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.
