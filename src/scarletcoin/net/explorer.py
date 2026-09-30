@@ -26,6 +26,17 @@ __all__ = ["NotFound", "render", "render_error"]
 #: summarised, so an address with thousands of coins cannot produce a huge page.
 MAX_UNSPENT_ROWS = 200
 
+#: Maximum number of inputs the transaction page resolves.  Each input's source
+#: is another transaction, which means loading *its* block, so a consolidation
+#: transaction with hundreds of inputs used to cost hundreds of block reads and
+#: take over a minute.  The rest are listed as outpoints without their source,
+#: which keeps any one page bounded no matter how the transaction was built.
+MAX_INPUT_ROWS = 25
+
+#: Maximum number of outputs the transaction page renders, for the same reason:
+#: a split transaction can have thousands, and a page should not grow with it.
+MAX_OUTPUT_ROWS = 200
+
 _STYLE = """
 :root {
   --bg: #12100f; --panel: #1b1817; --line: #2e2825; --text: #e8e2df;
@@ -603,7 +614,9 @@ def _transaction_rows(server: RpcServer, transaction: Transaction) -> str:
     node = server.node
     version = node.params.address_version
     inputs: list[list[Cell]] = []
-    for txin in transaction.inputs:
+    for index, txin in enumerate(transaction.inputs):
+        if index >= MAX_INPUT_ROWS:
+            break
         if txin.prevout.is_null:
             inputs.append([_html(_tag("coinbase", "warn")), _text(""), _text("")])
             continue
@@ -626,14 +639,24 @@ def _transaction_rows(server: RpcServer, transaction: Transaction) -> str:
                 _html(source),
             ]
         )
+    if len(transaction.inputs) > MAX_INPUT_ROWS:
+        rest = len(transaction.inputs) - MAX_INPUT_ROWS
+        inputs.append(
+            [_text(f"… and {rest} more input{'s' if rest != 1 else ''}"), _text(""), _text("")]
+        )
     outputs = [
         [
             _text(index, numeric=True),
             _html(_address_link(str(output.address(version)))),
             _html(_amount(output.value), numeric=True),
         ]
-        for index, output in enumerate(transaction.outputs)
+        for index, output in enumerate(transaction.outputs[:MAX_OUTPUT_ROWS])
     ]
+    if len(transaction.outputs) > MAX_OUTPUT_ROWS:
+        rest = len(transaction.outputs) - MAX_OUTPUT_ROWS
+        outputs.append(
+            [_text("…"), _text(f"and {rest} more output{'s' if rest != 1 else ''}"), _text("")]
+        )
     return (
         "<h2>Inputs</h2>"
         + _rows(["Previous transaction", "#Index", "Source"], inputs)

@@ -59,8 +59,11 @@ SCHEMA_VERSION = 5
 #: database.  2,000 blocks is far deeper than any reorg this chain has seen.
 UNDO_KEEP_BLOCKS = 2_000
 
-#: How long :meth:`Storage.size_stats` may reuse its last measurement.
-SIZE_CACHE_SECONDS = 5.0
+#: How long :meth:`Storage.size_stats` may reuse its last measurement.  The
+#: measurement reads every stored block, so it is far too heavy to repeat on
+#: each new block or each ``getinfo``; a slightly stale "chain weight" figure
+#: is the right trade.
+SIZE_CACHE_SECONDS = 60.0
 
 #: How many deserialised blocks :meth:`Storage.get_block` keeps in memory.
 #: Blocks are immutable, so this is only a read cache; it is dropped on pruning.
@@ -774,9 +777,15 @@ class Storage:
     # ------------------------------------------------------------------- sizes
 
     def _forget_sizes(self) -> None:
-        """Drop the cached size measurement after the chain changed."""
-        with self._lock:
-            self._size_cache = None
+        """Note that the chain changed; the size measurement refreshes on its own.
+
+        Computing the size reads every stored block, so it is kept for
+        :data:`SIZE_CACHE_SECONDS` rather than recomputed for each new block (or
+        each ``getinfo`` poll) — that is what made a busy node look pegged.
+        Callers that need the current figure immediately (a prune, say) ask for
+        it with ``max_age=0``.
+        """
+        return
 
     def size_stats(self, *, max_age: float = SIZE_CACHE_SECONDS) -> dict:
         """Measure how much room the chain takes up.

@@ -169,3 +169,35 @@ No consensus change, no chain change, no wallet-file change.  Existing
 databases are upgraded in place on first start: the migration adds
 `blocks.tx_count`, drops the two indexes and prunes old undo.  It can take a
 few seconds; follow it with `vacuum` to reclaim the freed pages.
+
+# ScarletCoin 2.7.6
+
+## A transaction page no longer resolves every input
+
+Resolving an input to the address and amount it spends means loading the block
+of the transaction it came from.  The page did that for every input, so a
+consolidation transaction with hundreds of inputs cost hundreds of block
+reads: measured on the live node, a 59-input transaction page took 107 seconds
+and a typical one 5 seconds.
+
+The page now resolves at most `MAX_INPUT_ROWS` (25) inputs and lists the rest
+as outpoints, and renders at most `MAX_OUTPUT_ROWS` (200) outputs.  The cost of
+any one page is bounded no matter how the transaction was built.
+
+This matters because a public explorer is crawled.  A crawler walking
+`/tx/` at about one page per second was enough to keep the node at 90% of a
+core with four out of five requests never completing (the client gave up while
+the node was still resolving inputs).
+
+## Chain size is no longer recomputed per block
+
+`size_stats` reads every stored block to sum its serialised length.  It was
+cached for five seconds but invalidated on every block, so a node being polled
+with `getinfo` rescanned the whole chain every block — 2.2 seconds of a
+full-table read on the live chain.  The measurement now stands for
+`SIZE_CACHE_SECONDS` (60); callers that need the current figure (a prune) ask
+for it with `max_age=0`.
+
+## Upgrading
+
+No consensus change, no chain change, no wallet-file change.

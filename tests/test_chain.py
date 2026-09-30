@@ -706,6 +706,19 @@ class TestStorage:
         assert len(chain.storage._block_cache) == 0
         assert chain.storage._block_cache_bytes == 0
 
+    def test_size_stats_are_cached_instead_of_rescanned_per_block(self, chain, key):
+        """Summing ``LENGTH(raw)`` reads every stored block, so a new block must
+        not force a rescan the next time ``getinfo`` is polled."""
+        mine_and_add(chain, key, count=2)
+        first = chain.storage.size_stats(max_age=60.0)
+        mine_and_add(chain, key, count=1)
+        # The chain changed, but the measurement is reused until it ages out.
+        assert chain.storage.size_stats(max_age=60.0) == first
+        # A caller that needs the current figure asks for it explicitly.
+        fresh = chain.storage.size_stats(max_age=0.0)
+        assert fresh["chain_blocks"] == first["chain_blocks"] + 1
+        assert fresh["chain_bytes"] > first["chain_bytes"]
+
     def test_missing_undo_data_is_an_error(self, chain, key):
         mine_and_add(chain, key, count=1)
         entry = chain.get_entry_by_height(1)

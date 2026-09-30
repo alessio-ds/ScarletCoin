@@ -870,6 +870,29 @@ class TestExplorer:
         assert f"{stats['transactions_per_second']:.2f}" in network_section
         assert f"{stats['transactions']} tx in {stats['window']} blocks" in network_section
 
+    def test_transaction_page_caps_the_inputs_it_resolves(self, rpc):
+        """Resolving an input means loading its parent transaction's block, so
+        a consolidation transaction with hundreds of inputs used to make one
+        page cost hundreds of block reads.  The page must stay bounded."""
+        from scarletcoin.core.transaction import OutPoint, Transaction, TxInput, TxOutput
+        from scarletcoin.net.explorer import MAX_INPUT_ROWS, _transaction_rows
+
+        _, server, _ = rpc
+        extra = 7
+        inputs = tuple(
+            TxInput(OutPoint(bytes([index]) * 32, index)) for index in range(MAX_INPUT_ROWS + extra)
+        )
+        transaction = Transaction(
+            version=1,
+            inputs=inputs,
+            outputs=(TxOutput.p2pkh(1000, b"\x11" * 20),),
+            lock_time=0,
+        )
+        markup = _transaction_rows(server, transaction)
+        assert f"… and {extra} more inputs" in markup
+        # Only the capped inputs are resolved to a parent transaction link.
+        assert markup.count('href="/tx/') == MAX_INPUT_ROWS
+
     def test_a_pruned_block_says_so_instead_of_looking_missing(self, rpc, key):
         node, server, client = rpc
         client.call("generate", 20, str(key.address(REGTEST.address_version)))
